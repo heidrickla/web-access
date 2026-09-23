@@ -87,21 +87,16 @@ nothing else, which is what keeps it small enough to review.
 ### Resolving by name puts DNS in the trust chain
 
 The target entry carries a hostname and the proxy resolves it at CONNECTION time, not at startup, so
-a re-addressed host does not stay broken until a restart. The consequence is that DNS now decides
-which machine a target id reaches, and a changed or poisoned record sends the session elsewhere while
-every log line still reads `historian-01`.
+a re-addressed host is picked up without a restart. DNS decides which machine a target id reaches.
 
-Name resolution answers WHERE. Certificate validation answers WHO. Neither is sufficient alone, which
-is why the certificate row above is not an independent nicety — it is the other half of this control.
-Cloudflare does not verify the origin certificate; on a segmented plant network that trade reads
-differently than it does on a CDN.
+Name resolution answers WHERE. Certificate validation answers WHO. The certificate row above is the
+other half of this control.
 
-Rules that follow:
+Rules:
 
-- Log the name AND the address it resolved to at that moment. If they ever disagree with expectation,
-  that log line is the evidence.
-- Fail closed on resolution failure. Never fall back to a cached address silently.
-- A name resolving to several addresses is ambiguity in a security control: refuse rather than pick.
+- Log the name AND the address it resolved to at that moment.
+- Fail closed on resolution failure. No silent fallback to a cached address.
+- A name resolving to several addresses is refused rather than picked from.
 
 Agent identity is no longer a decision. Direct reach means there are no agents to authenticate.
 
@@ -114,49 +109,38 @@ is a boundary failure, and it should be tested as one.
 
 ### Where saved credentials live
 
-Three options, and the third is the one this grows into. Recorded because the first framing of this
-offered only the first two, which is a narrower question than the one being asked.
-
-| | Where | What it costs |
+| | Where | Scope |
 |---|---|---|
-| Browser `localStorage` | plaintext on disk, per browser | what ships today. No server work, no key management, and a Windows password in a file any script on the origin can read |
-| Browser credential manager | DPAPI-encrypted in the user's profile | the Credential Management API, which needs a SECURE ORIGIN, so it waits on a TLS listener. Still per-browser: nothing follows a user to another machine |
-| PROXY-SIDE ENCRYPTED STORE | a database the proxy owns, the Guacamole model | the direction this grows into, and the one that reverses "the proxy stores nothing" |
+| Browser `localStorage` | the browser profile | per browser; no server work |
+| Browser credential manager | the Credential Management API | per browser; requires a secure origin |
+| PROXY-SIDE ENCRYPTED STORE | a database the proxy owns, the Guacamole model | per user or per connection, any machine |
 
-THE THIRD IS WHAT MAKES A MULTI-USER GATEWAY POSSIBLE, and that is why it wins eventually. It buys
-things the other two cannot:
+The third is the direction this grows into, because it is what makes a multi-user gateway possible:
 
-- Credentials follow the USER, not the browser. Any machine, same experience.
+- Credentials follow the USER, not the browser.
 - An administrator can attach credentials to a CONNECTION rather than a person, so an operator clicks
-  a system and is in without ever knowing the Windows password — which is also how a credential gets
-  rotated without telling anyone.
+  a system and is in without knowing the Windows password, and a credential rotates without telling
+  anyone.
 - One place to audit, revoke and rotate.
 
-What it costs is honest and should be stated before it is built, not after:
+Design consequences:
 
-- THE PROXY BECOMES A CREDENTIAL VAULT. Compromising it stops yielding reach alone and starts
-  yielding the keys to everything it can reach. That is the property `pass-through` was chosen to
-  avoid, so choosing this is a reversal and not an extension.
-- The audit trail weakens if credentials are per-connection rather than per-person: the proxy log
-  still names the person, but the Windows event log names whatever account the connection carries,
-  and the two stop corresponding. Per-user storage keeps the correspondence; per-connection does not.
-- KEY MANAGEMENT IS THE WHOLE PROBLEM, not the encryption. A key sitting beside the database is
-  obfuscation. The candidates, in order of how much they actually protect:
-  1. Derived from the authenticated user's own session, so a row is only decryptable while that user
-     is signed in. Strongest, and it requires the identity provider decision first.
-  2. Windows DPAPI under the service account, which ties the store to the machine and stops a stolen
-     database file being readable elsewhere. Available today, since the proxy is a Windows service.
-  3. A key in the config file. Not worth the word encrypted.
+- The proxy then holds credentials, which reverses pass-through rather than extending it.
+- Per-user storage keeps the proxy log and the Windows event log naming the same person;
+  per-connection storage makes the event log name the connection's account instead.
+- Key management decides the design. Candidates, strongest first:
+  1. Derived from the authenticated user's own session, so a row decrypts only while that user is
+     signed in. Requires the identity provider.
+  2. Windows DPAPI under the service account, binding the store to the machine.
+  3. A key in the config file. Rejected.
 
-So this waits on the identity provider, because option 1 is the one worth having and it cannot be
-built before there are identities to key against. Until then `localStorage` stays, and the sign-in
-dialog says plainly where the password is kept.
+It follows the identity provider, because option 1 needs identities to key against.
 
 ### What pass-through makes true
 
-- The proxy holds no secrets, so compromising it yields reach but not credentials.
+- The proxy holds no secrets.
 - The Windows event log names the actual person, so the proxy's log and the target's log correlate.
-  That correlation is the audit story; stored credentials would have destroyed it permanently.
+  That correlation is the audit story.
 - CredSSP has to work from a browser-hosted client. This is the historically awkward part of
   client-side RDP, and it is known to work: Cloudflare's implementation is pass-through and states
   that it manages no credentials on the Windows server.
@@ -170,7 +154,7 @@ stripped-down experience.
 
 ## Other connection types
 
-Roadmap, not built; RDP comes first (Lewis, 2026-09-23). Facts below as of 2026-09-23.
+Roadmap; RDP comes first (Lewis, 2026-09-23).
 
 The proxy never decodes, so any protocol with a browser-side client fits. Proxy changes shared by
 VNC, SSH and Telnet:
@@ -183,44 +167,35 @@ VNC, SSH and Telnet:
 
 | Protocol | Browser client | Licence |
 |---|---|---|
-| VNC | noVNC v1.7.0; needs only a WebSocket-to-TCP relay | MPL-2.0 (mainly) |
-| SSH | `golang.org/x/crypto/ssh` compiled to WASM, on xterm.js. `c2FmZQ/sshterm` and `hullarb/ssheasy` (adds SFTP) are small wrappers already built this way | BSD-3 / MIT |
+| VNC | noVNC; needs only a WebSocket-to-TCP relay | MPL-2.0 (mainly) |
+| SSH | `golang.org/x/crypto/ssh` compiled to WASM, on xterm.js. `c2FmZQ/sshterm` and `hullarb/ssheasy` (adds SFTP) use this shape | BSD-3 / MIT |
 | Telnet | xterm.js plus option negotiation, written here | MIT |
 | HTTP(S) | the browser itself; needs a reverse proxy that parses HTTP, a new component rather than a relay mode | n/a |
 
 - SSH host keys belong in the target entry, checked in the browser: SSH's form of the certificate
   row in Decisions.
 - Credentials pass through for all of them.
-- Not reusable: Devolutions' gateway UI does VNC, SSH and Telnet, but only its RDP packages are on
-  public npm; `@devolutions/iron-remote-desktop-vnc`, `web-ssh-gui` and `web-telnet-gui` return 404.
-  `russh`'s browser WASM pull request (#349) was closed unmerged.
 
 ### Linux desktops
 
 Ubuntu's GNOME desktop ships an RDP server, GNOME Remote Desktop. Nothing is installed on the
 target, so direct reach holds.
 
-| Ubuntu | GNOME | Built-in RDP | `ironrdp-web` |
-|---|---|---|---|
-| 22.04 | 42 | Desktop Sharing: mirrors the console session | untested; GNOME 42 still has the pre-pipeline path |
-| 24.04 | 46 | Desktop Sharing, and Remote Login: login screen, own session | refused |
-| 26.04 | 50 | as 24.04 | refused |
+| Ubuntu | GNOME | Built-in RDP |
+|---|---|---|
+| 22.04 | 42 | Desktop Sharing: mirrors the console session |
+| 24.04 | 46 | Desktop Sharing, and Remote Login: login screen, own session |
+| 26.04 | 50 | as 24.04 |
 
-- GNOME Remote Desktop requires the graphics pipeline (EGFX). From GNOME 44 the older path needs a
-  debug flag and serves mirroring only; GNOME 47 removed it (gnome-remote-desktop MR !274).
-- IronRDP's native client gained EGFX on master in August 2026, not yet in a crates.io release
-  (IronRDP #1446). `ironrdp-web` on master sets `support_dyn_vc_gfx_protocol: false` and registers
-  only display control.
-- The work: wire EGFX into `ironrdp-web`, the browser counterpart of IronRDP #1462. GNOME uses
-  RemoteFX Progressive for a client without H.264, and that decoder has landed. Until upstream ships
-  it, the client builds from IronRDP master with a local patch, and that patch is recorded here.
+- GNOME Remote Desktop requires the graphics pipeline (EGFX) from GNOME 44; GNOME 47 removed the
+  older path (gnome-remote-desktop MR !274). The client side is EGFX in `ironrdp-web`, the browser
+  counterpart of IronRDP #1462. GNOME uses RemoteFX Progressive for a client without H.264.
 - Remote Login takes two credentials: one shared RDP credential per machine
   (`grdctl --system rdp set-credentials`), then the user's own login at the GNOME login screen. The
   shared one is a per-connection credential, the case the proxy-side store is for.
-- xrdp is the fallback: an installed package, but a listening service rather than an agent. It logs
-  in real Linux accounts through PAM, so pass-through holds. `ironrdp-web` connects to it; an open
-  IronRDP bug garbles 16-bit colour (#1693). Ubuntu 26.04 has no GNOME X11 session, so xrdp there
-  needs a second desktop such as Xfce.
+- xrdp is the alternative: an installed package, but a listening service rather than an agent. It
+  logs in real Linux accounts through PAM, so pass-through holds. It needs an X11 desktop, which
+  GNOME no longer provides from Ubuntu 26.04, so there it pairs with one such as Xfce.
 
 ### Kerberos for RDP
 

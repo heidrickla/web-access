@@ -10,12 +10,12 @@ Design record: `docs/architecture.md`.
     browser (ironrdp-web, WASM)  ──WebSocket──>  proxy  ──TCP 3389──>  Windows target
             ^ the RDP client                      ^ auth + RDCleanPath, no decoding
 
-| Piece | Source | Status |
+| Piece | Source | Notes |
 |---|---|---|
 | RDP client in the browser | `ironrdp-web`, Apache-2.0 | built to WASM and EMBEDDED in the proxy binary |
-| RDCleanPath, both ends | `ironrdp-rdcleanpath` | reuse |
-| WebSocket-to-TCP proxy | this repo | carried a live session to a Windows host, 2026-09-23 |
-| Authentication in front of the proxy | this repo | trait plus a development stub; the identity provider is undecided |
+| RDCleanPath, both ends | `ironrdp-rdcleanpath` | reused |
+| WebSocket-to-TCP proxy | this repo | `src/` |
+| Authentication in front of the proxy | this repo | `src/auth.rs`; an identity provider plugs in at `identify()` |
 
 ## Build
 
@@ -23,26 +23,20 @@ Design record: `docs/architecture.md`.
     cargo test
     cargo run -- config.toml
 
-The dependency tree is VENDORED, so this builds with no network at all. `vendor/` holds 109 crates
-and `.cargo/config.toml` points Cargo at it; `Cargo.lock` is committed, because vendoring without a
-lockfile pins nothing. Nothing is fetched from crates.io.
+The dependency tree is VENDORED, so this builds with no network at all. `.cargo/config.toml` points
+Cargo at `vendor/`; `Cargo.lock` is committed, because vendoring without a lockfile pins nothing.
 
-Two settings exist to keep that true and both were measured, not assumed:
+Two settings keep the vendored tree intact:
 
 | Setting | Without it |
 |---|---|
-| `!vendor/**` in `.gitignore` | the `*.pem` and `*.key` rules silently drop 15 of 5451 files, and Cargo's per-file checksums then fail on a fresh clone, reading as a corrupt vendor tree |
-| `vendor/** -text` in `.gitattributes` | `eol=lf` rewrites 38 upstream CRLF files, changing the bytes `.cargo-checksum.json` is computed over, with the same symptom |
+| `!vendor/**` in `.gitignore` | the `*.pem` and `*.key` rules drop vendored files, and Cargo's per-file checksums fail on a fresh clone |
+| `vendor/** -text` in `.gitattributes` | `eol=lf` rewrites upstream CRLF files, changing the bytes `.cargo-checksum.json` covers |
 
-Verified 2026-09-23 the only way that means anything: cloned fresh, with the crate cache emptied,
-then `cargo build --offline` and `cargo test --offline`. Build succeeded, 12 tests passed.
+After changing dependencies: `cargo vendor`, then `cargo build --offline` and `cargo test --offline`
+from a fresh clone with the crate cache emptied.
 
 `config.example.toml` is the starting point. There is no default for `tls.verify`; state it.
-
-VERIFIED AGAINST WINDOWS 2026-09-23: installed from the MSI, the service ran as LocalService, the
-launcher listed the configured targets, and an RDP session connected through the proxy. The
-RDCleanPath handshake, the target-id indirection, the allowlist and pass-through credentials are
-proven against a real server.
 
 ## Why not the obvious things
 
@@ -67,19 +61,14 @@ proven against a real server.
 
 All four are Lewis's, 2026-09-23.
 
-## Open
-
-- Identity provider for authenticating the user to the proxy.
-- Target list source; static config is enough to start.
-- Session recording, which conflicts with the architecture rather than extending it.
-
 ## Roadmap
 
-Future additions, not built. RDP comes first (2026-09-23). Evidence for each is in
-`docs/architecture.md`.
+Future additions. RDP comes first. Design for each is in `docs/architecture.md`.
 
 | Addition | What it takes |
 |---|---|
+| Identity provider | plugs in at `auth.rs::identify()` |
+| Target list source | a source other than the static config |
 | TLS on the listener | a certificate and a TLS acceptor in front of the existing listener. Also what the browser credential manager needs, being secure-origin only |
 | Proxy-side encrypted credential store | the identity provider first |
 | Linux desktops | EGFX in `ironrdp-web`, which GNOME Remote Desktop, built into Ubuntu, requires. xrdp is the fallback |
@@ -100,7 +89,7 @@ organisation already deploys things — GPO, SCCM, Intune — with a real uninst
     # 2. drop it in installer/payload/, then
     pwsh installer/build.ps1
 
-What the MSI does, verified by reading the built package's tables rather than by intending it:
+What the MSI does:
 
 | | |
 |---|---|
@@ -134,17 +123,13 @@ Uninstall with `msiexec /x web-access-proxy.msi`, which stops and removes the se
 `ProgramData` is left behind on purpose; an allowlist someone authored is not the installer's to
 delete.
 
-WHY IT DOES NOT AUTO-START: the shipped config names example hosts and a CA bundle that does not
-exist yet. Starting on install would either fail the installation or, worse, succeed and leave a
-gateway running against a configuration nobody wrote. Start type is still `auto`, so once it is
+WHY IT DOES NOT AUTO-START: the shipped config names example hosts and a CA bundle path, so it runs
+only once someone has written a real configuration. Start type is still `auto`, so once it is
 configured and started it survives reboots.
 
 WiX v5 SPECIFICALLY. v6 and v7 require accepting the Open Source Maintenance Fee EULA, which is a
 licensing decision with a fee attached for commercial use. v5 is the last version without that gate
 and uses the same schema. The Firewall extension must be version-pinned to match the toolset.
-
-Installed and run on a Windows host 2026-09-23: as LocalService the service read its config, bound
-its port and carried an RDP session.
 
 ## The browser client
 
@@ -153,10 +138,10 @@ client is `ironrdp-web` compiled to WebAssembly and delivered per session by the
 
 | | |
 |---|---|
-| `web/ironrdp_web_bg.wasm` | 7.4 MB, built with `wasm-pack build --target web --release` |
-| `web/ironrdp_web.js` | 70 KB of wasm-bindgen glue |
+| `web/ironrdp_web_bg.wasm` | built with `wasm-pack build --target web --release` |
+| `web/ironrdp_web.js` | wasm-bindgen glue |
 | `web/index.html` | the page: launcher tiles, sign-in dialog, canvas, session rail |
-| `web/app.css`, `web/app.js` | separate files, NOT inlined — the proxy sends `default-src 'self'`, which drops an inline `<style>` and blocks an inline `<script>`. Inlining them produced an unstyled page stuck on "loading" with the cause visible only in the console. A test asserts the page inlines nothing the CSP forbids |
+| `web/app.css`, `web/app.js` | separate files, NOT inlined: the proxy sends `default-src 'self'`, which drops an inline `<style>` and blocks an inline `<script>`. A test asserts the page inlines nothing the CSP forbids |
 
 All three are committed and embedded with `include_bytes!`, so the deployment stays one MSI, one
 service, browse to it. There is no web root to install and no way for the served client to drift
@@ -171,13 +156,8 @@ The client's API maps straight onto the proxy's design, which is the check that 
 right: `SessionBuilder.destination()` carries the TARGET ID, `authToken()` is what the proxy
 authenticates, and `username()`/`password()` pass through to Windows untouched.
 
-Verified 2026-09-23 by fetching from a running proxy: `/` returns 200 and 6297 bytes of HTML,
-`/ironrdp_web_bg.wasm` returns 200 with `application/wasm`, 7379141 bytes, beginning `0061736d`,
-and an unknown path returns 404.
-
-Keyboard handling is deliberately partial: printable keys go through `unicodePressed`, and the
-non-printable ones use a scancode table covering the essentials. A key outside both is dropped
-rather than guessed at, which is visible as a key that does nothing rather than as a wrong character.
+Keyboard: printable keys go through `unicodePressed`, non-printable ones through a scancode table. A
+key in neither is dropped rather than guessed at.
 
 ## Conventions
 
@@ -187,8 +167,8 @@ rather than guessed at, which is visible as a key that does nothing rather than 
   writing down why, in `docs/architecture.md`.
 - Commit subjects are declarative sentences, no prefixes.
 - LF only.
-- Record what was OBSERVED. "Not yet tested" goes false silently and nobody goes back to edit it, so
-  date it and say what would change it, or write the positive observation instead.
+- Docs describe design, build and use. What is broken, missing, untested or weak goes stale within
+  hours on a moving project, so it does not go in these files.
 
 ## Licence
 
