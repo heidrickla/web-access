@@ -222,6 +222,31 @@ dialog#signin::backdrop { background: rgba(5, 7, 10, .68); backdrop-filter: blur
 }
 #signin input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(91,157,255,.15); }
 
+#signin label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 9px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--fg);
+  cursor: pointer;
+}
+#signin label.check input { width: 15px; height: 15px; accent-color: var(--accent); margin: 0; padding: 0; }
+
+#signin .note { margin: -4px 0 0; font-size: 11px; line-height: 1.5; color: var(--dim); }
+#signin .note button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 #signin .actions { display: flex; gap: 9px; justify-content: flex-end; margin-top: 4px; }
 #signin .primary { background: var(--accent); border-color: var(--accent); color: #07121f; font-weight: 650; }
 #signin .primary:hover { background: #74aeff; border-color: #74aeff; }
