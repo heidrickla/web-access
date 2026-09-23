@@ -1,0 +1,86 @@
+# Architecture
+
+Design record, 2026-09-23, settled in one conversation after building the Cloudflare version of the
+same thing and taking it apart.
+
+## The problem
+
+Reach a Windows desktop from a browser, with nothing installed on the accessing machine, on an
+internal network with no third party in the path.
+
+## Why a browser cannot do this by itself
+
+RDP is binary over TCP 3389 with its own TLS and CredSSP handshake. A browser exposes no raw TCP
+socket API. So something must be a real RDP client, and the only question is WHERE that client runs.
+
+| Client location | Consequence |
+|---|---|
+| Server-side | the gateway decodes RDP and re-emits drawing operations. Every channel must be re-implemented by hand. Apache Guacamole |
+| Client-side, WASM | the browser IS the RDP client; the server is a byte relay. Cloudflare |
+
+This repository takes the second.
+
+## What Cloudflare actually does, since it was the reference
+
+Measured, not assumed — their engineering blog, "RDP without the risk", 2025-03-21:
+
+- The client is IronRDP compiled to WebAssembly, running in the browser. The post names Apache
+  Guacamole as the alternative they rejected, for being Java.
+- The client wraps the RDP session in a WebSocket, because browsers cannot speak TCP.
+- `RDCleanPath` eliminates the inner RDP TLS, on the grounds that the WebSocket is already TLS to
+  Cloudflare. That is what makes the session readable inside their network.
+- Their server half is Cloudflare-specific: a Workers-based WebSocket proxy handing off to an
+  internal routing service, then out through Cloudflare Tunnel. None of it is replicable and none of
+  it is needed.
+
+AN EARLIER READING OF THIS WAS WRONG AND IS KEPT HERE because it is an easy mistake to repeat: from
+the feature limits alone — no audio, 500 KB text-only clipboard, PDF-only printing, file transfer as
+a separate panel — it looks exactly like a server-side re-encoding design, because those are the
+symptoms of having to bridge every channel by hand. It is not. Those limits are product decisions.
+`ironrdp-rdpsnd` and `ironrdp-rdpdr` exist in the upstream tree, so audio and drive redirection are
+implemented in the library and simply not exposed. A limitation list is evidence about a product, not
+about its architecture.
+
+## What is reused
+
+Upstream is `Devolutions/IronRDP`, Apache-2.0, 67 crates. The ones that matter here:
+
+| Crate | Role |
+|---|---|
+| `ironrdp-web` | the WASM browser build; the client half |
+| `ironrdp-rdcleanpath` | the protocol between browser and proxy, both ends |
+| `ironrdp-connector`, `ironrdp-tls`, `ironrdp-tokio` | connection sequence and transport for the proxy |
+| `ironrdp-rdpsnd`, `ironrdp-rdpdr`, `ironrdp-cliprdr` | audio, drives, clipboard — available if wanted |
+
+Devolutions Gateway is the reference implementation of the proxy half and is worth reading before
+writing this one.
+
+## What is written here
+
+A WebSocket-to-TCP proxy:
+
+1. Terminate the WebSocket and authenticate the user.
+2. Decide which target that identity may reach.
+3. Read the RDCleanPath request, open TCP to the target, perform the TLS handshake on the client's
+   behalf, return the server's response.
+4. Pipe bytes until the session ends.
+
+The proxy never decodes RDP. It is the enforcement point for identity and target selection, and
+nothing else, which is what keeps it small enough to review.
+
+## Decisions
+
+| Decision | State |
+|---|---|
+| Client-side WASM rather than server-side rendering | settled |
+| RDCleanPath, accepting that the proxy can read the stream | settled: internal network, not a concern (Lewis, 2026-09-23) |
+| Reverse tunnel from targets, or direct reach from the proxy | OPEN. The reverse shape means the target's zone needs no inbound rules, which is the property worth having if a zone boundary is ever crossed |
+| Authentication mechanism | OPEN |
+| Session recording | OPEN, and it conflicts with client-side RDP: a proxy that cannot decode the stream cannot record it. If recording is required, it has to come from the target or from a decoding gateway, and that reopens the architecture |
+
+## The capability note
+
+Every limitation of the Cloudflare implementation is a choice made for a multi-tenant edge. On an
+internal network none of those reasons apply, so audio, drive redirection and a full clipboard are
+all available from the same upstream crates. The stripped-down build does not have to be the
+stripped-down experience.
