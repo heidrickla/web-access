@@ -167,3 +167,62 @@ Every limitation of the Cloudflare implementation is a choice made for a multi-t
 internal network none of those reasons apply, so audio, drive redirection and a full clipboard are
 all available from the same upstream crates. The stripped-down build does not have to be the
 stripped-down experience.
+
+## Other connection types
+
+Roadmap, not built; RDP comes first (Lewis, 2026-09-23). Facts below as of 2026-09-23.
+
+The proxy never decodes, so any protocol with a browser-side client fits. Proxy changes shared by
+VNC, SSH and Telnet:
+
+- `Target` gains `protocol`; the port defaults by protocol (3389, 5900, 22, 23).
+- A raw-forward mode: authenticate, resolve, connect, pipe. The RDP path minus the RDCleanPath step.
+- The mode must match the target's protocol. Protocol and port come from config, never the request,
+  so the target-id rule carries over unchanged.
+- Each client bundle passes the same CSP test as the RDP page.
+
+| Protocol | Browser client | Licence |
+|---|---|---|
+| VNC | noVNC v1.7.0; needs only a WebSocket-to-TCP relay | MPL-2.0 (mainly) |
+| SSH | `golang.org/x/crypto/ssh` compiled to WASM, on xterm.js. `c2FmZQ/sshterm` and `hullarb/ssheasy` (adds SFTP) are small wrappers already built this way | BSD-3 / MIT |
+| Telnet | xterm.js plus option negotiation, written here | MIT |
+| HTTP(S) | the browser itself; needs a reverse proxy that parses HTTP, a new component rather than a relay mode | n/a |
+
+- SSH host keys belong in the target entry, checked in the browser: SSH's form of the certificate
+  row in Decisions.
+- Credentials pass through for all of them.
+- Not reusable: Devolutions' gateway UI does VNC, SSH and Telnet, but only its RDP packages are on
+  public npm; `@devolutions/iron-remote-desktop-vnc`, `web-ssh-gui` and `web-telnet-gui` return 404.
+  `russh`'s browser WASM pull request (#349) was closed unmerged.
+
+### Linux desktops
+
+Ubuntu's GNOME desktop ships an RDP server, GNOME Remote Desktop. Nothing is installed on the
+target, so direct reach holds.
+
+| Ubuntu | GNOME | Built-in RDP | `ironrdp-web` |
+|---|---|---|---|
+| 22.04 | 42 | Desktop Sharing: mirrors the console session | untested; GNOME 42 still has the pre-pipeline path |
+| 24.04 | 46 | Desktop Sharing, and Remote Login: login screen, own session | refused |
+| 26.04 | 50 | as 24.04 | refused |
+
+- GNOME Remote Desktop requires the graphics pipeline (EGFX). From GNOME 44 the older path needs a
+  debug flag and serves mirroring only; GNOME 47 removed it (gnome-remote-desktop MR !274).
+- IronRDP's native client gained EGFX on master in August 2026, not yet in a crates.io release
+  (IronRDP #1446). `ironrdp-web` on master sets `support_dyn_vc_gfx_protocol: false` and registers
+  only display control.
+- The work: wire EGFX into `ironrdp-web`, the browser counterpart of IronRDP #1462. GNOME uses
+  RemoteFX Progressive for a client without H.264, and that decoder has landed. Until upstream ships
+  it, the client builds from IronRDP master with a local patch, and that patch is recorded here.
+- Remote Login takes two credentials: one shared RDP credential per machine
+  (`grdctl --system rdp set-credentials`), then the user's own login at the GNOME login screen. The
+  shared one is a per-connection credential, the case the proxy-side store is for.
+- xrdp is the fallback: an installed package, but a listening service rather than an agent. It logs
+  in real Linux accounts through PAM, so pass-through holds. `ironrdp-web` connects to it; an open
+  IronRDP bug garbles 16-bit colour (#1693). Ubuntu 26.04 has no GNOME X11 session, so xrdp there
+  needs a second desktop such as Xfce.
+
+### Kerberos for RDP
+
+`ironrdp-web` accepts a `kdc_proxy_url` through `extension()`; the proxy would add a KDC proxy
+endpoint. Needed where the domain restricts NTLM.
