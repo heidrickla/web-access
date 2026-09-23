@@ -3,7 +3,7 @@
 // console error visible on the page, so the only symptom is a status that never leaves "loading".
 // Measured 2026-09-23.
 
-import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction, ClipboardData }
+import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction, ClipboardData, Extension }
   from './ironrdp_web.js';
 
 const $ = id => document.getElementById(id);
@@ -195,12 +195,164 @@ $('fullscreen').addEventListener('click', () => {
 $('panel-disconnect').addEventListener('click', () => endSession());
 window.addEventListener('resize', followWindowSize);
 
-// Files ride the clipboard channel in RDP (RDPECLIP) and reach JS through invokeExtension:
-// initiate_file_copy, request_file_contents, submit_file_contents. Compiled in — ironrdp-web builds
-// ironrdp with the rdpdr feature — and not yet wired here. Said plainly rather than shown as a drop
-// zone that does nothing.
+/* ---- file transfer over the clipboard channel (RDPECLIP) ------------------
+ *
+ * Two directions, both routed through invokeExtension because the surface is protocol-specific:
+ *
+ *   browser -> remote   initiate_file_copy([{name,size}])  announces the files. The remote then asks
+ *                       for bytes via file_contents_request_callback, answered with
+ *                       submit_file_contents.
+ *   remote -> browser   files_available_callback(files) says what the remote copied. We pull each
+ *                       one with request_file_contents and collect file_contents_response_callback.
+ *
+ * NOTE THE CASE ASYMMETRY, which is easy to get wrong: callbacks DELIVER camelCase (streamId,
+ * isError, dataId, index) and invocations TAKE snake_case (stream_id, file_index, is_error,
+ * clip_data_id). Read from ironrdp-web's clipboard.rs and session.rs.
+ */
+const FLAG_SIZE = 0x1;    // the response carries the file's length, not its contents
+const FLAG_RANGE = 0x2;   // the response carries the requested byte range
+const CHUNK = 1 << 20;    // 1 MiB per range request
+
+let outgoing = [];              // File objects, index-aligned with what initiate_file_copy announced
+let remoteFiles = [];           // what the remote has on its clipboard
+let nextStream = 1;
+const pending = new Map();      // streamId -> resolve/reject for a request we issued
+
+function ext(ident, value) {
+  if (!session) throw new Error('no session');
+  return session.invokeExtension(new Extension(ident, value));
+}
+
+function humanSize(n) {
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 ? 1 : 0) + ' ' + units[i];
+}
+
+/// Ask the remote for one slice, resolving when its response arrives.
+function askRemote(fileIndex, flags, position, size) {
+  const streamId = nextStream++;
+  return new Promise((resolve, reject) => {
+    pending.set(streamId, { resolve, reject });
+    try {
+      ext('request_file_contents', {
+        stream_id: streamId,
+        file_index: fileIndex,
+        flags,
+        position,
+        size,
+      });
+    } catch (err) {
+      pending.delete(streamId);
+      reject(err);
+    }
+    // Without a timeout a remote that never answers leaves the entry, and the download bar, forever.
+    setTimeout(() => {
+      if (pending.has(streamId)) {
+        pending.delete(streamId);
+        reject(new Error('the remote did not answer for file ' + fileIndex));
+      }
+    }, 30000);
+  });
+}
+
+async function downloadRemoteFile(index, li) {
+  const meta = remoteFiles[index];
+  const bar = document.createElement('progress');
+  bar.max = 1; bar.value = 0;
+  li.append(bar);
+  try {
+    // The size the clipboard advertised is not always present, so ask for it explicitly first.
+    let total = Number(meta.size) || 0;
+    if (!total) {
+      const sized = await askRemote(index, FLAG_SIZE, 0, 8);
+      // The SIZE response carries a little-endian 64-bit length.
+      const view = new DataView(sized.buffer, sized.byteOffset, sized.byteLength);
+      total = Number(view.getBigUint64(0, true));
+    }
+
+    const parts = [];
+    for (let at = 0; at < total; at += CHUNK) {
+      const want = Math.min(CHUNK, total - at);
+      parts.push(await askRemote(index, FLAG_RANGE, at, want));
+      bar.value = Math.min(1, (at + want) / total);
+    }
+
+    const url = URL.createObjectURL(new Blob(parts));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = meta.name;
+    a.click();
+    URL.revokeObjectURL(url);
+    say('downloaded ' + meta.name);
+  } catch (err) {
+    say('download failed: ' + describe(err), true);
+  } finally {
+    bar.remove();
+  }
+}
+
+function renderIncoming() {
+  const list = $('incoming');
+  list.innerHTML = '';
+  $('incoming-head').hidden = remoteFiles.length === 0;
+  remoteFiles.forEach((f, i) => {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'fname';
+    name.textContent = f.name;
+    const size = document.createElement('span');
+    size.className = 'fsize';
+    size.textContent = humanSize(Number(f.size) || 0);
+    const get = document.createElement('button');
+    get.textContent = 'Download';
+    get.addEventListener('click', () => downloadRemoteFile(i, li));
+    li.append(name, size, get);
+    list.append(li);
+  });
+}
+
+function renderOutgoing() {
+  const list = $('outgoing');
+  list.innerHTML = '';
+  outgoing.forEach(f => {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'fname';
+    name.textContent = f.name;
+    const size = document.createElement('span');
+    size.className = 'fsize';
+    size.textContent = humanSize(f.size);
+    li.append(name, size);
+    list.append(li);
+  });
+}
+
+function offerFiles(files) {
+  if (!session || !files.length) return;
+  outgoing = Array.from(files);
+  renderOutgoing();
+  try {
+    ext('initiate_file_copy', outgoing.map(f => ({ name: f.name, size: f.size })));
+    say(outgoing.length + ' file(s) on the remote clipboard — paste on the remote');
+  } catch (err) {
+    say('offering files failed: ' + describe(err), true);
+  }
+}
+
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(e =>
+  drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(e =>
+  drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', ev => offerFiles(ev.dataTransfer.files));
+$('pick').addEventListener('click', () => $('picker').click());
+$('picker').addEventListener('change', ev => offerFiles(ev.target.files));
+
 $('files-note').textContent =
-  'File transfer is not wired up yet. The client supports it over the clipboard channel; it is the next piece.';
+  'Files ride the RDP clipboard channel, so they appear as a paste on the remote rather than as a drive.';
 
 function attachInput() {
   const at = e => {
@@ -290,6 +442,40 @@ async function connect(targetId) {
         } catch { /* a clipboard update must never take the session down */ }
       })
       .forceClipboardUpdateCallback(() => sendClipboard())
+      // File transfer callbacks are registered through extension(), not as builder methods.
+      .extension(new Extension('files_available_callback', files => {
+        remoteFiles = Array.from(files || []);
+        renderIncoming();
+        if (remoteFiles.length) say(remoteFiles.length + ' file(s) copied on the remote — open the panel to download');
+      }))
+      .extension(new Extension('file_contents_request_callback', async req => {
+        // The remote is pasting our files and wants bytes.
+        const file = outgoing[req.index];
+        try {
+          if (!file) throw new Error('no file at index ' + req.index);
+          let data;
+          if (req.flags & FLAG_SIZE) {
+            // The SIZE reply is the length as a little-endian 64-bit value, not file content.
+            data = new Uint8Array(8);
+            new DataView(data.buffer).setBigUint64(0, BigInt(file.size), true);
+          } else {
+            const slice = file.slice(Number(req.position), Number(req.position) + Number(req.size));
+            data = new Uint8Array(await slice.arrayBuffer());
+          }
+          ext('submit_file_contents', { stream_id: req.streamId, is_error: false, data });
+        } catch (err) {
+          // An error reply is required, or the remote's paste hangs rather than failing.
+          try { ext('submit_file_contents', { stream_id: req.streamId, is_error: true, data: new Uint8Array() }); } catch { /* session gone */ }
+          say('upload failed: ' + describe(err), true);
+        }
+      }))
+      .extension(new Extension('file_contents_response_callback', resp => {
+        const waiting = pending.get(resp.streamId);
+        if (!waiting) return;
+        pending.delete(resp.streamId);
+        if (resp.isError) waiting.reject(new Error('the remote reported an error for this file'));
+        else waiting.resolve(new Uint8Array(resp.data || []));
+      }))
       // REQUIRED, both of them. ironrdp-web refuses to connect without every one of username,
       // password, destination, proxyAddress, authToken, renderCanvas, setCursorStyleCallback and
       // setCursorStyleCallbackContext. Read off session.rs rather than discovered one failure at a
@@ -336,6 +522,14 @@ async function connect(targetId) {
     $('rail').hidden = true;
     openRail(false);
     session = null;
+    // Transfer state belongs to the session. Leaving it would show the last session's files and let
+    // a stale streamId resolve against a new one.
+    outgoing = [];
+    remoteFiles = [];
+    for (const { reject } of pending.values()) reject(new Error('session ended'));
+    pending.clear();
+    renderOutgoing();
+    renderIncoming();
   }
 }
 

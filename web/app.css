@@ -329,3 +329,38 @@ body.connected #screen { display: block; }
 #panel .danger:hover { border-color: var(--bad); background: rgba(255, 107, 107, .08); }
 
 #panel .note { margin: 9px 0 0; font-size: 11px; line-height: 1.5; color: var(--dim); }
+
+#panel h4 {
+  margin: 14px 0 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+#drop {
+  border: 1px dashed var(--line-hi);
+  border-radius: 8px;
+  padding: 16px 12px;
+  text-align: center;
+  transition: border-color .15s ease, background .15s ease;
+}
+#drop p { margin: 0 0 10px; font-size: 11.5px; line-height: 1.5; color: var(--dim); }
+#drop.over { border-color: var(--accent); background: rgba(91, 157, 255, .07); }
+
+.files { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.files li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 7px 9px;
+}
+.files .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files .fsize { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+.files button { padding: 3px 9px; font-size: 11px; }
+.files progress { width: 100%; height: 3px; margin-top: 5px; accent-color: var(--accent); }
