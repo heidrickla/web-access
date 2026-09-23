@@ -1,1 +1,8 @@
 * text=auto eol=lf
+
+# VENDORED FILES ARE NOT NORMALISED. Cargo verifies each one against .cargo-checksum.json over its
+# exact bytes, and several upstream crates ship CRLF. Letting the rule above rewrite line endings
+# changes those bytes, so a fresh clone fails checksum verification and presents as a corrupt vendor
+# tree rather than as a line-ending setting. Measured 2026-09-23: 38 files would have been rewritten,
+# across generic-array, nu-ansi-term and zerocopy.
+vendor/** -text
