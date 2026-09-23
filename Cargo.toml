@@ -24,6 +24,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+ring = "0.17"
 
 # Only the Windows build needs the Service Control Manager integration. On Linux the binary is a
 # plain daemon and this is not compiled at all.

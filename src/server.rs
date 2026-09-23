@@ -3,12 +3,10 @@
 //! Both callers supply their own shutdown future: Ctrl-C from a terminal, the Service Control
 //! Manager's stop event from a service. Nothing below knows which.
 
-use crate::auth::{Authenticator, StaticAuthenticator};
 use crate::config::Config;
-use crate::policy::{Catalogue, Identity};
+use crate::policy::Catalogue;
 use crate::proxy::{tls_setup, Session};
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -19,6 +17,8 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(config_path)?;
     let catalogue = Arc::new(Catalogue::new(&cfg));
+    let all_groups: Arc<Vec<String>> =
+        Arc::new(cfg.policy.iter().map(|p| p.group.clone()).collect());
 
     if catalogue.is_empty() {
         warn!("the allowlist is empty, so this proxy can reach nothing; that is the safe state, not a working one");
@@ -29,25 +29,11 @@ pub async fn run(
         verify = ?cfg.tls.verify,
         "loaded {config_path}"
     );
-
-    // Placeholder identity source. See auth.rs: the piece designed to be deleted once the identity
-    // provider is chosen.
-    let mut tokens = BTreeMap::new();
-    if let Ok(dev) = std::env::var("WEB_ACCESS_DEV_TOKEN") {
-        tokens.insert(
-            dev,
-            Identity {
-                subject: "dev".into(),
-                groups: cfg.policy.iter().map(|p| p.group.clone()).collect(),
-            },
-        );
-        warn!("WEB_ACCESS_DEV_TOKEN is set: one static token grants every configured group. Development only.");
-    }
-    let authenticator: Arc<dyn Authenticator> = Arc::new(StaticAuthenticator::new(tokens));
+    warn!("NO IDENTITY PROVIDER IS CONFIGURED: everyone who can reach this listener is served the launcher and granted every configured group. The boundary is the network, not an identity. See auth.rs::identify.");
 
     let tls = Arc::new(tls_setup(&cfg.tls)?);
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-    info!(listen = %cfg.listen, "accepting websocket connections");
+    info!(listen = %cfg.listen, "serving the launcher and accepting websocket connections");
 
     tokio::pin!(shutdown);
     loop {
@@ -64,15 +50,18 @@ pub async fn run(
                         continue;
                     }
                 };
+
                 let session = Session {
                     catalogue: Arc::clone(&catalogue),
-                    authenticator: Arc::clone(&authenticator),
                     tls: Arc::clone(&tls),
                 };
+                let catalogue = Arc::clone(&catalogue);
+                let all_groups = Arc::clone(&all_groups);
+
                 tokio::spawn(async move {
-                    // One listener serves both the browser client and its WebSocket. The path is
-                    // peeked without consuming, so a WebSocket upgrade still reaches the handshake
-                    // with its bytes intact.
+                    // One listener serves both the launcher and its WebSocket. The path is peeked
+                    // without consuming, so a WebSocket upgrade still reaches the handshake with its
+                    // bytes intact.
                     let path = match crate::web::peek_path(&stream).await {
                         Ok(p) => p,
                         Err(e) => {
@@ -82,8 +71,8 @@ pub async fn run(
                     };
 
                     if path != crate::web::WS_PATH {
-                        if let Err(e) = crate::web::serve(stream, &path).await {
-                            warn!(%peer, %path, error = %e, "serving the client failed");
+                        if let Err(e) = crate::web::serve(stream, &path, &catalogue, &all_groups).await {
+                            warn!(%peer, %path, error = %e, "serving the launcher failed");
                         }
                         return;
                     }

@@ -4,7 +4,7 @@
 //! client's behalf, hands back the server's certificate chain so the CLIENT can judge who it
 //! reached, and then moves bytes until one side stops.
 
-use crate::auth::Authenticator;
+use crate::auth::Sessions;
 use crate::config::{Tls, VerifyMode};
 use crate::policy::{Catalogue, Denied};
 use crate::resolve::resolve_one;
@@ -40,7 +40,6 @@ pub enum SessionError {
 
 pub struct Session {
     pub catalogue: Arc<Catalogue>,
-    pub authenticator: Arc<dyn Authenticator>,
     pub tls: Arc<TlsSetup>,
 }
 
@@ -91,7 +90,7 @@ impl Session {
         // THE DESTINATION FIELD CARRIES A TARGET ID, NOT AN ADDRESS. RDCleanPath was designed for a
         // client that names a host; here the field is an opaque key into the allowlist, so "reach an
         // arbitrary host" is not a request this protocol can express.
-        let identity = match self.authenticator.authenticate(&proxy_auth) {
+        let identity = match Sessions::global().authenticate(&proxy_auth) {
             Ok(id) => id,
             Err(e) => {
                 warn!(%peer, error = %e, "proxy authentication refused");
