@@ -2,7 +2,15 @@
 *.pem
 *.wasm
 .env
-Cargo.lock
 node_modules/
 pkg/
 target/
+
+# Cargo.lock IS committed. Vendoring without a lockfile is incoherent: the point is a build that is
+# reproducible offline, and the lockfile is what pins it.
+
+# THE VENDORED TREE IS COMMITTED WHOLE and must not be filtered by the patterns above. Cargo verifies
+# every vendored file against .cargo-checksum.json, so one file missed by a pattern breaks the build
+# on a fresh clone and presents as corruption rather than as a gitignore rule.
+# Measured 2026-09-23: without this line git would add 5354 of 5451 files, excluding 14 .pem and 1 .key.
+!vendor/**
