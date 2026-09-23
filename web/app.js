@@ -391,26 +391,53 @@ function askCredentials(targetId) {
     const dialog = $('signin');
     $('signin-title').textContent = 'Sign in to ' + targetId;
 
-    const remembered = localStorage.getItem('user:' + targetId) || '';
-    $('u').value = remembered;
-    $('p').value = '';
+    const savedPassword = localStorage.getItem('pw:' + targetId);
+    $('u').value = localStorage.getItem('user:' + targetId) || '';
+    $('p').value = savedPassword || '';
     $('d').value = localStorage.getItem('domain:' + targetId) || '';
+    $('save').checked = savedPassword !== null;
+
+    // Saving a password puts it in localStorage in the clear: readable by any script served from
+    // this origin and left on disk until cleared. Said once, here, where the choice is made.
+    const note = $('save-note');
+    note.textContent = '';
+    note.hidden = savedPassword === null;
+    if (savedPassword !== null) {
+      note.append('Stored unencrypted in this browser. ');
+      const forget = document.createElement('button');
+      forget.type = 'button';
+      forget.textContent = 'Forget it';
+      forget.addEventListener('click', () => {
+        localStorage.removeItem('pw:' + targetId);
+        $('p').value = '';
+        $('save').checked = false;
+        note.hidden = true;
+        $('p').focus();
+      });
+      note.append(forget);
+    }
 
     const done = () => {
       dialog.removeEventListener('close', done);
       if (dialog.returnValue !== 'go' || !$('u').value) return resolve(null);
       const creds = { username: $('u').value, password: $('p').value, domain: $('d').value.trim() };
+
       localStorage.setItem('user:' + targetId, creds.username);
       if (creds.domain) localStorage.setItem('domain:' + targetId, creds.domain);
       else localStorage.removeItem('domain:' + targetId);
-      $('p').value = '';
+      if ($('save').checked) localStorage.setItem('pw:' + targetId, creds.password);
+      else localStorage.removeItem('pw:' + targetId);
+
+      $('p').value = '';   // never leave it sitting in the DOM
       resolve(creds);
     };
 
     dialog.addEventListener('close', done);
     dialog.showModal();
-    // Focus whichever field still needs filling in.
-    ($('u').value ? $('p') : $('u')).focus();
+    // Focus whatever still needs doing: an empty field, or the Connect button when nothing does.
+    if (!$('u').value) $('u').focus();
+    else if (!$('p').value) $('p').focus();
+    else $('signin-go').focus();
   });
 }
 
