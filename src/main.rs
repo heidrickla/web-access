@@ -33,19 +33,41 @@ pub fn config_path_from_args() -> String {
         .unwrap_or(given)
 }
 
+/// Where a service writes its log. A service has no stdout — anything written there goes nowhere,
+/// so without this the proxy is undiagnosable exactly when it matters. Beside the config, because
+/// that directory already exists and the service can already read it.
+#[cfg(windows)]
+fn service_log_path(config_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("web-access-proxy.log")
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "web_access_proxy=info".into()),
-        )
-        .init();
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "web_access_proxy=info".into())
+    };
 
     #[cfg(windows)]
     if std::env::args().any(|a| a == "--service") {
+        let path = service_log_path(&config_path_from_args());
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false) // a log file is read in Notepad, not a terminal
+            .with_writer(move || file.try_clone().expect("could not clone the log file handle"))
+            .init();
+        tracing::info!(log = %path.display(), "starting as a windows service");
         service::start()?;
         return Ok(());
     }
+
+    tracing_subscriber::fmt().with_env_filter(filter()).init();
 
     let config_path = config_path_from_args();
     tokio::runtime::Runtime::new()?.block_on(async move {

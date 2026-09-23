@@ -25,7 +25,7 @@ try {
   await init();
   setup('info');
 } catch (err) {
-  say('the RDP client failed to load: ' + err, true);
+  say('the RDP client failed to load: ' + describe(err), true);
   throw err;
 }
 
@@ -39,7 +39,7 @@ try {
   token = data.token;
   render(data.targets || []);
 } catch (err) {
-  say('could not load the system list: ' + err, true);
+  say('could not load the system list: ' + describe(err), true);
 }
 
 function render(targets) {
@@ -72,6 +72,29 @@ function render(targets) {
     tiles.append(b);
   }
   say(targets.length + (targets.length === 1 ? ' system' : ' systems'));
+}
+
+// IronError exposes backtrace(), kind() and rdcleanpathDetails() as METHODS. Reading `err.backtrace`
+// without calling it is truthy — it is a function — so stringifying it printed the function's own
+// source code instead of the failure. Measured 2026-09-23, and the reason a real error was invisible.
+function describe(err) {
+  if (!err) return 'unknown error';
+  const parts = [];
+  for (const name of ['kind', 'backtrace']) {
+    if (typeof err[name] === 'function') {
+      try {
+        const value = err[name]();
+        if (value !== undefined && value !== null && String(value) !== '') parts.push(String(value));
+      } catch { /* an accessor that throws must not replace the error with its own */ }
+    }
+  }
+  if (typeof err.rdcleanpathDetails === 'function') {
+    try {
+      const d = err.rdcleanpathDetails();
+      if (d) parts.push('rdcleanpath: ' + JSON.stringify(d, Object.keys(d)));
+    } catch { /* optional detail */ }
+  }
+  return parts.length ? parts.join(' — ') : String(err);
 }
 
 const send = event => {
@@ -143,7 +166,7 @@ async function connect(targetId) {
     await session.run();
     say('session ended');
   } catch (err) {
-    const text = String(err && err.backtrace ? err.backtrace : err);
+    const text = describe(err);
     // A target with NLA enabled refuses before any screen is drawn, because CredSSP wants the
     // credentials up front. Say so plainly rather than showing a bare protocol error.
     if (/credssp|nla|negotiat/i.test(text)) {
