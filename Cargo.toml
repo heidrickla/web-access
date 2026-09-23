@@ -8,7 +8,9 @@ repository = "https://github.com/heidrickla/web-access"
 
 [dependencies]
 ironrdp-rdcleanpath = "0.2.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
+# "sync" is for the oneshot the Windows service uses to turn an SCM stop into a shutdown future.
+# Its absence compiles fine on Linux, because service.rs is cfg(windows) — only the cross-build finds it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 # default-features = false on both, or rustls' default aws-lc-rs backend is compiled ALONGSIDE the
@@ -22,6 +24,11 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+
+# Only the Windows build needs the Service Control Manager integration. On Linux the binary is a
+# plain daemon and this is not compiled at all.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
 
 [profile.release]
 strip = true

@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI for the web-access proxy.
+
+  MSI rather than a self-extracting exe because this is meant to be deployable the way an
+  organisation already deploys things: GPO, SCCM or Intune, with a real uninstall and a real
+  upgrade path. A script that copies files and calls sc.exe is not that.
+
+  Build:  wix extension add -g WixToolset.Firewall.wixext
+          wix build installer/web-access-proxy.wxs -ext WixToolset.Firewall.wixext -o web-access-proxy.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+
+  <Package Name="web-access proxy"
+           Manufacturer="Lewis Heidrick"
+           Version="0.1.0"
+           UpgradeCode="7c4a1c6e-2f5b-4d8a-9e13-5b0a2d6f8c41"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- The service reads the config at start, so an upgrade restarts it; that is the intended
+         behaviour and the reason the config lives outside the install directory. -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="web-access" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="web-access" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Payload">
+      <Component Id="ProxyExe" Directory="INSTALLFOLDER" Guid="a1d2f3b4-5c6d-4e7f-8a90-b1c2d3e4f501">
+        <File Id="web_access_proxy.exe" Source="payload\web-access-proxy.exe" KeyPath="yes" />
+
+        <!-- LocalService, not LocalSystem. The proxy needs to open sockets and read one config
+             file; it never authenticates as itself to anything, because credentials pass through
+             to the target untouched. There is no reason for it to hold machine identity. -->
+        <ServiceInstall Id="ServiceInstall"
+                        Name="WebAccessProxy"
+                        DisplayName="web-access RDP proxy"
+                        Description="Terminates browser WebSocket connections and proxies RDCleanPath to allowlisted targets. Does not decode RDP."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="NT AUTHORITY\LocalService"
+                        Arguments="--service &quot;[DATAFOLDER]config.toml&quot;"
+                        Vital="yes" />
+
+        <ServiceControl Id="ServiceControl"
+                        Name="WebAccessProxy"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+
+        <!-- Scoped to the PROGRAM, not to a port. The listening port comes from config.toml, which
+             an administrator edits after install, so a port-scoped rule baked in here would be
+             wrong the first time anyone changed it. -->
+        <fw:FirewallException Id="InboundWebSocket"
+                              Name="web-access proxy"
+                              Description="Inbound WebSocket connections to the web-access RDP proxy"
+                              Scope="localSubnet"
+                              Profile="all"
+                              Protocol="tcp"
+                              IgnoreFailure="no" />
+      </Component>
+
+      <!-- NeverOverwrite so an upgrade does not replace an administrator's allowlist with the
+           example. The allowlist is a security control; silently resetting it on upgrade would be
+           a failure mode, not a convenience. -->
+      <Component Id="ConfigFile" Directory="DATAFOLDER" Guid="b2e3a4c5-6d7e-4f80-9ab1-c2d3e4f50612"
+                 NeverOverwrite="yes">
+        <File Id="config.toml" Source="..\config.example.toml" Name="config.toml" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="web-access proxy" Level="1">
+      <ComponentGroupRef Id="Payload" />
+    </Feature>
+
+  </Package>
+</Wix>
