@@ -1,0 +1,138 @@
+//! Serving the browser client.
+//!
+//! "Clientless" means nothing is INSTALLED on the accessing machine, not that no client exists. The
+//! RDP client is `ironrdp-web` compiled to WebAssembly, and it is delivered to the browser on
+//! demand, per session. This module is what delivers it.
+//!
+//! The assets are EMBEDDED IN THE BINARY rather than served from a web root. The deployment story is
+//! one MSI, one service, browse to it: a web root would add a second thing to install, a path to get
+//! wrong, and a way for the served client to drift from the proxy it talks to.
+//!
+//! The HTTP handled here is deliberately tiny — GET on a fixed set of paths, nothing else. Anything
+//! that is not one of those paths is a 404, and the WebSocket endpoint never reaches this code.
+
+use std::io;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// Where the browser opens its WebSocket. Everything else on the listener is a static asset.
+pub const WS_PATH: &str = "/ws";
+
+/// (request path, content type, bytes).
+pub const ASSETS: &[(&str, &str, &[u8])] = &[
+    ("/", "text/html; charset=utf-8", include_bytes!("../web/index.html")),
+    ("/index.html", "text/html; charset=utf-8", include_bytes!("../web/index.html")),
+    ("/ironrdp_web.js", "text/javascript; charset=utf-8", include_bytes!("../web/ironrdp_web.js")),
+    ("/ironrdp_web_bg.wasm", "application/wasm", include_bytes!("../web/ironrdp_web_bg.wasm")),
+];
+
+/// Peek at the request line without consuming it, so a WebSocket upgrade can still be handed to the
+/// handshake code with its bytes intact. Routing is by PATH rather than by the Upgrade header: a
+/// header block can be split across segments, a request line essentially never is.
+pub async fn peek_path(stream: &TcpStream) -> io::Result<String> {
+    let mut buf = [0u8; 512];
+    let n = stream.peek(&mut buf).await?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    Ok(head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .to_owned())
+}
+
+/// Read the request off the socket and answer it. Only GET on a known path succeeds.
+pub async fn serve(mut stream: TcpStream, path: &str) -> io::Result<()> {
+    drain_request(&mut stream).await?;
+
+    match ASSETS.iter().find(|(p, _, _)| *p == path) {
+        Some((_, content_type, body)) => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+                 Cache-Control: no-store\r\n\
+                 X-Content-Type-Options: nosniff\r\n\
+                 Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' ws: wss:\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(body).await?;
+        }
+        None => {
+            let body = b"not found";
+            let header = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(body).await?;
+        }
+    }
+    stream.flush().await
+}
+
+/// Consume the request head. Bounded, because an unbounded read here is a trivial memory exhaustion
+/// from an unauthenticated peer.
+async fn drain_request(stream: &mut TcpStream) -> io::Result<()> {
+    const LIMIT: usize = 16 * 1024;
+    let mut seen = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    while seen.len() < LIMIT {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            break;
+        }
+        seen.push(byte[0]);
+        if seen.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_request_line_decides_the_route() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n")
+                .await
+                .unwrap();
+            // Hold the connection open so the peek has something to look at.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        assert_eq!(peek_path(&stream).await.unwrap(), WS_PATH);
+    }
+
+    #[tokio::test]
+    async fn a_query_string_does_not_change_the_route() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET /index.html?v=2 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        assert_eq!(peek_path(&stream).await.unwrap(), "/index.html");
+    }
+
+    #[test]
+    fn every_asset_has_bytes() {
+        for (path, ctype, body) in ASSETS {
+            assert!(!body.is_empty(), "{path} is empty");
+            assert!(!ctype.is_empty(), "{path} has no content type");
+        }
+    }
+}

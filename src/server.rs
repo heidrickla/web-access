@@ -70,6 +70,24 @@ pub async fn run(
                     tls: Arc::clone(&tls),
                 };
                 tokio::spawn(async move {
+                    // One listener serves both the browser client and its WebSocket. The path is
+                    // peeked without consuming, so a WebSocket upgrade still reaches the handshake
+                    // with its bytes intact.
+                    let path = match crate::web::peek_path(&stream).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(%peer, error = %e, "could not read the request line");
+                            return;
+                        }
+                    };
+
+                    if path != crate::web::WS_PATH {
+                        if let Err(e) = crate::web::serve(stream, &path).await {
+                            warn!(%peer, %path, error = %e, "serving the client failed");
+                        }
+                        return;
+                    }
+
                     let ws = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(e) => {

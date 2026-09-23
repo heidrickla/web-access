@@ -12,7 +12,7 @@ Design record: `docs/architecture.md`.
 
 | Piece | Source | Status |
 |---|---|---|
-| RDP client in the browser | `ironrdp-web`, Apache-2.0 | reuse |
+| RDP client in the browser | `ironrdp-web`, Apache-2.0 | built to WASM and EMBEDDED in the proxy binary |
 | RDCleanPath, both ends | `ironrdp-rdcleanpath` | reuse |
 | WebSocket-to-TCP proxy | this repo | written; compiles, 12 tests pass |
 | Authentication in front of the proxy | this repo | trait plus a development stub; the identity provider is undecided |
@@ -108,7 +108,8 @@ Then configure it, because an unconfigured gateway will not run:
 1. Edit `C:\ProgramData\web-access\config.toml`: set `listen`, author the `[[target]]` allowlist and
    the `[[policy]]` grants, and set `tls.verify`. There is no default for `verify`.
 2. If `verify = "ca"`, put the CA bundle where `ca_bundle` points.
-3. `Start-Service WebAccessProxy`
+3. `Start-Service WebAccessProxy`, then browse to `http://<host>:<port>/`. The proxy serves the
+   client itself — there is nothing to install on the machine you browse from, which was the point.
 4. `Get-Service WebAccessProxy` should read Running. If it does not, the reason is in the config:
    the service refuses to start rather than run against something it cannot validate.
 
@@ -128,6 +129,38 @@ and uses the same schema. The Firewall extension must be version-pinned to match
 NOT YET INSTALLED ANYWHERE as of 2026-09-23. The package builds and its contents are verified; no
 machine has run it, so the service's ability to read the config as LocalService and bind its port is
 unproven.
+
+## The browser client
+
+"Clientless" means nothing is INSTALLED on the accessing machine, not that no client exists. The RDP
+client is `ironrdp-web` compiled to WebAssembly and delivered per session by the proxy itself.
+
+| | |
+|---|---|
+| `web/ironrdp_web_bg.wasm` | 7.4 MB, built with `wasm-pack build --target web --release` |
+| `web/ironrdp_web.js` | 70 KB of wasm-bindgen glue |
+| `web/index.html` | the page: connection form, canvas, mouse and keyboard wiring |
+
+All three are committed and embedded with `include_bytes!`, so the deployment stays one MSI, one
+service, browse to it. There is no web root to install and no way for the served client to drift
+from the proxy it talks to.
+
+One listener carries both. The request path is PEEKED without consuming, so a WebSocket upgrade
+still reaches the handshake intact; `/ws` is the socket and everything else is a static asset.
+Routing is by request line rather than by the `Upgrade` header because a header block can be split
+across segments and a request line essentially never is.
+
+The client's API maps straight onto the proxy's design, which is the check that the architecture was
+right: `SessionBuilder.destination()` carries the TARGET ID, `authToken()` is what the proxy
+authenticates, and `username()`/`password()` pass through to Windows untouched.
+
+Verified 2026-09-23 by fetching from a running proxy: `/` returns 200 and 6297 bytes of HTML,
+`/ironrdp_web_bg.wasm` returns 200 with `application/wasm`, 7379141 bytes, beginning `0061736d`,
+and an unknown path returns 404.
+
+Keyboard handling is deliberately partial: printable keys go through `unicodePressed`, and the
+non-printable ones use a scancode table covering the essentials. A key outside both is dropped
+rather than guessed at, which is visible as a key that does nothing rather than as a wrong character.
 
 ## Conventions
 
