@@ -1,0 +1,7 @@
+target/
+*.wasm
+pkg/
+node_modules/
+.env
+*.key
+*.pem
