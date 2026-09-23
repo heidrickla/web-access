@@ -229,16 +229,103 @@ dialog#signin::backdrop { background: rgba(5, 7, 10, .68); backdrop-filter: blur
 
 /* ---- session ---------------------------------------------------------- */
 
-#screen {
-  display: none;
-  margin: 0 auto;
-  background: #000;
-  max-width: 100%;
-  border-radius: 6px;
-}
+#screen { display: none; background: #000; }
 #screen:focus { outline: none; }
 
-body.connected { background: #000; }
+/* Connected, the desktop IS the window: the remote is asked for a desktop the size of the viewport,
+   so the canvas is shown at its natural pixels rather than scaled. Scaling a remote desktop is what
+   makes text fuzzy; resizing it keeps every pixel 1:1. */
+body.connected { background: #000; overflow: hidden; }
+body.connected header { display: none; }
 body.connected main { padding: 0; }
 body.connected #tiles { display: none; }
-body.connected #screen { display: block; border-radius: 0; }
+body.connected #screen { display: block; }
+
+/* ---- session rail and panel ------------------------------------------- */
+
+#rail {
+  position: fixed;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+}
+
+.rail-btn {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line-hi);
+  border-left: 0;
+  border-radius: 0 7px 7px 0;
+  background: rgba(23, 27, 35, .82);
+  color: var(--dim);
+  opacity: .38;
+  transition: opacity .15s ease, color .15s ease, background .15s ease;
+}
+.rail-btn:hover { opacity: 1; color: var(--fg); background: var(--panel-hi); border-color: var(--accent); }
+#rail.open #rail-toggle { display: none; }
+
+#panel {
+  display: none;
+  width: 296px;
+  max-height: 86vh;
+  overflow-y: auto;
+  background: rgba(23, 27, 35, .97);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--line-hi);
+  border-left: 0;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .55);
+}
+#rail.open #panel { display: block; }
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px 11px 15px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .03em;
+}
+.panel-head span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#panel-close { width: 24px; height: 24px; border: 1px solid var(--line-hi); border-radius: 6px; opacity: .6; }
+
+#panel section { padding: 14px 15px; border-bottom: 1px solid var(--line); }
+#panel section:last-child { border-bottom: 0; }
+
+#panel h3 {
+  margin: 0 0 9px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+#panel textarea {
+  width: 100%;
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--line-hi);
+  border-radius: 7px;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  resize: vertical;
+}
+#panel textarea:focus { outline: none; border-color: var(--accent); }
+
+#panel .row { display: flex; gap: 8px; margin-top: 9px; flex-wrap: wrap; }
+#panel .row button { flex: 1; min-width: 96px; }
+#panel .danger { width: 100%; border-color: #5a2b2b; color: #ffb4b4; }
+#panel .danger:hover { border-color: var(--bad); background: rgba(255, 107, 107, .08); }
+
+#panel .note { margin: 9px 0 0; font-size: 11px; line-height: 1.5; color: var(--dim); }
