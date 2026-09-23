@@ -116,6 +116,23 @@ const SCANCODE = {
   ControlRight:0xE01D, AltRight:0xE038, MetaLeft:0xE05B, MetaRight:0xE05C,
 };
 
+// Invoked by the client as (kind, data, hotspotX, hotspotY), where kind is "default", "hidden" or
+// "url" and data is a data-URL for the cursor image. Read from ironrdp-web's session.rs.
+function setCursorStyle(kind, data, hotspotX, hotspotY) {
+  switch (kind) {
+    case 'hidden':
+      canvas.style.cursor = 'none';
+      break;
+    case 'url':
+      canvas.style.cursor = data
+        ? `url(${data}) ${hotspotX || 0} ${hotspotY || 0}, default`
+        : 'default';
+      break;
+    default:
+      canvas.style.cursor = 'default';
+  }
+}
+
 function attachInput() {
   const at = e => {
     const r = canvas.getBoundingClientRect();
@@ -191,7 +208,20 @@ async function connect(targetId) {
       .username(creds.username)
       .password(creds.password)
       .desktopSize(new DesktopSize(canvas.width, canvas.height))
-      .renderCanvas(canvas);
+      .renderCanvas(canvas)
+      // REQUIRED, both of them. ironrdp-web refuses to connect without every one of username,
+      // password, destination, proxyAddress, authToken, renderCanvas, setCursorStyleCallback and
+      // setCursorStyleCallbackContext. Read off session.rs rather than discovered one failure at a
+      // time, which is how the first two were found.
+      .setCursorStyleCallback(setCursorStyle)
+      .setCursorStyleCallbackContext(window)
+      // Optional and worth having: the remote decides the desktop size, so follow it rather than
+      // leaving the canvas at whatever it was created with.
+      .canvasResizedCallback(() => {
+        if (!session) return;
+        const size = session.desktopSize();
+        if (size) { canvas.width = size.width; canvas.height = size.height; }
+      });
     if (creds.domain) builder.serverDomain(creds.domain);
 
     session = await builder.connect();
