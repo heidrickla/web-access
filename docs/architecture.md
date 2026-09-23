@@ -77,6 +77,7 @@ nothing else, which is what keeps it small enough to review.
 | DIRECT REACH: the proxy opens TCP to the target, no agents anywhere | settled (Lewis, 2026-09-23) |
 | PASS-THROUGH: the user's own Windows credentials go to the target; the proxy stores none | settled (Lewis, 2026-09-23) |
 | Identity provider for authenticating the USER to the proxy | OPEN |
+| WHERE SAVED CREDENTIALS LIVE | OPEN, and the answer changes the architecture. See below |
 | Target list source | OPEN; static config is enough to start |
 | THE CLIENT SENDS A TARGET ID, NEVER AN ADDRESS | settled by design. Cloudflare's `/rdp/<vnet>/<ip>/<port>` lets the browser name the destination, so the allowlist is all that stands between a crafted request and an unlisted host. An opaque id makes "reach an arbitrary host" inexpressible rather than merely forbidden |
 | RESOLVE BY NAME, not by address | settled (Lewis, 2026-09-23) |
@@ -110,6 +111,46 @@ With no agents, nothing outside the proxy constrains which hosts it can open a s
 network policy. SO THE TARGET ALLOWLIST IN THE PROXY IS A SECURITY CONTROL, not a convenience
 feature: default-deny, explicit, and reviewable. A bug that lets an identity reach an unlisted target
 is a boundary failure, and it should be tested as one.
+
+### Where saved credentials live
+
+Three options, and the third is the one this grows into. Recorded because the first framing of this
+offered only the first two, which is a narrower question than the one being asked.
+
+| | Where | What it costs |
+|---|---|---|
+| Browser `localStorage` | plaintext on disk, per browser | what ships today. No server work, no key management, and a Windows password in a file any script on the origin can read |
+| Browser credential manager | DPAPI-encrypted in the user's profile | the Credential Management API, which needs a SECURE ORIGIN, so it waits on a TLS listener. Still per-browser: nothing follows a user to another machine |
+| PROXY-SIDE ENCRYPTED STORE | a database the proxy owns, the Guacamole model | the direction this grows into, and the one that reverses "the proxy stores nothing" |
+
+THE THIRD IS WHAT MAKES A MULTI-USER GATEWAY POSSIBLE, and that is why it wins eventually. It buys
+things the other two cannot:
+
+- Credentials follow the USER, not the browser. Any machine, same experience.
+- An administrator can attach credentials to a CONNECTION rather than a person, so an operator clicks
+  a system and is in without ever knowing the Windows password — which is also how a credential gets
+  rotated without telling anyone.
+- One place to audit, revoke and rotate.
+
+What it costs is honest and should be stated before it is built, not after:
+
+- THE PROXY BECOMES A CREDENTIAL VAULT. Compromising it stops yielding reach alone and starts
+  yielding the keys to everything it can reach. That is the property `pass-through` was chosen to
+  avoid, so choosing this is a reversal and not an extension.
+- The audit trail weakens if credentials are per-connection rather than per-person: the proxy log
+  still names the person, but the Windows event log names whatever account the connection carries,
+  and the two stop corresponding. Per-user storage keeps the correspondence; per-connection does not.
+- KEY MANAGEMENT IS THE WHOLE PROBLEM, not the encryption. A key sitting beside the database is
+  obfuscation. The candidates, in order of how much they actually protect:
+  1. Derived from the authenticated user's own session, so a row is only decryptable while that user
+     is signed in. Strongest, and it requires the identity provider decision first.
+  2. Windows DPAPI under the service account, which ties the store to the machine and stops a stolen
+     database file being readable elsewhere. Available today, since the proxy is a Windows service.
+  3. A key in the config file. Not worth the word encrypted.
+
+So this waits on the identity provider, because option 1 is the one worth having and it cannot be
+built before there are identities to key against. Until then `localStorage` stays, and the sign-in
+dialog says plainly where the password is kept.
 
 ### What pass-through makes true
 
