@@ -40,6 +40,18 @@
         <button id="clip-send">Send to remote</button>
         <button id="clip-copy" class="ghost">Copy</button>
       </div>
+    </section>
+
+    <section>
+      <h3>Files</h3>
+      <div id="drop">
+        <p>Drop files here to put them on the remote clipboard, then paste on the remote.</p>
+        <button id="pick" class="ghost">Choose files</button>
+        <input id="picker" type="file" multiple hidden>
+      </div>
+      <ul id="outgoing" class="files"></ul>
+      <h4 id="incoming-head" hidden>On the remote clipboard</h4>
+      <ul id="incoming" class="files"></ul>
       <p class="note" id="files-note"></p>
     </section>
 
