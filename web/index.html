@@ -21,6 +21,25 @@
   <div id="tiles"></div>
   <canvas id="screen" width="1280" height="800" tabindex="0"></canvas>
 </main>
+
+<!--
+  Credentials are asked for AFTER a system is chosen, not before. IronRDP requires a username to
+  connect at all — omitting it fails with "username missing" — so there is no path where the target's
+  own login screen appears instead. Cloudflare's browser RDP prompts for the same reason.
+-->
+<dialog id="signin">
+  <form method="dialog" id="signin-form">
+    <h2 id="signin-title">Sign in</h2>
+    <label>Username<input id="u" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+    <label>Password<input id="p" type="password" autocomplete="current-password"></label>
+    <label>Domain <span class="hint">optional</span><input id="d" autocapitalize="none" spellcheck="false"></label>
+    <div class="actions">
+      <!-- formnovalidate, or `required` on the username blocks Cancel from closing the dialog. -->
+      <button value="cancel" type="submit" class="ghost" formnovalidate>Cancel</button>
+      <button value="go" type="submit" id="signin-go" class="primary">Connect</button>
+    </div>
+  </form>
+</dialog>
 <script type="module" src="./app.js"></script>
 </body>
 </html>
