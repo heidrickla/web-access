@@ -7,14 +7,14 @@ Design record: `docs/architecture.md`.
 
 ## Shape
 
-    browser (ironrdp-web, WASM)  ──WebSocket/TLS──>  proxy  ──TCP 3389──>  Windows target
-            ^ the RDP client                          ^ auth + RDCleanPath, no decoding
+    browser (ironrdp-web, WASM)  ──WebSocket──>  proxy  ──TCP 3389──>  Windows target
+            ^ the RDP client                      ^ auth + RDCleanPath, no decoding
 
 | Piece | Source | Status |
 |---|---|---|
 | RDP client in the browser | `ironrdp-web`, Apache-2.0 | built to WASM and EMBEDDED in the proxy binary |
 | RDCleanPath, both ends | `ironrdp-rdcleanpath` | reuse |
-| WebSocket-to-TCP proxy | this repo | written; compiles, 12 tests pass |
+| WebSocket-to-TCP proxy | this repo | carried a live session to a Windows host, 2026-09-23 |
 | Authentication in front of the proxy | this repo | trait plus a development stub; the identity provider is undecided |
 
 ## Build
@@ -23,7 +23,7 @@ Design record: `docs/architecture.md`.
     cargo test
     cargo run -- config.toml
 
-The dependency tree is VENDORED, so this builds with no network at all. `vendor/` holds 106 crates
+The dependency tree is VENDORED, so this builds with no network at all. `vendor/` holds 109 crates
 and `.cargo/config.toml` points Cargo at it; `Cargo.lock` is committed, because vendoring without a
 lockfile pins nothing. Nothing is fetched from crates.io.
 
@@ -39,9 +39,10 @@ then `cargo build --offline` and `cargo test --offline`. Build succeeded, 12 tes
 
 `config.example.toml` is the starting point. There is no default for `tls.verify`; state it.
 
-VERIFICATION STATE, 2026-09-23: the crate compiles on Rust 1.98.1 and its 12 tests pass. It has NOT
-been run against a real RDP server, so the handshake is correct against the published RDCleanPath
-types and unproven against Windows. The first live connection is the test that matters.
+VERIFIED AGAINST WINDOWS 2026-09-23: installed from the MSI, the service ran as LocalService, the
+launcher listed the configured targets, and an RDP session connected through the proxy. The
+RDCleanPath handshake, the target-id indirection, the allowlist and pass-through credentials are
+proven against a real server.
 
 ## Why not the obvious things
 
@@ -142,9 +143,8 @@ WiX v5 SPECIFICALLY. v6 and v7 require accepting the Open Source Maintenance Fee
 licensing decision with a fee attached for commercial use. v5 is the last version without that gate
 and uses the same schema. The Firewall extension must be version-pinned to match the toolset.
 
-NOT YET INSTALLED ANYWHERE as of 2026-09-23. The package builds and its contents are verified; no
-machine has run it, so the service's ability to read the config as LocalService and bind its port is
-unproven.
+Installed and run on a Windows host 2026-09-23: as LocalService the service read its config, bound
+its port and carried an RDP session.
 
 ## The browser client
 
@@ -155,7 +155,7 @@ client is `ironrdp-web` compiled to WebAssembly and delivered per session by the
 |---|---|
 | `web/ironrdp_web_bg.wasm` | 7.4 MB, built with `wasm-pack build --target web --release` |
 | `web/ironrdp_web.js` | 70 KB of wasm-bindgen glue |
-| `web/index.html` | the page: launcher tiles, canvas, no input fields |
+| `web/index.html` | the page: launcher tiles, sign-in dialog, canvas, session rail |
 | `web/app.css`, `web/app.js` | separate files, NOT inlined — the proxy sends `default-src 'self'`, which drops an inline `<style>` and blocks an inline `<script>`. Inlining them produced an unstyled page stuck on "loading" with the cause visible only in the console. A test asserts the page inlines nothing the CSP forbids |
 
 All three are committed and embedded with `include_bytes!`, so the deployment stays one MSI, one

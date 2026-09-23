@@ -82,6 +82,7 @@ nothing else, which is what keeps it small enough to review.
 | THE CLIENT SENDS A TARGET ID, NEVER AN ADDRESS | settled by design. Cloudflare's `/rdp/<vnet>/<ip>/<port>` lets the browser name the destination, so the allowlist is all that stands between a crafted request and an unlisted host. An opaque id makes "reach an arbitrary host" inexpressible rather than merely forbidden |
 | RESOLVE BY NAME, not by address | settled (Lewis, 2026-09-23) |
 | Verify the target's certificate against an internal CA | OPEN, and coupled to the row above |
+| Session recording | OPEN, and it conflicts with client-side RDP: a proxy that cannot decode the stream cannot record it. If recording is required, it has to come from the target or from a decoding gateway, and that reopens the architecture |
 
 ### Resolving by name puts DNS in the trust chain
 
@@ -101,7 +102,6 @@ Rules that follow:
   that log line is the evidence.
 - Fail closed on resolution failure. Never fall back to a cached address silently.
 - A name resolving to several addresses is ambiguity in a security control: refuse rather than pick.
-| Session recording | OPEN, and it conflicts with client-side RDP: a proxy that cannot decode the stream cannot record it. If recording is required, it has to come from the target or from a decoding gateway, and that reopens the architecture |
 
 Agent identity is no longer a decision. Direct reach means there are no agents to authenticate.
 
