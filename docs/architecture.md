@@ -74,9 +74,29 @@ nothing else, which is what keeps it small enough to review.
 |---|---|
 | Client-side WASM rather than server-side rendering | settled |
 | RDCleanPath, accepting that the proxy can read the stream | settled: internal network, not a concern (Lewis, 2026-09-23) |
-| Reverse tunnel from targets, or direct reach from the proxy | OPEN. The reverse shape means the target's zone needs no inbound rules, which is the property worth having if a zone boundary is ever crossed |
-| Authentication mechanism | OPEN |
+| DIRECT REACH: the proxy opens TCP to the target, no agents anywhere | settled (Lewis, 2026-09-23) |
+| PASS-THROUGH: the user's own Windows credentials go to the target; the proxy stores none | settled (Lewis, 2026-09-23) |
+| Identity provider for authenticating the USER to the proxy | OPEN |
+| Target list source | OPEN; static config is enough to start |
 | Session recording | OPEN, and it conflicts with client-side RDP: a proxy that cannot decode the stream cannot record it. If recording is required, it has to come from the target or from a decoding gateway, and that reopens the architecture |
+
+Agent identity is no longer a decision. Direct reach means there are no agents to authenticate.
+
+### What direct reach makes load-bearing
+
+With no agents, nothing outside the proxy constrains which hosts it can open a socket to except
+network policy. SO THE TARGET ALLOWLIST IN THE PROXY IS A SECURITY CONTROL, not a convenience
+feature: default-deny, explicit, and reviewable. A bug that lets an identity reach an unlisted target
+is a boundary failure, and it should be tested as one.
+
+### What pass-through makes true
+
+- The proxy holds no secrets, so compromising it yields reach but not credentials.
+- The Windows event log names the actual person, so the proxy's log and the target's log correlate.
+  That correlation is the audit story; stored credentials would have destroyed it permanently.
+- CredSSP has to work from a browser-hosted client. This is the historically awkward part of
+  client-side RDP, and it is known to work: Cloudflare's implementation is pass-through and states
+  that it manages no credentials on the Windows server.
 
 ## The capability note
 
