@@ -90,12 +90,36 @@ What the MSI does, verified by reading the built package's tables rather than by
 | Installs | `%ProgramFiles%\web-access\web-access-proxy.exe`, config to `%ProgramData%\web-access\config.toml` |
 | Service | `WebAccessProxy`, auto-start, running as `NT AUTHORITY\LocalService` |
 | Service arguments | `--service "[ProgramData]\web-access\config.toml"` |
-| Service control | start on install, stop and delete on uninstall (event 163) |
+| Service control | stop on reinstall, stop and delete on uninstall (event 162). NOT started by the installer |
 | Firewall | one exception scoped to the PROGRAM, not a port, because the port comes from a config an administrator edits |
 | Upgrades | major-upgrade path registered; the config is `NeverOverwrite`, so an upgrade cannot reset the allowlist |
 
 LocalService, not LocalSystem: the proxy opens sockets and reads one file, and never authenticates as
 itself to anything, because credentials pass through to the target untouched.
+
+### Installing
+
+From an ELEVATED prompt. The installer does not start the service, by design — see below.
+
+    msiexec /i web-access-proxy.msi /l*v install.log     # or /qn to run silent
+
+Then configure it, because an unconfigured gateway will not run:
+
+1. Edit `C:\ProgramData\web-access\config.toml`: set `listen`, author the `[[target]]` allowlist and
+   the `[[policy]]` grants, and set `tls.verify`. There is no default for `verify`.
+2. If `verify = "ca"`, put the CA bundle where `ca_bundle` points.
+3. `Start-Service WebAccessProxy`
+4. `Get-Service WebAccessProxy` should read Running. If it does not, the reason is in the config:
+   the service refuses to start rather than run against something it cannot validate.
+
+Uninstall with `msiexec /x web-access-proxy.msi`, which stops and removes the service. The config in
+`ProgramData` is left behind on purpose; an allowlist someone authored is not the installer's to
+delete.
+
+WHY IT DOES NOT AUTO-START: the shipped config names example hosts and a CA bundle that does not
+exist yet. Starting on install would either fail the installation or, worse, succeed and leave a
+gateway running against a configuration nobody wrote. Start type is still `auto`, so once it is
+configured and started it survives reboots.
 
 WiX v5 SPECIFICALLY. v6 and v7 require accepting the Open Source Maintenance Fee EULA, which is a
 licensing decision with a fee attached for commercial use. v5 is the last version without that gate

@@ -49,9 +49,13 @@
                         Arguments="--service &quot;[DATAFOLDER]config.toml&quot;"
                         Vital="yes" />
 
+        <!-- DELIBERATELY NOT STARTED ON INSTALL. The allowlist is a security control that has to be
+             authored before this service does anything useful, and the shipped config names example
+             hosts. Starting here would either fail the install on an unconfigured ca_bundle or, worse,
+             succeed and leave a gateway running against a config nobody wrote. Start type stays auto,
+             so once an administrator configures and starts it, it survives reboots. -->
         <ServiceControl Id="ServiceControl"
                         Name="WebAccessProxy"
-                        Start="install"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
