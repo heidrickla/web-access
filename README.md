@@ -23,6 +23,20 @@ Design record: `docs/architecture.md`.
     cargo test
     cargo run -- config.toml
 
+The dependency tree is VENDORED, so this builds with no network at all. `vendor/` holds 106 crates
+and `.cargo/config.toml` points Cargo at it; `Cargo.lock` is committed, because vendoring without a
+lockfile pins nothing. Nothing is fetched from crates.io.
+
+Two settings exist to keep that true and both were measured, not assumed:
+
+| Setting | Without it |
+|---|---|
+| `!vendor/**` in `.gitignore` | the `*.pem` and `*.key` rules silently drop 15 of 5451 files, and Cargo's per-file checksums then fail on a fresh clone, reading as a corrupt vendor tree |
+| `vendor/** -text` in `.gitattributes` | `eol=lf` rewrites 38 upstream CRLF files, changing the bytes `.cargo-checksum.json` is computed over, with the same symptom |
+
+Verified 2026-09-23 the only way that means anything: cloned fresh, with the crate cache emptied,
+then `cargo build --offline` and `cargo test --offline`. Build succeeded, 12 tests passed.
+
 `config.example.toml` is the starting point. There is no default for `tls.verify`; state it.
 
 VERIFICATION STATE, 2026-09-23: the crate compiles on Rust 1.98.1 and its 12 tests pass. It has NOT
