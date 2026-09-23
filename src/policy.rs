@@ -48,15 +48,28 @@ impl Catalogue {
     /// The whole authorization decision. Absence of a grant is a denial; there is no fallthrough.
     pub fn resolve(&self, identity: &Identity, target_id: &str) -> Result<&Target, Denied> {
         let target = self.targets.get(target_id).ok_or(Denied::NoSuchTarget)?;
-        let permitted = self.policies.iter().any(|policy| {
-            identity.groups.iter().any(|g| g == &policy.group)
-                && policy.allow.iter().any(|tag| target.tags.contains(tag))
-        });
-        if permitted {
+        if self.grants(identity, target) {
             Ok(target)
         } else {
             Err(Denied::NotPermitted)
         }
+    }
+
+    /// Everything this identity may reach, for the launcher to render. SAME PREDICATE as `resolve`,
+    /// deliberately: a list that showed something the connection would refuse, or hid something it
+    /// would allow, would be a second authorization model drifting away from the first.
+    pub fn permitted(&self, identity: &Identity) -> Vec<&Target> {
+        self.targets
+            .values()
+            .filter(|t| self.grants(identity, t))
+            .collect()
+    }
+
+    fn grants(&self, identity: &Identity, target: &Target) -> bool {
+        self.policies.iter().any(|policy| {
+            identity.groups.iter().any(|g| g == &policy.group)
+                && policy.allow.iter().any(|tag| target.tags.contains(tag))
+        })
     }
 }
 

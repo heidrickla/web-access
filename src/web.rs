@@ -11,12 +11,16 @@
 //! The HTTP handled here is deliberately tiny — GET on a fixed set of paths, nothing else. Anything
 //! that is not one of those paths is a 404, and the WebSocket endpoint never reaches this code.
 
+use crate::policy::Catalogue;
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Where the browser opens its WebSocket. Everything else on the listener is a static asset.
 pub const WS_PATH: &str = "/ws";
+
+/// Where the launcher fetches its token and its list of systems.
+pub const TARGETS_PATH: &str = "/api/targets";
 
 /// (request path, content type, bytes).
 pub const ASSETS: &[(&str, &str, &[u8])] = &[
@@ -44,9 +48,76 @@ pub async fn peek_path(stream: &TcpStream) -> io::Result<String> {
         .to_owned())
 }
 
+/// The launcher's data: a freshly minted proxy token and the systems this caller may reach.
+///
+/// THE TOKEN IS NEVER TYPED BY A HUMAN. It is minted here and handed to the page, which sends it
+/// back on the WebSocket. Asking a person to paste it would have been a password box that
+/// authenticated nothing, since the page is served to whoever can reach the proxy anyway.
+fn launcher_json(catalogue: &Catalogue, all_groups: &[String]) -> String {
+    let identity = crate::auth::identify(all_groups);
+    let token = crate::auth::Sessions::global().mint(identity.clone());
+
+    let mut targets = catalogue.permitted(&identity);
+    targets.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let items: Vec<String> = targets
+        .iter()
+        .map(|t| {
+            format!(
+                r#"{{"id":{},"tags":[{}]}}"#,
+                json_string(&t.id),
+                t.tags.iter().map(|s| json_string(s)).collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect();
+
+    format!(
+        r#"{{"token":{},"targets":[{}]}}"#,
+        json_string(&token),
+        items.join(",")
+    )
+}
+
+/// Enough JSON string escaping for ids and tags, which the config author writes. Escapes the
+/// characters that would break out of a string rather than assuming none are present.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Read the request off the socket and answer it. Only GET on a known path succeeds.
-pub async fn serve(mut stream: TcpStream, path: &str) -> io::Result<()> {
+pub async fn serve(
+    mut stream: TcpStream,
+    path: &str,
+    catalogue: &Catalogue,
+    all_groups: &[String],
+) -> io::Result<()> {
     drain_request(&mut stream).await?;
+
+    if path == TARGETS_PATH {
+        let body = launcher_json(catalogue, all_groups);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await?;
+        stream.write_all(body.as_bytes()).await?;
+        return stream.flush().await;
+    }
 
     match ASSETS.iter().find(|(p, _, _)| *p == path) {
         Some((_, content_type, body)) => {
