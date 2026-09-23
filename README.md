@@ -46,6 +46,17 @@ All four are Lewis's, 2026-09-23.
 - Target list source; static config is enough to start.
 - Session recording, which conflicts with the architecture rather than extending it.
 
+## Conventions
+
+- No credential, host address or site detail belongs in this repository. It is a general tool and
+  the network it might be deployed into is not described here.
+- Upstream is `Devolutions/IronRDP`, Apache-2.0. Reuse the crates. Do not vendor a fork without
+  writing down why, in `docs/architecture.md`.
+- Commit subjects are declarative sentences, no prefixes.
+- LF only.
+- Record what was OBSERVED. "Not yet tested" goes false silently and nobody goes back to edit it, so
+  date it and say what would change it, or write the positive observation instead.
+
 ## Licence
 
 MIT. See `LICENSE`.
