@@ -11,7 +11,11 @@ listen = "0.0.0.0:8443"
 #   "insecure" accept any certificate; reachability without identity
 # There is no default. State it.
 verify = "ca"
-ca_bundle = "/etc/web-access/internal-ca.pem"
+# Linux:   /etc/web-access/internal-ca.pem
+# Windows: C:\ProgramData\web-access\internal-ca.pem
+# THE SERVICE WILL NOT START until this file exists and verify is set. That is intended: an
+# unconfigured gateway refusing to run is the safe state.
+ca_bundle = "C:\\ProgramData\\web-access\\internal-ca.pem"
 
 # Targets. `id` is what a client names; it is never an address.
 # `port` defaults to 3389 and comes from here, never from the client.
