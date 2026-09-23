@@ -29,17 +29,22 @@ Design record: `docs/architecture.md`.
 
 ## Settled
 
-- The RDP client runs CLIENT-SIDE in WASM, not server-side. The proxy moves bytes and cannot read
-  them unless RDCleanPath strips the inner TLS.
+- The RDP client runs CLIENT-SIDE in WASM, not server-side.
 - RDCleanPath is acceptable. Session confidentiality from the proxy is not a requirement on an
-  internal network (Lewis, 2026-09-23).
+  internal network.
+- DIRECT REACH. The proxy opens TCP to the target. No agents, no connectors, nothing installed on
+  any target, so appliances and vendor-supported nodes are in scope.
+- PASS-THROUGH credentials. The user's own Windows account authenticates to the target and the proxy
+  stores nothing.
 - Apache-2.0 upstream, so the licence question is closed.
+
+All four are Lewis's, 2026-09-23.
 
 ## Open
 
-- Whether targets are reached directly by the proxy, or dial out to it in a reverse tunnel.
-- Authentication mechanism.
-- Where the proxy sits relative to the network zones it serves.
+- Identity provider for authenticating the user to the proxy.
+- Target list source; static config is enough to start.
+- Session recording, which conflicts with the architecture rather than extending it.
 
 ## Licence
 
