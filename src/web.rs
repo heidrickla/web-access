@@ -26,6 +26,8 @@ pub const TARGETS_PATH: &str = "/api/targets";
 pub const ASSETS: &[(&str, &str, &[u8])] = &[
     ("/", "text/html; charset=utf-8", include_bytes!("../web/index.html")),
     ("/index.html", "text/html; charset=utf-8", include_bytes!("../web/index.html")),
+    ("/app.css", "text/css; charset=utf-8", include_bytes!("../web/app.css")),
+    ("/app.js", "text/javascript; charset=utf-8", include_bytes!("../web/app.js")),
     ("/ironrdp_web.js", "text/javascript; charset=utf-8", include_bytes!("../web/ironrdp_web.js")),
     ("/ironrdp_web_bg.wasm", "application/wasm", include_bytes!("../web/ironrdp_web_bg.wasm")),
 ];
@@ -197,6 +199,65 @@ mod tests {
         });
         let (stream, _) = listener.accept().await.unwrap();
         assert_eq!(peek_path(&stream).await.unwrap(), "/index.html");
+    }
+
+    /// The page is served with `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`, which
+    /// permits neither an inline <style> nor an inline <script>. Inlining either produced a page
+    /// that rendered unstyled and sat on "loading" forever, with the cause visible only in the
+    /// browser console. The CSP and the page have to agree, so this asserts they do.
+    #[test]
+    fn the_page_inlines_nothing_the_csp_forbids() {
+        let html = std::str::from_utf8(
+            ASSETS
+                .iter()
+                .find(|(p, _, _)| *p == "/")
+                .expect("index is served")
+                .2,
+        )
+        .expect("index is utf-8");
+
+        // Comments are stripped first. The page's own comment EXPLAINS that it must not inline a
+        // style block, and the first version of this test matched that explanation and failed on a
+        // page that was already correct.
+        let mut stripped = String::with_capacity(html.len());
+        let mut rest = html;
+        while let Some(start) = rest.find("<!--") {
+            stripped.push_str(&rest[..start]);
+            rest = match rest[start..].find("-->") {
+                Some(end) => &rest[start + end + 3..],
+                None => "",
+            };
+        }
+        stripped.push_str(rest);
+        let html = stripped.as_str();
+
+        assert!(!html.contains("<style"), "inline <style> is blocked by default-src 'self'");
+        for fragment in html.split("<script").skip(1) {
+            let tag = fragment.split('>').next().unwrap_or("");
+            assert!(
+                tag.contains("src="),
+                "inline <script> is blocked by script-src 'self'; found <script{tag}>"
+            );
+        }
+    }
+
+    /// Every asset the page references must actually be served, or the CSP-safe split just moves the
+    /// failure from "blocked" to "404".
+    #[test]
+    fn everything_the_page_references_is_served() {
+        let html = std::str::from_utf8(ASSETS.iter().find(|(p, _, _)| *p == "/").unwrap().2).unwrap();
+        for needle in ["./app.css", "./app.js"] {
+            assert!(html.contains(needle), "index does not reference {needle}");
+            let path = needle.trim_start_matches('.');
+            assert!(
+                ASSETS.iter().any(|(p, _, _)| *p == path),
+                "{path} is referenced but not in ASSETS"
+            );
+        }
+        // app.js imports the wasm glue, which pulls the .wasm itself.
+        let app = std::str::from_utf8(ASSETS.iter().find(|(p, _, _)| *p == "/app.js").unwrap().2).unwrap();
+        assert!(app.contains("./ironrdp_web.js"), "app.js does not import the client");
+        assert!(ASSETS.iter().any(|(p, _, _)| *p == "/ironrdp_web_bg.wasm"));
     }
 
     #[test]

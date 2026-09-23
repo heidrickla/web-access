@@ -1,32 +1,15 @@
 <!DOCTYPE html>
+<!--
+  No inline <style> or <script>. The proxy serves a strict Content-Security-Policy, and
+  `default-src 'self'` with `script-src 'self'` forbids both. Inlining them produced an unstyled page
+  stuck on "loading", with the failure visible only in the console. Measured 2026-09-23.
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>web-access</title>
-<style>
-  :root { color-scheme: dark; --bg:#14161a; --panel:#1c1f26; --line:#2b3039; --fg:#d7dbe0; --dim:#8b939e; --accent:#4c8dff; --bad:#ff6b6b; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",sans-serif; }
-  header { padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); display:flex; gap:12px; align-items:center; }
-  header h1 { font-size:14px; font-weight:600; margin:0; letter-spacing:.02em; }
-  #status { margin-left:auto; font-size:12px; color:var(--dim); }
-  #status.bad { color:var(--bad); }
-  button { background:transparent; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:5px 11px; font:inherit; font-size:12px; cursor:pointer; }
-  button:hover { border-color:var(--accent); }
-  main { padding:20px 16px; }
-  #tiles { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:12px; max-width:1100px; }
-  .tile { background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:14px 16px; cursor:pointer; text-align:left; }
-  .tile:hover { border-color:var(--accent); }
-  .tile .name { font-size:15px; font-weight:600; margin-bottom:6px; }
-  .tile .tags { font-size:11px; color:var(--dim); }
-  .empty { color:var(--dim); max-width:60ch; }
-  #screen { display:none; margin:0 auto; background:#000; max-width:100%; }
-  #screen:focus { outline:none; }
-  body.connected main { padding:0; }
-  body.connected #tiles { display:none; }
-  body.connected #screen { display:block; }
-</style>
+<link rel="stylesheet" href="./app.css">
 </head>
 <body>
 <header>
@@ -38,155 +21,6 @@
   <div id="tiles"></div>
   <canvas id="screen" width="1280" height="800" tabindex="0"></canvas>
 </main>
-
-<script type="module">
-import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction }
-  from './ironrdp_web.js';
-
-const $ = id => document.getElementById(id);
-const canvas = $('screen');
-const say = (text, bad = false) => { $('status').textContent = text; $('status').classList.toggle('bad', bad); };
-
-// Same origin as the page that was served, so there is nothing to configure and no way to point the
-// client at a different proxy.
-const proxyAddress = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
-
-let token = '';
-let session = null;
-
-await init();
-setup('info');
-
-// The launcher's contents come from the proxy's own allowlist, filtered by the same predicate the
-// connection will use. Nothing is typed in: the systems are listed because the config lists them,
-// and the proxy token arrives with them.
-try {
-  const res = await fetch('/api/targets', { cache: 'no-store' });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  const data = await res.json();
-  token = data.token;
-  render(data.targets || []);
-} catch (err) {
-  say('could not load the system list: ' + err, true);
-}
-
-function render(targets) {
-  const tiles = $('tiles');
-  tiles.innerHTML = '';
-  if (!targets.length) {
-    tiles.innerHTML = '<p class="empty">No systems. The proxy\'s allowlist is empty, or no policy grants this identity a tag that any target carries. Both are edited in config.toml.</p>';
-    say('no systems available');
-    return;
-  }
-  for (const t of targets) {
-    const b = document.createElement('button');
-    b.className = 'tile';
-    const name = document.createElement('div');
-    name.className = 'name';
-    name.textContent = t.id;
-    const tags = document.createElement('div');
-    tags.className = 'tags';
-    tags.textContent = (t.tags || []).join(' · ');
-    b.append(name, tags);
-    b.addEventListener('click', () => connect(t.id));
-    tiles.append(b);
-  }
-  say(targets.length + (targets.length === 1 ? ' system' : ' systems'));
-}
-
-const send = event => {
-  if (!session) return;
-  const tx = new InputTransaction();
-  tx.addEvent(event);
-  session.applyInputs(tx);
-};
-
-// Printable keys go through unicode, which avoids a full PS/2 set-1 table. The rest need scancodes,
-// so the essential ones are mapped; anything outside both is dropped rather than guessed at, which
-// shows up as a dead key rather than as a wrong character.
-const SCANCODE = {
-  Escape:0x01, Backspace:0x0E, Tab:0x0F, Enter:0x1C, ControlLeft:0x1D, ShiftLeft:0x2A,
-  ShiftRight:0x36, AltLeft:0x38, Space:0x39, CapsLock:0x3A, F1:0x3B, F2:0x3C, F3:0x3D, F4:0x3E,
-  F5:0x3F, F6:0x40, F7:0x41, F8:0x42, F9:0x43, F10:0x44, F11:0x57, F12:0x58,
-  Home:0xE047, ArrowUp:0xE048, PageUp:0xE049, ArrowLeft:0xE04B, ArrowRight:0xE04D,
-  End:0xE04F, ArrowDown:0xE050, PageDown:0xE051, Insert:0xE052, Delete:0xE053,
-  ControlRight:0xE01D, AltRight:0xE038, MetaLeft:0xE05B, MetaRight:0xE05C,
-};
-
-function attachInput() {
-  const at = e => {
-    const r = canvas.getBoundingClientRect();
-    return [
-      Math.round((e.clientX - r.left) * (canvas.width / r.width)),
-      Math.round((e.clientY - r.top) * (canvas.height / r.height)),
-    ];
-  };
-  canvas.addEventListener('mousemove', e => { const [x,y] = at(e); send(DeviceEvent.mouseMove(x,y)); });
-  canvas.addEventListener('mousedown', e => { e.preventDefault(); canvas.focus(); send(DeviceEvent.mouseButtonPressed(e.button)); });
-  canvas.addEventListener('mouseup',   e => { e.preventDefault(); send(DeviceEvent.mouseButtonReleased(e.button)); });
-  canvas.addEventListener('contextmenu', e => e.preventDefault());
-  canvas.addEventListener('keydown', e => {
-    e.preventDefault();
-    const c = SCANCODE[e.code];
-    if (c !== undefined) send(DeviceEvent.keyPressed(c));
-    else if (e.key.length === 1) send(DeviceEvent.unicodePressed(e.key));
-  });
-  canvas.addEventListener('keyup', e => {
-    e.preventDefault();
-    const c = SCANCODE[e.code];
-    if (c !== undefined) send(DeviceEvent.keyReleased(c));
-    else if (e.key.length === 1) send(DeviceEvent.unicodeReleased(e.key));
-  });
-  canvas.addEventListener('blur', () => session && session.releaseAllInputs());
-}
-
-async function connect(targetId) {
-  say('connecting to ' + targetId);
-  try {
-    // NO CREDENTIALS ARE SUPPLIED HERE ON PURPOSE. Pass-through means the Windows account belongs to
-    // the session, not to this page: with NLA off the target's own login screen appears in the
-    // canvas, which is where it should be typed.
-    session = await new SessionBuilder()
-      .proxyAddress(proxyAddress)
-      .destination(targetId)   // a TARGET ID, never an address
-      .authToken(token)        // minted by the proxy when it served this page
-      .desktopSize(new DesktopSize(canvas.width, canvas.height))
-      .renderCanvas(canvas)
-      .connect();
-
-    document.body.classList.add('connected');
-    $('back').hidden = false;
-    attachInput();
-    canvas.focus();
-    say('connected to ' + targetId);
-
-    await session.run();
-    say('session ended');
-  } catch (err) {
-    const text = String(err && err.backtrace ? err.backtrace : err);
-    // A target with NLA enabled refuses before any screen is drawn, because CredSSP wants the
-    // credentials up front. Say so plainly rather than showing a bare protocol error.
-    if (/credssp|nla|negotiat/i.test(text)) {
-      say(targetId + ' requires Network Level Authentication, which needs credentials before the session starts. Turn NLA off on that host, or this page needs a credential prompt adding.', true);
-    } else {
-      say('failed: ' + text, true);
-    }
-  } finally {
-    disconnectUi();
-  }
-}
-
-function disconnectUi() {
-  document.body.classList.remove('connected');
-  $('back').hidden = true;
-  session = null;
-}
-
-$('back').addEventListener('click', () => {
-  if (session) session.shutdown();
-  disconnectUi();
-  say('disconnected');
-});
-</script>
+<script type="module" src="./app.js"></script>
 </body>
 </html>
