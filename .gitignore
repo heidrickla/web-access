@@ -20,3 +20,7 @@ target/
 installer/payload/
 installer/*.msi
 installer/*.wixpdb
+
+# The browser client is committed: it is embedded into the binary with include_bytes!, so the
+# single-MSI deployment has nothing to misplace. The *.wasm rule above must not catch it.
+!web/**

@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>web-access</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1c1f26; --line:#2b3039; --fg:#d7dbe0; --dim:#8b939e; --accent:#4c8dff; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 ui-sans-serif,system-ui,Segoe UI,sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:14px; font-weight:600; margin:0 12px 0 0; letter-spacing:.02em; }
+  label { display:flex; flex-direction:column; gap:3px; font-size:11px; color:var(--dim); }
+  input { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:5px 7px; font:inherit; font-size:13px; min-width:150px; }
+  input:focus { outline:none; border-color:var(--accent); }
+  button { background:var(--accent); color:#06101f; border:0; border-radius:4px; padding:7px 15px; font:inherit; font-weight:600; cursor:pointer; align-self:flex-end; }
+  button:disabled { background:var(--line); color:var(--dim); cursor:not-allowed; }
+  #status { margin-left:auto; font-size:12px; color:var(--dim); }
+  #status.bad { color:var(--bad); }
+  #screen { display:block; margin:0 auto; background:#000; max-width:100%; }
+  #screen:focus { outline:2px solid var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>web-access</h1>
+  <label>target id<input id="target" placeholder="historian-01" autocomplete="off"></label>
+  <label>username<input id="username" placeholder="lewis" autocomplete="off"></label>
+  <label>password<input id="password" type="password" autocomplete="off"></label>
+  <label>domain<input id="domain" placeholder="optional" autocomplete="off"></label>
+  <label>proxy token<input id="token" type="password" autocomplete="off"></label>
+  <button id="go">Connect</button>
+  <span id="status">idle</span>
+</header>
+<canvas id="screen" width="1280" height="800" tabindex="0"></canvas>
+
+<script type="module">
+import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction }
+  from './ironrdp_web.js';
+
+const $ = id => document.getElementById(id);
+const canvas = $('screen');
+const status = (text, bad = false) => { $('status').textContent = text; $('status').classList.toggle('bad', bad); };
+
+// The proxy serves this page, so its WebSocket is on the same origin. Nothing to configure and no
+// way to point the client at a different proxy by editing a field.
+const proxyAddress = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+
+await init();
+setup('info');
+status('ready — ' + proxyAddress);
+
+// One event at a time is fine here: RDP input is low rate and a transaction per event keeps the
+// ordering obvious. Batch only if a profiler ever says to.
+const send = (session, event) => {
+  const tx = new InputTransaction();
+  tx.addEvent(event);
+  session.applyInputs(tx);
+};
+
+// Printable characters go through unicode, which avoids a full PS/2 set-1 scancode table. The keys
+// that are not printable still need scancodes, so the essential ones are mapped and anything else is
+// dropped rather than guessed at.
+const SCANCODE = {
+  Escape:0x01, Backspace:0x0E, Tab:0x0F, Enter:0x1C, ControlLeft:0x1D, ShiftLeft:0x2A,
+  ShiftRight:0x36, AltLeft:0x38, Space:0x39, CapsLock:0x3A, F1:0x3B, F2:0x3C, F3:0x3D, F4:0x3E,
+  F5:0x3F, F6:0x40, F7:0x41, F8:0x42, F9:0x43, F10:0x44, F11:0x57, F12:0x58,
+  Home:0xE047, ArrowUp:0xE048, PageUp:0xE049, ArrowLeft:0xE04B, ArrowRight:0xE04D,
+  End:0xE04F, ArrowDown:0xE050, PageDown:0xE051, Insert:0xE052, Delete:0xE053,
+  ControlRight:0xE01D, AltRight:0xE038, MetaLeft:0xE05B, MetaRight:0xE05C,
+};
+
+function attachInput(session) {
+  const rect = () => canvas.getBoundingClientRect();
+  const at = e => {
+    const r = rect();
+    return [
+      Math.round((e.clientX - r.left) * (canvas.width / r.width)),
+      Math.round((e.clientY - r.top) * (canvas.height / r.height)),
+    ];
+  };
+
+  canvas.addEventListener('mousemove', e => { const [x, y] = at(e); send(session, DeviceEvent.mouseMove(x, y)); });
+  canvas.addEventListener('mousedown', e => { e.preventDefault(); canvas.focus(); send(session, DeviceEvent.mouseButtonPressed(e.button)); });
+  canvas.addEventListener('mouseup', e => { e.preventDefault(); send(session, DeviceEvent.mouseButtonReleased(e.button)); });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  canvas.addEventListener('keydown', e => {
+    e.preventDefault();
+    const code = SCANCODE[e.code];
+    if (code !== undefined) send(session, DeviceEvent.keyPressed(code));
+    else if (e.key.length === 1) send(session, DeviceEvent.unicodePressed(e.key));
+  });
+  canvas.addEventListener('keyup', e => {
+    e.preventDefault();
+    const code = SCANCODE[e.code];
+    if (code !== undefined) send(session, DeviceEvent.keyReleased(code));
+    else if (e.key.length === 1) send(session, DeviceEvent.unicodeReleased(e.key));
+  });
+
+  // A held key with focus lost stays held on the remote side otherwise.
+  canvas.addEventListener('blur', () => session.releaseAllInputs());
+}
+
+$('go').addEventListener('click', async () => {
+  $('go').disabled = true;
+  status('connecting');
+  try {
+    const builder = new SessionBuilder()
+      .proxyAddress(proxyAddress)
+      .destination($('target').value.trim())   // a TARGET ID, never an address
+      .authToken($('token').value)             // checked by the proxy, not by the target
+      .username($('username').value)           // these two pass through to Windows untouched
+      .password($('password').value)
+      .desktopSize(new DesktopSize(canvas.width, canvas.height))
+      .renderCanvas(canvas);
+
+    const domain = $('domain').value.trim();
+    if (domain) builder.serverDomain(domain);
+
+    const session = await builder.connect();
+    attachInput(session);
+    canvas.focus();
+    status('connected');
+
+    const ended = await session.run();
+    status('session ended' + (ended ? '' : ''));
+  } catch (err) {
+    status('failed: ' + (err && err.backtrace ? err.backtrace : err), true);
+  } finally {
+    $('go').disabled = false;
+  }
+});
+</script>
+</body>
+</html>

@@ -15,6 +15,7 @@ mod policy;
 mod proxy;
 mod resolve;
 mod server;
+mod web;
 
 #[cfg(windows)]
 mod service;
