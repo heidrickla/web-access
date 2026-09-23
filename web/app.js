@@ -3,7 +3,7 @@
 // console error visible on the page, so the only symptom is a status that never leaves "loading".
 // Measured 2026-09-23.
 
-import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction }
+import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction, ClipboardData }
   from './ironrdp_web.js';
 
 const $ = id => document.getElementById(id);
@@ -133,6 +133,75 @@ function setCursorStyle(kind, data, hotspotX, hotspotY) {
   }
 }
 
+// The remote is asked for a desktop the size of the browser viewport, so every pixel is 1:1 and
+// nothing is scaled. Scaling is what makes remote text fuzzy; resizing the desktop does not.
+function viewportSize() {
+  return new DesktopSize(
+    Math.max(640, Math.floor(window.innerWidth)),
+    Math.max(480, Math.floor(window.innerHeight)),
+  );
+}
+
+let resizeTimer = null;
+function followWindowSize() {
+  clearTimeout(resizeTimer);
+  // Debounced: a drag-resize fires continuously and each call is a protocol round trip.
+  resizeTimer = setTimeout(() => {
+    if (!session) return;
+    const size = viewportSize();
+    try { session.resize(size.width, size.height); } catch { /* the session may be closing */ }
+  }, 250);
+}
+
+function sendClipboard() {
+  if (!session) return;
+  const text = $('clip').value;
+  try {
+    const data = new ClipboardData();
+    if (text) data.addText('text/plain', text);
+    session.onClipboardPaste(data);
+  } catch (err) {
+    say('clipboard: ' + describe(err), true);
+  }
+}
+
+// Ctrl+Alt+Del cannot arrive as a keystroke: the browser never delivers it. Pressing and releasing
+// the three scancodes in one transaction is the only way to send it.
+function sendCtrlAltDel() {
+  if (!session) return;
+  const tx = new InputTransaction();
+  for (const c of [0x1D, 0x38, 0xE053]) tx.addEvent(DeviceEvent.keyPressed(c));
+  for (const c of [0xE053, 0x38, 0x1D]) tx.addEvent(DeviceEvent.keyReleased(c));
+  session.applyInputs(tx);
+}
+
+function openRail(open) {
+  $('rail').classList.toggle('open', open);
+  $('rail-toggle').setAttribute('aria-expanded', String(open));
+}
+
+$('rail-toggle').addEventListener('click', () => openRail(true));
+$('panel-close').addEventListener('click', () => openRail(false));
+$('clip-send').addEventListener('click', sendClipboard);
+$('clip-copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('clip').value); say('copied to this machine'); }
+  catch { $('clip').select(); }
+});
+$('send-cad').addEventListener('click', () => { sendCtrlAltDel(); openRail(false); canvas.focus(); });
+$('fullscreen').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+});
+$('panel-disconnect').addEventListener('click', () => endSession());
+window.addEventListener('resize', followWindowSize);
+
+// Files ride the clipboard channel in RDP (RDPECLIP) and reach JS through invokeExtension:
+// initiate_file_copy, request_file_contents, submit_file_contents. Compiled in — ironrdp-web builds
+// ironrdp with the rdpdr feature — and not yet wired here. Said plainly rather than shown as a drop
+// zone that does nothing.
+$('files-note').textContent =
+  'File transfer is not wired up yet. The client supports it over the clipboard channel; it is the next piece.';
+
 function attachInput() {
   const at = e => {
     const r = canvas.getBoundingClientRect();
@@ -207,8 +276,20 @@ async function connect(targetId) {
       .authToken(token)        // minted by the proxy when it served this page
       .username(creds.username)
       .password(creds.password)
-      .desktopSize(new DesktopSize(canvas.width, canvas.height))
+      .desktopSize(viewportSize())
       .renderCanvas(canvas)
+      // Text clipboard, both directions. Files go through invokeExtension and are not wired yet.
+      .remoteClipboardChangedCallback(data => {
+        try {
+          for (const item of data.items()) {
+            if (String(item.mimeType()).startsWith('text/')) {
+              $('clip').value = String(item.value());
+              break;
+            }
+          }
+        } catch { /* a clipboard update must never take the session down */ }
+      })
+      .forceClipboardUpdateCallback(() => sendClipboard())
       // REQUIRED, both of them. ironrdp-web refuses to connect without every one of username,
       // password, destination, proxyAddress, authToken, renderCanvas, setCursorStyleCallback and
       // setCursorStyleCallbackContext. Read off session.rs rather than discovered one failure at a
@@ -220,7 +301,10 @@ async function connect(targetId) {
       .canvasResizedCallback(() => {
         if (!session) return;
         const size = session.desktopSize();
-        if (size) { canvas.width = size.width; canvas.height = size.height; }
+        if (!size) return;
+        canvas.width = size.width;
+        canvas.height = size.height;
+        $('panel-info').textContent = targetId + ' — ' + size.width + '×' + size.height;
       });
     if (creds.domain) builder.serverDomain(creds.domain);
 
@@ -228,6 +312,9 @@ async function connect(targetId) {
 
     document.body.classList.add('connected');
     $('back').hidden = false;
+    $('rail').hidden = false;
+    $('panel-target').textContent = targetId;
+    $('panel-info').textContent = targetId + ' — ' + canvas.width + '×' + canvas.height;
     attachInput();
     canvas.focus();
     say('connected to ' + targetId);
@@ -246,14 +333,17 @@ async function connect(targetId) {
   } finally {
     document.body.classList.remove('connected');
     $('back').hidden = true;
+    $('rail').hidden = true;
+    openRail(false);
     session = null;
   }
 }
 
-$('back').addEventListener('click', () => {
+function endSession() {
   if (session) session.shutdown();
-  document.body.classList.remove('connected');
-  $('back').hidden = true;
-  session = null;
-  say('disconnected');
+}
+
+$('back').addEventListener('click', () => {
+  endSession();
+  say('disconnecting');
 });
