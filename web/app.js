@@ -143,19 +143,58 @@ function attachInput() {
   canvas.addEventListener('blur', () => { if (session) session.releaseAllInputs(); });
 }
 
+/// Ask for Windows credentials, after a system has been chosen.
+///
+/// IronRDP requires a username: connecting without one fails with "username missing", so there is no
+/// variant of this where the target's own login screen appears instead. The username is remembered
+/// per target because retyping it every time is the annoyance; THE PASSWORD IS NEVER STORED.
+function askCredentials(targetId) {
+  return new Promise(resolve => {
+    const dialog = $('signin');
+    $('signin-title').textContent = 'Sign in to ' + targetId;
+
+    const remembered = localStorage.getItem('user:' + targetId) || '';
+    $('u').value = remembered;
+    $('p').value = '';
+    $('d').value = localStorage.getItem('domain:' + targetId) || '';
+
+    const done = () => {
+      dialog.removeEventListener('close', done);
+      if (dialog.returnValue !== 'go' || !$('u').value) return resolve(null);
+      const creds = { username: $('u').value, password: $('p').value, domain: $('d').value.trim() };
+      localStorage.setItem('user:' + targetId, creds.username);
+      if (creds.domain) localStorage.setItem('domain:' + targetId, creds.domain);
+      else localStorage.removeItem('domain:' + targetId);
+      $('p').value = '';
+      resolve(creds);
+    };
+
+    dialog.addEventListener('close', done);
+    dialog.showModal();
+    // Focus whichever field still needs filling in.
+    ($('u').value ? $('p') : $('u')).focus();
+  });
+}
+
 async function connect(targetId) {
+  const creds = await askCredentials(targetId);
+  if (!creds) { say('cancelled'); return; }
+
   say('connecting to ' + targetId);
   try {
-    // NO CREDENTIALS ARE SUPPLIED HERE ON PURPOSE. Pass-through means the Windows account belongs to
-    // the session, not to this page: with NLA off the target's own login screen appears in the
-    // canvas, which is where it should be typed.
-    session = await new SessionBuilder()
+    // Pass-through: these go to the target inside the RDP stream, which the proxy does not decode.
+    // The proxy neither sees nor stores them.
+    const builder = new SessionBuilder()
       .proxyAddress(proxyAddress)
       .destination(targetId)   // a TARGET ID, never an address
       .authToken(token)        // minted by the proxy when it served this page
+      .username(creds.username)
+      .password(creds.password)
       .desktopSize(new DesktopSize(canvas.width, canvas.height))
-      .renderCanvas(canvas)
-      .connect();
+      .renderCanvas(canvas);
+    if (creds.domain) builder.serverDomain(creds.domain);
+
+    session = await builder.connect();
 
     document.body.classList.add('connected');
     $('back').hidden = false;
@@ -169,8 +208,8 @@ async function connect(targetId) {
     const text = describe(err);
     // A target with NLA enabled refuses before any screen is drawn, because CredSSP wants the
     // credentials up front. Say so plainly rather than showing a bare protocol error.
-    if (/credssp|nla|negotiat/i.test(text)) {
-      say(targetId + ' requires Network Level Authentication, which needs credentials before the session starts. Turn NLA off on that host, or this page needs a credential prompt adding.', true);
+    if (/credssp|logon|authentic|password|credential/i.test(text)) {
+      say('sign-in refused by ' + targetId + ': ' + text, true);
     } else {
       say('failed: ' + text, true);
     }
