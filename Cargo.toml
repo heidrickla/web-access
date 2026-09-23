@@ -1,0 +1,25 @@
+[package]
+name = "web-access-proxy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "WebSocket-to-TCP RDP proxy that speaks RDCleanPath and never decodes the session"
+repository = "https://github.com/heidrickla/web-access"
+
+[dependencies]
+ironrdp-rdcleanpath = "0.2.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[profile.release]
+strip = true

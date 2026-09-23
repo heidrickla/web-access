@@ -14,8 +14,20 @@ Design record: `docs/architecture.md`.
 |---|---|---|
 | RDP client in the browser | `ironrdp-web`, Apache-2.0 | reuse |
 | RDCleanPath, both ends | `ironrdp-rdcleanpath` | reuse |
-| WebSocket-to-TCP proxy | this repo | to write |
-| Authentication in front of the proxy | this repo | to write, mechanism undecided |
+| WebSocket-to-TCP proxy | this repo | written; compiles, 12 tests pass |
+| Authentication in front of the proxy | this repo | trait plus a development stub; the identity provider is undecided |
+
+## Build
+
+    cargo check --all-targets
+    cargo test
+    cargo run -- config.toml
+
+`config.example.toml` is the starting point. There is no default for `tls.verify`; state it.
+
+VERIFICATION STATE, 2026-09-23: the crate compiles on Rust 1.98.1 and its 12 tests pass. It has NOT
+been run against a real RDP server, so the handshake is correct against the published RDCleanPath
+types and unproven against Windows. The first live connection is the test that matters.
 
 ## Why not the obvious things
 

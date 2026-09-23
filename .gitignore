@@ -1,7 +1,8 @@
-target/
-*.wasm
-pkg/
-node_modules/
-.env
 *.key
 *.pem
+*.wasm
+.env
+Cargo.lock
+node_modules/
+pkg/
+target/
