@@ -72,6 +72,22 @@ All four are Lewis's, 2026-09-23.
 - Target list source; static config is enough to start.
 - Session recording, which conflicts with the architecture rather than extending it.
 
+## Roadmap
+
+Future additions, not built. RDP comes first (2026-09-23). Evidence for each is in
+`docs/architecture.md`.
+
+| Addition | What it takes |
+|---|---|
+| TLS on the listener | a certificate and a TLS acceptor in front of the existing listener. Also what the browser credential manager needs, being secure-origin only |
+| Proxy-side encrypted credential store | the identity provider first |
+| Linux desktops | EGFX in `ironrdp-web`, which GNOME Remote Desktop, built into Ubuntu, requires. xrdp is the fallback |
+| SSH | a raw-forward proxy mode; Go's SSH client compiled to WASM, on xterm.js |
+| VNC | the same raw-forward mode; noVNC |
+| Telnet | the same raw-forward mode; xterm.js plus option negotiation |
+| Kerberos for RDP | a KDC proxy endpoint; `ironrdp-web` already takes the URL |
+| HTTP(S) web interfaces | a reverse proxy: a new component, not a relay mode |
+
 ## Windows installer
 
 `installer/` builds an MSI. MSI rather than a self-extracting exe because it is deployable the way an
