@@ -1,0 +1,37 @@
+# web-access proxy configuration.
+#
+# This file is a security control. A host absent from [[target]] cannot be named by any client, and
+# a target no [[policy]] grants cannot be reached by anyone. Review it like firewall rules.
+
+listen = "0.0.0.0:8443"
+
+[tls]
+# How the proxy decides WHO it connected to, having used DNS to decide WHERE.
+#   "ca"       validate the target certificate against ca_bundle
+#   "insecure" accept any certificate; reachability without identity
+# There is no default. State it.
+verify = "ca"
+ca_bundle = "/etc/web-access/internal-ca.pem"
+
+# Targets. `id` is what a client names; it is never an address.
+# `port` defaults to 3389 and comes from here, never from the client.
+[[target]]
+id = "historian-01"
+host = "historian-01.plant.example"
+port = 3389
+tags = ["l3", "historian"]
+
+[[target]]
+id = "eng-ws-04"
+host = "eng-ws-04.plant.example"
+tags = ["l3", "engineering"]
+
+# Policies grant TAGS to GROUPS from the identity provider, not hosts to people. Adding a historian
+# is one [[target]] entry and no change here.
+[[policy]]
+group = "OT-Historian-Admins"
+allow = ["historian"]
+
+[[policy]]
+group = "OT-Engineering"
+allow = ["engineering", "historian"]
