@@ -139,7 +139,8 @@ client is `ironrdp-web` compiled to WebAssembly and delivered per session by the
 |---|---|
 | `web/ironrdp_web_bg.wasm` | 7.4 MB, built with `wasm-pack build --target web --release` |
 | `web/ironrdp_web.js` | 70 KB of wasm-bindgen glue |
-| `web/index.html` | the page: connection form, canvas, mouse and keyboard wiring |
+| `web/index.html` | the page: launcher tiles, canvas, no input fields |
+| `web/app.css`, `web/app.js` | separate files, NOT inlined — the proxy sends `default-src 'self'`, which drops an inline `<style>` and blocks an inline `<script>`. Inlining them produced an unstyled page stuck on "loading" with the cause visible only in the console. A test asserts the page inlines nothing the CSP forbids |
 
 All three are committed and embedded with `include_bytes!`, so the deployment stays one MSI, one
 service, browse to it. There is no web root to install and no way for the served client to drift

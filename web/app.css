@@ -1,0 +1,191 @@
+/* Served as a file, not inlined: the proxy sends a strict Content-Security-Policy and
+   `default-src 'self'` forbids an inline style block. Measured 2026-09-23 — inlining it produced an
+   unstyled page with no error on screen. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0d0f13;
+  --bg-2: #12151b;
+  --panel: #171b23;
+  --panel-hi: #1d2230;
+  --line: #262c38;
+  --line-hi: #333b4d;
+  --fg: #e4e8ef;
+  --dim: #8a94a6;
+  --accent: #5b9dff;
+  --accent-dim: #2a4b80;
+  --good: #46d39a;
+  --bad: #ff6b6b;
+  --radius: 10px;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(900px 500px at 15% -10%, rgba(70, 211, 154, .05) 0%, transparent 60%),
+    radial-gradient(1100px 600px at 100% 0%, rgba(91,157,255,.07) 0%, transparent 55%),
+    var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- top bar ---------------------------------------------------------- */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 20px;
+  height: 52px;
+  background: rgba(18, 21, 27, .85);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+
+header h1::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 9px;
+  border-radius: 50%;
+  background: var(--good);
+  box-shadow: 0 0 10px var(--good);
+  vertical-align: middle;
+}
+
+#status {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+#status.bad { color: var(--bad); }
+
+button {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--line-hi);
+  border-radius: 7px;
+  padding: 6px 13px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: border-color .12s ease, background .12s ease;
+}
+button:hover { border-color: var(--accent); background: var(--panel-hi); }
+button:active { transform: translateY(1px); }
+
+/* ---- launcher --------------------------------------------------------- */
+
+main { padding: 28px 20px 40px; }
+
+#tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 14px;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+.tile {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 18px 18px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--panel-hi) 0%, var(--panel) 100%);
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease;
+}
+
+/* A thin accent rail that lights up on hover, so the tile reads as a launch action rather than a
+   card of text. */
+.tile::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--accent-dim);
+  transition: background .15s ease;
+}
+
+.tile:hover {
+  border-color: var(--line-hi);
+  transform: translateY(-2px);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .45);
+}
+.tile:hover::before { background: var(--accent); }
+.tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.tile .name {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  margin-bottom: 10px;
+}
+
+.tile .tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tile .tag {
+  font-size: 10.5px;
+  font-weight: 550;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: rgba(255, 255, 255, .04);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.empty {
+  color: var(--dim);
+  max-width: 62ch;
+  margin: 0 auto;
+  padding: 26px;
+  border: 1px dashed var(--line-hi);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, .015);
+}
+
+/* ---- session ---------------------------------------------------------- */
+
+#screen {
+  display: none;
+  margin: 0 auto;
+  background: #000;
+  max-width: 100%;
+  border-radius: 6px;
+}
+#screen:focus { outline: none; }
+
+body.connected { background: #000; }
+body.connected main { padding: 0; }
+body.connected #tiles { display: none; }
+body.connected #screen { display: block; border-radius: 0; }
