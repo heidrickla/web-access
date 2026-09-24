@@ -108,6 +108,7 @@ skips them.
 | `[tls]` | how RDP servers' certificates are checked: `verify = "ca"` with `ca_bundle`, or `"insecure"`. No default |
 | `[directory]` | `domain`, optional `netbios`, `urls` (ldaps only), `ca_bundle`, optional `service_account` and `check_interval_secs`. Optional when local accounts are allowed |
 | `allow_local_accounts` | let local accounts sign in; default false |
+| `max_connections` | HTTP connections served at once, default 1024; RDP sessions are not counted once connected |
 
 ## Build
 

@@ -125,7 +125,25 @@ an assignment row, so the list a user sees and the connections they can open can
 - With a service account configured, signed-in accounts are re-checked periodically. An account that
   is disabled, expired, gone or re-created loses its sessions and its live RDP connections.
 - A click mints a connect ticket: 60 seconds, single use, bound to the user and the server. The
-  WebSocket must also carry the session cookie of the same user and a same-origin `Origin`.
+  WebSocket must also carry the session cookie of the same user and a same-origin `Origin`. The
+  browser takes its ticket after the credentials dialog closes, immediately before connecting.
+- A connection is registered at upgrade, before anything is read, and belongs to the sign-in it was
+  opened under. Admission re-checks that sign-in, the ticket and the assignment. Revocation,
+  sign-out, the sign-in expiring, the assignment or server being removed, or an import ends it at
+  any stage, setting up or established. Each setup stage has a deadline.
+
+### Imports and freezes
+
+Requests hold a shared gate; an import and a freezing export hold it exclusively. An import waits
+for requests in flight, swaps the database and its key together, and ends every connection, since
+their identities came from the database it replaced. A freezing export freezes and snapshots with no
+request in flight, so nothing acknowledged is missing from it.
+
+### Connections
+
+The listener closes connections beyond `max_connections` on accept, and a TLS handshake not
+finished within 10 seconds. Headers must arrive within 30 seconds and a request complete within 2
+minutes, 30 for an import upload.
 
 ### Where saved credentials live
 

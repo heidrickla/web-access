@@ -247,9 +247,63 @@ pub fn router(app: Shared) -> Router {
         .route("/ws", get(ws_upgrade))
         .nest("/api/admin", crate::admin::router())
         .fallback(static_asset)
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), gate_requests))
+        .layer(middleware::from_fn(deadline))
         .layer(middleware::from_fn(origin_guard))
         .layer(middleware::map_response(security_headers))
         .with_state(app)
+}
+
+/// Routes that manage the gate themselves: the export and the import confirmation take it
+/// exclusively, and the import upload takes it only once its large body has arrived.
+pub const SELF_GATED_ROUTES: &[&str] = &[
+    "/api/admin/migration/export",
+    "/api/admin/migration/import",
+    "/api/admin/migration/import/",
+];
+
+/// Largest body read before the gate is taken. The same as axum's default body limit.
+const GATED_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Every request runs under a shared hold of the gate, so an import or a freezing export waits for
+/// requests in flight and none straddles the swap. THE BODY IS READ FIRST: the lock queues new
+/// readers behind a waiting writer, so a client dribbling a body while holding a share would stall
+/// every request behind the import it delays.
+async fn gate_requests(State(app): State<Shared>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if SELF_GATED_ROUTES
+        .iter()
+        .any(|p| if p.ends_with('/') { path.starts_with(p) } else { path == *p })
+    {
+        return next.run(req).await;
+    }
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, GATED_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "the request body is too large")
+                .into_response()
+        }
+    };
+    let req = Request::from_parts(parts, Body::from(bytes));
+    let _shared = app.gate.read().await;
+    next.run(req).await
+}
+
+/// How long a request, body included, may take. The import upload carries the whole database.
+pub const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+pub const UPLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+async fn deadline(req: Request, next: Next) -> Response {
+    let limit = if req.uri().path() == "/api/admin/migration/import" {
+        UPLOAD_DEADLINE
+    } else {
+        REQUEST_DEADLINE
+    };
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(res) => res,
+        Err(_) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "the request took too long").into_response(),
+    }
 }
 
 async fn static_asset(method: Method, uri: Uri) -> Response {
@@ -388,6 +442,8 @@ async fn directory_sign_in(app: &App, username: &str, password: &str) -> ApiResu
 
 async fn logout(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Response> {
     app.store.session_delete(&current.token_hash)?;
+    // RDP connections opened under this sign-in end with it.
+    app.live.end_session(&current.token_hash);
     app.store.audit(&current.user.username, "signout", "");
     Ok((
         [(header::SET_COOKIE, auth::clear_cookie(app.secure_cookies))],
@@ -596,12 +652,17 @@ async fn ws_upgrade(
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let on_upgrade = hyper::upgrade::on(&mut req);
 
+    // Registered NOW, before anything is read from the socket, so revocation, sign-out or an import
+    // reaches a connection that is still setting up.
     let user = current.user;
+    let token_hash = current.token_hash;
+    let (live_id, ended) = app.live.register(user.id, token_hash.clone());
     tokio::spawn(async move {
         let upgraded = match on_upgrade.await {
             Ok(u) => u,
             Err(e) => {
                 tracing::warn!(%peer, error = %e, "websocket upgrade failed");
+                app.live.remove(live_id);
                 return;
             }
         };
@@ -609,9 +670,11 @@ async fn ws_upgrade(
         let session = Session {
             app: &app,
             user: &user,
+            token_hash: &token_hash,
             peer,
+            live_id,
         };
-        if let Err(e) = session.run(ws, std::future::pending::<()>()).await {
+        if let Err(e) = session.run(ws, ended).await {
             tracing::warn!(%peer, user = %user.username, error = %e, "session ended");
         }
     });
@@ -675,6 +738,7 @@ pub mod tests {
             live: Default::default(),
             target_tls,
             imports: Default::default(),
+            gate: Default::default(),
             cfg,
         })
     }
@@ -891,6 +955,38 @@ pub mod tests {
         let (_, cookie) = login_as(&app, "boss", "a dev test password").await;
         let (s, _) = call(&app, "GET", "/api/admin/users", cookie.as_deref(), None).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    /// A client dribbling a body must not hold the gate while it does.
+    #[tokio::test]
+    async fn a_slow_body_does_not_hold_the_gate() {
+        let app = test_app();
+        let never = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header(header::HOST, "proxy.test")
+            .header(header::ORIGIN, "https://proxy.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(never))
+            .unwrap();
+        let task = tokio::spawn(router(Arc::clone(&app)).oneshot(req));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(app.gate.try_write().is_ok(), "a request still receiving its body holds the gate");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn signing_out_ends_its_connections() {
+        let app = test_app();
+        let (uid, cookie) = signed_in(&app, "jdoe");
+        let hash = auth::token_hash(cookie.split_once('=').unwrap().1);
+        let (_, mut mine) = app.live.register(uid, hash);
+        let (_, mut elsewhere) = app.live.register(uid, b"another browser".to_vec());
+        let (s, _) = call(&app, "POST", "/api/logout", Some(&cookie), None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        assert!(mine.try_recv().is_ok(), "the connection outlived its sign-in");
+        assert!(elsewhere.try_recv().is_err(), "another sign-in's connection was ended");
     }
 
     #[tokio::test]

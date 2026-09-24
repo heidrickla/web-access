@@ -108,9 +108,16 @@ function serversByGroup() {
 
 /* ---- users -------------------------------------------------------------------------------- */
 
-let selected = null;          // user id
+// The user the detail pane shows. Every detail action targets it, and it is set only together with
+// the rendering, so the two cannot disagree.
+let selected = null;
+let selection = 0;            // bumped per click; a response to an older click is discarded
 let assigned = new Set();     // working copy for the selected user
 let savedAssigned = new Set();
+
+function detailBusy(busy) {
+  for (const c of $('user-detail').querySelectorAll('button, input, select')) c.disabled = busy;
+}
 
 loaders.users = async () => {
   const [u] = await Promise.all([api('GET', '/api/admin/users'), loadCatalogue()]);
@@ -154,10 +161,20 @@ $('add-user').addEventListener('submit', async ev => {
 });
 
 async function selectUser(id) {
-  selected = id;
+  const mine = ++selection;
   const u = users.find(x => x.id === id);
   if (!u) return;
-  const r = await api('GET', `/api/admin/users/${id}/servers`);
+  detailBusy(true);
+  let r;
+  try {
+    r = await api('GET', `/api/admin/users/${id}/servers`);
+  } finally {
+    if (mine === selection) detailBusy(false);
+  }
+  // Clicked A then B, and A's answer arrived last: showing it would put A's servers on screen while
+  // Save targeted B.
+  if (mine !== selection) return;
+  selected = id;
   assigned = new Set(r.assigned);
   savedAssigned = new Set(r.assigned);
   renderUsers();

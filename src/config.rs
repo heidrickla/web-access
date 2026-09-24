@@ -30,6 +30,10 @@ pub struct Config {
     /// the config file.
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// HTTP connections served at once; more are closed on accept. Established RDP sessions are not
+    /// counted: they leave the HTTP cycle when the WebSocket takes over.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     /// Seeds an empty database, then ignored.
     #[serde(default)]
     pub target: Vec<Target>,
@@ -91,6 +95,10 @@ pub struct DirectoryConfig {
 
 fn default_timeout() -> u64 {
     10
+}
+
+fn default_max_connections() -> usize {
+    1024
 }
 
 fn default_check_interval() -> u64 {

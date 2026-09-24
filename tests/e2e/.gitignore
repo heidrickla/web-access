@@ -18,4 +18,8 @@ browser/package-lock.json
 jdoe-*.json
 export.zip
 e2e2.out
+e2e3.out
+all.log
+all.pid
+local.jar
 revoke-ready

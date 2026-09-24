@@ -1,21 +1,28 @@
-//! The session: RDCleanPath handshake, then bytes.
+//! The session: admission, the RDCleanPath handshake, then bytes.
 //!
 //! The proxy never decodes RDP. It performs the X.224 exchange and the TLS handshake on the
 //! client's behalf, hands back the server's certificate chain so the CLIENT can judge who it
 //! reached, and then moves bytes until one side stops.
+//!
+//! The connection is registered in the live registry at upgrade, before anything is read, so it can
+//! be ended at every stage: while the client has not yet sent its request, during admission, while
+//! the server is being reached, and once bytes flow.
 
 use crate::app::App;
 use crate::config::{Tls, VerifyMode};
 use crate::policy::{resolve, Denied, PolicyError};
 use crate::resolve::resolve_one;
-use crate::store::User;
+use crate::store::{now, Server, User};
 
 use futures_util::{SinkExt, StreamExt};
 use ironrdp_rdcleanpath::{RDCleanPath, RDCleanPathPdu};
-use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -25,6 +32,12 @@ use tracing::{info, warn};
 /// The X.224 connection confirm is one such unit and must be read whole before TLS begins.
 const TPKT_HEADER: usize = 4;
 const TPKT_MAX: usize = 65535;
+
+/// Deadlines for setting a session up. Once bytes flow there is none: a desktop can sit idle.
+const FIRST_MESSAGE: Duration = Duration::from_secs(30);
+const NAME_RESOLUTION: Duration = Duration::from_secs(10);
+const SERVER_CONNECT: Duration = Duration::from_secs(10);
+const SERVER_HANDSHAKE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -38,14 +51,45 @@ pub enum SessionError {
     Refused,
     #[error("tls: {0}")]
     Tls(String),
+    #[error("timed out {0}")]
+    Timeout(&'static str),
 }
 
-/// One RDP session for a signed-in user. The WebSocket carrying it was already authenticated by the
-/// user's sign-in cookie; the connect ticket inside the RDCleanPath request names the server.
+/// Why admission refused a connection. Logged; the client sees one refusal shape for all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    TicketUnknown,
+    TicketOtherUser,
+    SignInEnded,
+    NoSuchServer,
+    NotAssigned,
+    WrongServer,
+    Store,
+}
+
+impl Refusal {
+    fn detail(self) -> &'static str {
+        match self {
+            Refusal::TicketUnknown => "connect ticket unknown, spent or expired",
+            Refusal::TicketOtherUser => "connect ticket belongs to another user",
+            Refusal::SignInEnded => "the sign-in session has ended",
+            Refusal::NoSuchServer => "no such server",
+            Refusal::NotAssigned => "not assigned to this user",
+            Refusal::WrongServer => "ticket was minted for a different server",
+            Refusal::Store => "store error during admission",
+        }
+    }
+}
+
+/// One RDP session for a signed-in user.
 pub struct Session<'a> {
     pub app: &'a App,
     pub user: &'a User,
-    pub peer: std::net::SocketAddr,
+    /// The sign-in session the WebSocket was opened under, re-checked at admission.
+    pub token_hash: &'a [u8],
+    pub peer: SocketAddr,
+    /// This connection's entry in the live registry, made at upgrade.
+    pub live_id: u64,
 }
 
 pub struct TlsSetup {
@@ -54,90 +98,107 @@ pub struct TlsSetup {
 }
 
 impl Session<'_> {
-    /// Run until either side stops or `cancel` fires, which is how a revoked user's session ends.
-    pub async fn run<S>(
-        &self,
-        mut ws: WebSocketStream<S>,
-        cancel: impl Future<Output = ()>,
-    ) -> Result<(), SessionError>
+    /// Run until either side stops or `ended` fires: revocation, sign-out, the assignment or server
+    /// removed, or an import. Whatever happens, the registry entry is removed.
+    pub async fn run<S>(&self, ws: WebSocketStream<S>, ended: oneshot::Receiver<()>) -> Result<(), SessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let outcome = tokio::select! {
+            r = self.serve(ws) => r,
+            _ = ended => {
+                info!(peer = %self.peer, subject = %self.user.username, "connection ended by revocation, sign-out, unassignment or import");
+                Ok(())
+            }
+        };
+        if let Some(e) = self.app.live.remove(self.live_id) {
+            // Closing the TCP connection is a DISCONNECT to Windows, not a sign-out: the desktop
+            // stays, and the same account reconnecting to this server picks it up again.
+            if let (true, Some(server_id)) = (e.established, e.server_id) {
+                if let Err(err) = self.app.store.session_ended(e.user_id, server_id, now()) {
+                    warn!(error = %err, "could not record the session end");
+                }
+            }
+        }
+        info!(peer = %self.peer, subject = %self.user.username, "connection closed");
+        outcome
+    }
+
+    /// The admission decision, under the import gate so it cannot straddle a database swap. The
+    /// connection was registered before this, so a revocation at any later moment still reaches it.
+    pub async fn admit(&self, target_id: &str, proxy_auth: &str) -> Result<Server, Refusal> {
+        let _gate = self.app.gate.read().await;
+        // THE DESTINATION FIELD CARRIES A SERVER ID, NOT AN ADDRESS. The ticket must have been
+        // minted for this user and this server, and is spent here whatever happens next.
+        let ticket = match self.app.tickets.redeem(proxy_auth) {
+            Some(t) if t.user_id == self.user.id => t,
+            Some(_) => return Err(Refusal::TicketOtherUser),
+            None => return Err(Refusal::TicketUnknown),
+        };
+        self.app.live.set_server(self.live_id, ticket.server_id);
+        // The sign-in the WebSocket was opened under must still be live, or a ticket minted before
+        // a revocation or a sign-out would still connect.
+        match self.app.store.session_user(self.token_hash, now()) {
+            Ok(Some(u)) if u.id == self.user.id => {}
+            Ok(_) => return Err(Refusal::SignInEnded),
+            Err(_) => return Err(Refusal::Store),
+        }
+        match resolve(&self.app.store, self.user.id, target_id) {
+            Ok(t) if t.id == ticket.server_id => Ok(t),
+            Ok(_) => Err(Refusal::WrongServer),
+            Err(PolicyError::Denied(Denied::NoSuchTarget)) => Err(Refusal::NoSuchServer),
+            Err(PolicyError::Denied(Denied::NotPermitted)) => Err(Refusal::NotAssigned),
+            Err(PolicyError::Store(_)) => Err(Refusal::Store),
+        }
+    }
+
+    async fn serve<S>(&self, mut ws: WebSocketStream<S>) -> Result<(), SessionError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let peer = self.peer;
         let subject = self.user.username.as_str();
-        // 1. The client's RDCleanPath request.
-        let first = loop {
-            match ws.next().await {
-                Some(Ok(Message::Binary(b))) => break b,
-                Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await?,
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(e.into()),
-                None => return Ok(()),
-            }
-        };
 
+        // 1. The client's RDCleanPath request, within a deadline.
+        let first = match timeout(FIRST_MESSAGE, first_binary(&mut ws)).await {
+            Ok(Ok(Some(b))) => b,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(SessionError::Timeout("waiting for the client's request")),
+        };
         let pdu = RDCleanPathPdu::from_der(&first).map_err(|_| SessionError::NotARequest)?;
-        let (target_id, proxy_auth, x224, _pcb) = match pdu
+        let (target_id, proxy_auth, x224) = match pdu
             .into_enum()
             .map_err(|_| SessionError::NotARequest)?
         {
             RDCleanPath::Request {
                 destination,
                 proxy_auth,
-                server_auth: _,
-                preconnection_blob,
                 x224_connection_request,
-            } => (
-                destination,
-                proxy_auth,
-                x224_connection_request,
-                preconnection_blob,
-            ),
+                ..
+            } => (destination, proxy_auth, x224_connection_request),
             RDCleanPath::Response { .. }
             | RDCleanPath::GeneralErr(_)
             | RDCleanPath::NegotiationErr { .. } => return Err(SessionError::NotARequest),
         };
 
-        // THE DESTINATION FIELD CARRIES A SERVER ID, NOT AN ADDRESS, so "reach an arbitrary host" is
-        // not a request this protocol can express. The ticket must have been minted for this user
-        // and this server, and is spent here whatever happens next.
-        let ticket = match self.app.tickets.redeem(&proxy_auth) {
-            Some(t) if t.user_id == self.user.id => t,
-            Some(_) => {
-                warn!(%peer, %subject, "connect ticket belongs to another user");
-                return self.refuse(ws).await;
-            }
-            None => {
-                warn!(%peer, %subject, "connect ticket unknown, spent or expired");
+        // 2. Admission.
+        let target = match self.admit(&target_id, &proxy_auth).await {
+            Ok(t) => t,
+            Err(r) => {
+                warn!(%peer, %subject, target = %target_id, detail = r.detail(), "refused");
                 return self.refuse(ws).await;
             }
         };
 
-        let target = match resolve(&self.app.store, self.user.id, &target_id) {
-            Ok(t) if t.id == ticket.server_id => t,
-            Ok(t) => {
-                warn!(%peer, %subject, requested = %t.id, ticketed = %ticket.server_id, "ticket was minted for a different server");
-                return self.refuse(ws).await;
-            }
-            Err(PolicyError::Denied(reason)) => {
-                // The log distinguishes these. The client does not.
-                let detail = match reason {
-                    Denied::NoSuchTarget => "no such server",
-                    Denied::NotPermitted => "not assigned to this user",
-                };
-                warn!(%peer, %subject, target = %target_id, %detail, "refused");
-                return self.refuse(ws).await;
-            }
-            Err(PolicyError::Store(e)) => {
-                warn!(%peer, %subject, error = %e, "store error while resolving");
-                return self.refuse(ws).await;
-            }
-        };
-
-        let addr = match resolve_one(&target.host, target.port).await {
-            Ok(a) => a,
-            Err(e) => {
+        let addr = match timeout(NAME_RESOLUTION, resolve_one(&target.host, target.port)).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
                 warn!(%peer, %subject, target = %target.name, error = %e, "resolution failed, failing closed");
+                return self.refuse(ws).await;
+            }
+            Err(_) => {
+                warn!(%peer, %subject, target = %target.name, "resolution timed out, failing closed");
                 return self.refuse(ws).await;
             }
         };
@@ -154,22 +215,28 @@ impl Session<'_> {
             &format!("{} ({} -> {addr})", target.name, target.host),
         );
 
-        // 2. X.224, in the clear, exactly as the client sent it.
-        let mut tcp = TcpStream::connect(addr).await?;
-        tcp.write_all(x224.as_bytes()).await?;
-        let confirm = read_tpkt(&mut tcp).await?;
+        // 3. X.224, in the clear, exactly as the client sent it.
+        let mut tcp = timeout(SERVER_CONNECT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| SessionError::Timeout("connecting to the server"))??;
+        let confirm = timeout(SERVER_HANDSHAKE, async {
+            tcp.write_all(x224.as_bytes()).await?;
+            read_tpkt(&mut tcp).await
+        })
+        .await
+        .map_err(|_| SessionError::Timeout("waiting for the server's X.224 confirm"))??;
 
-        // 3. TLS, performed here so the client does not have to. RDCleanPath exists to remove this
+        // 4. TLS, performed here so the client does not have to. RDCleanPath exists to remove this
         //    second encapsulation; the chain goes back to the client so it can still judge identity.
         let server_name = rustls_pki_types::ServerName::try_from(target.host.clone())
             .map_err(|e| SessionError::Tls(e.to_string()))?;
-        let tls = self
-            .app
-            .target_tls
-            .connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| SessionError::Tls(e.to_string()))?;
+        let tls = timeout(
+            SERVER_HANDSHAKE,
+            self.app.target_tls.connector.connect(server_name, tcp),
+        )
+        .await
+        .map_err(|_| SessionError::Timeout("in the TLS handshake with the server"))?
+        .map_err(|e| SessionError::Tls(e.to_string()))?;
 
         let chain: Vec<Vec<u8>> = tls
             .get_ref()
@@ -187,7 +254,8 @@ impl Session<'_> {
         ))
         .await?;
 
-        // 4. Bytes, both ways, until someone stops. Nothing below this line understands RDP.
+        // 5. Bytes, both ways, until someone stops. Nothing below this line understands RDP.
+        self.app.live.set_established(self.live_id);
         let (mut ws_tx, mut ws_rx) = ws.split();
         let (mut srv_rx, mut srv_tx) = tokio::io::split(tls);
 
@@ -214,31 +282,10 @@ impl Session<'_> {
             Ok::<_, SessionError>(())
         };
 
-        // Registered only once the session is really up, so the list's "connected" marker and the
-        // revocation sweep see real sessions.
-        let (live_id, revoked) = self.app.live.register(self.user.id, target.id);
-        let outcome = tokio::select! {
+        tokio::select! {
             r = to_server => r,
             r = to_client => r,
-            _ = revoked => {
-                info!(%peer, %subject, target = %target.name, "session ended by revocation");
-                Ok(())
-            }
-            _ = cancel => Ok(()),
-        };
-        self.app.live.unregister(live_id);
-
-        // Closing the TCP connection is a DISCONNECT to Windows, not a sign-out: the desktop stays,
-        // and the same account reconnecting to this server picks it up again.
-        if let Err(e) = self
-            .app
-            .store
-            .session_ended(self.user.id, target.id, crate::store::now())
-        {
-            warn!(error = %e, "could not record the session end");
         }
-        info!(%peer, %subject, target = %target.name, "session closed");
-        outcome
     }
 
     /// One refusal shape for every denial, so the client learns nothing from which one it hit.
@@ -252,6 +299,22 @@ impl Session<'_> {
         }
         let _ = ws.close(None).await;
         Err(SessionError::Refused)
+    }
+}
+
+/// The first binary message, answering pings. None if the client closed first.
+async fn first_binary<S>(ws: &mut WebSocketStream<S>) -> Result<Option<Vec<u8>>, SessionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Binary(b))) => return Ok(Some(b)),
+            Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await?,
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(e.into()),
+            None => return Ok(None),
+        }
     }
 }
 
@@ -356,6 +419,7 @@ mod insecure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::tests::{signed_in, test_app};
 
     #[tokio::test]
     async fn a_tpkt_unit_is_read_whole() {
@@ -383,5 +447,78 @@ mod tests {
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         assert!(read_tpkt(&mut client).await.is_err());
+    }
+
+    /// The token hash behind a `signed_in` cookie.
+    fn hash_of(cookie: &str) -> Vec<u8> {
+        crate::auth::token_hash(cookie.split_once('=').unwrap().1)
+    }
+
+    #[tokio::test]
+    async fn admission_accepts_a_live_sign_in_with_its_ticket() {
+        let app = test_app();
+        let (uid, cookie) = signed_in(&app, "jdoe");
+        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        app.store.set_assignments(uid, &[s]).unwrap();
+        let user = app.store.user_by_id(uid).unwrap().unwrap();
+        let hash = hash_of(&cookie);
+        let (live_id, _ended) = app.live.register(uid, hash.clone());
+        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id };
+        let ticket = app.tickets.issue(uid, s);
+        assert_eq!(session.admit(&s.to_string(), &ticket).await.unwrap().id, s);
+    }
+
+    /// A ticket minted before a revocation or sign-out must not connect afterwards.
+    #[tokio::test]
+    async fn admission_refuses_once_the_sign_in_has_ended() {
+        let app = test_app();
+        let (uid, cookie) = signed_in(&app, "jdoe");
+        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        app.store.set_assignments(uid, &[s]).unwrap();
+        let user = app.store.user_by_id(uid).unwrap().unwrap();
+        let hash = hash_of(&cookie);
+        let (live_id, _ended) = app.live.register(uid, hash.clone());
+        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id };
+        let ticket = app.tickets.issue(uid, s);
+        app.store.sessions_delete_user(uid).unwrap();
+        assert_eq!(session.admit(&s.to_string(), &ticket).await.unwrap_err(), Refusal::SignInEnded);
+    }
+
+    #[tokio::test]
+    async fn admission_refuses_another_users_ticket_and_an_unassigned_server() {
+        let app = test_app();
+        let (uid, cookie) = signed_in(&app, "jdoe");
+        let (other, _) = signed_in(&app, "asmith");
+        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let user = app.store.user_by_id(uid).unwrap().unwrap();
+        let hash = hash_of(&cookie);
+        let (live_id, _ended) = app.live.register(uid, hash.clone());
+        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id };
+        let theirs = app.tickets.issue(other, s);
+        assert_eq!(session.admit(&s.to_string(), &theirs).await.unwrap_err(), Refusal::TicketOtherUser);
+        let mine = app.tickets.issue(uid, s);
+        assert_eq!(session.admit(&s.to_string(), &mine).await.unwrap_err(), Refusal::NotAssigned);
+    }
+
+    /// A connection that never sends its request is ended by revocation while it waits.
+    #[tokio::test]
+    async fn a_connection_still_setting_up_is_ended_by_revocation() {
+        let app = test_app();
+        let (uid, cookie) = signed_in(&app, "jdoe");
+        let user = app.store.user_by_id(uid).unwrap().unwrap();
+        let hash = hash_of(&cookie);
+        let (client, server) = tokio::io::duplex(4096);
+        let ws = WebSocketStream::from_raw_socket(server, tokio_tungstenite::tungstenite::protocol::Role::Server, None).await;
+        let _client = client; // held open, silent
+        let (live_id, ended) = app.live.register(uid, hash.clone());
+        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id };
+        let app2 = Arc::clone(&app);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            app2.live.end_user(uid);
+        });
+        let finished = timeout(Duration::from_secs(5), session.run(ws, ended)).await;
+        assert!(finished.is_ok(), "the pending connection was not ended");
+        assert_eq!(app.live.count(), 0);
     }
 }

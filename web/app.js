@@ -600,6 +600,7 @@ async function openServer(id) {
   for (let round = 0; round < 2; round++) {
     let grant;
     try {
+      await clientReady;   // before any ticket is minted, so none ages while the client loads
       grant = await api('POST', '/api/connect', { server: id });
     } catch (err) {
       if (err instanceof SignedOut) return showLogin('Your sign-in has expired. Sign in again.');
@@ -613,7 +614,19 @@ async function openServer(id) {
     grant.credential = null;
     if (!creds) { say('cancelled'); return; }
 
-    const outcome = await runSession(server, grant.ticket, creds);
+    // A ticket lives 60 seconds and the dialog can take longer, so a fresh one is taken once the
+    // credentials are in hand and the client is loaded, immediately before connecting.
+    let ticket = grant.ticket;
+    if (!fromSaved) {
+      try {
+        ticket = (await api('POST', '/api/connect', { server: id })).ticket;
+      } catch (err) {
+        if (err instanceof SignedOut) return showLogin('Your sign-in has expired. Sign in again.');
+        return say('could not open ' + server.name + ': ' + err.message, true);
+      }
+    }
+
+    const outcome = await runSession(server, ticket, creds);
     if (outcome.connected) {
       // The proxy records the end once it sees the socket close, a moment after the client does,
       // so the list is loaded again shortly to pick up the Reconnect marker.

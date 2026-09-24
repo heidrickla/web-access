@@ -25,3 +25,4 @@ check "local account assigns itself a server" 200 "$(code -X PUT -b local.jar "$
 check "local account gets a connect ticket" 64 "$(curl -s -b local.jar "${O[@]}" -d "{\"server\":$sid}" "$B/api/connect" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["ticket"]))')"
 ./proxy.sh stop 3
 echo "passed=$pass failed=$fail"
+[ "$fail" -eq 0 ]
