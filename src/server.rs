@@ -4,7 +4,7 @@
 use crate::app::App;
 use crate::config::{Config, Https};
 use crate::store::now;
-use crate::web::Peer;
+use crate::web::{ConnectionPermit, Peer};
 
 use axum::Router;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -40,7 +40,8 @@ pub async fn run(
         "loaded {config_path}"
     );
 
-    tokio::spawn(checks(Arc::clone(&app)));
+    tokio::spawn(session_checks(Arc::clone(&app)));
+    tokio::spawn(directory_checks(Arc::clone(&app)));
 
     let limits = Limits {
         max_connections: app.cfg.max_connections,
@@ -58,8 +59,9 @@ pub const TLS_HANDSHAKE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// HTTP connections served at once, each from accept until its request cycle ends. A connection
-    /// over the limit is closed on accept.
+    /// Connections served at once, each from accept until its request cycle ends or, for a
+    /// WebSocket, until its RDP session is established. A connection over the limit is closed on
+    /// accept.
     pub max_connections: usize,
     pub tls_handshake: Duration,
 }
@@ -97,16 +99,17 @@ pub async fn accept_loop(
                 let router = router.clone();
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    // Held for the HTTP cycle; a WebSocket upgrade takes it over.
+                    let slot = ConnectionPermit::new(permit);
                     match acceptor {
                         Some(acceptor) => {
                             match tokio::time::timeout(limits.tls_handshake, acceptor.accept(stream)).await {
-                                Ok(Ok(tls)) => serve(tls, peer, router).await,
+                                Ok(Ok(tls)) => serve(tls, peer, slot, router).await,
                                 Ok(Err(e)) => debug!(%peer, error = %e, "TLS handshake failed"),
                                 Err(_) => debug!(%peer, "TLS handshake timed out"),
                             }
                         }
-                        None => serve(stream, peer, router).await,
+                        None => serve(stream, peer, slot, router).await,
                     }
                 });
             }
@@ -115,12 +118,13 @@ pub async fn accept_loop(
 }
 
 /// HTTP/1.1 on one connection, with upgrades so the WebSocket can take it over.
-async fn serve<S>(stream: S, peer: SocketAddr, router: Router)
+async fn serve<S>(stream: S, peer: SocketAddr, permit: ConnectionPermit, router: Router)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
         req.extensions_mut().insert(Peer(peer));
+        req.extensions_mut().insert(permit.clone());
         router.clone().oneshot(req.map(axum::body::Body::new))
     });
     let result = hyper::server::conn::http1::Builder::new()
@@ -156,17 +160,9 @@ fn server_tls(h: &Https) -> Result<rustls::ServerConfig, Box<dyn std::error::Err
 /// How often connections are checked against the sign-in they were opened under.
 pub const SESSION_CHECK: Duration = Duration::from_secs(30);
 
-/// Periodic housekeeping: expired sessions go, connections whose sign-in has ended are closed, and
-/// accounts the directory no longer allows lose their sessions and connections.
-async fn checks(app: Arc<App>) {
-    let directory_every = Duration::from_secs(
-        app.cfg
-            .directory
-            .as_ref()
-            .map_or(600, |d| d.check_interval_secs)
-            .max(30),
-    );
-    let mut last_directory: Option<std::time::Instant> = None;
+/// Expired sessions go and connections whose sign-in has ended are closed, every 30 seconds. Its
+/// own task, so a slow directory never delays it.
+async fn session_checks(app: Arc<App>) {
     let mut tick = tokio::time::interval(SESSION_CHECK);
     loop {
         tick.tick().await;
@@ -179,13 +175,25 @@ async fn checks(app: Arc<App>) {
         if orphans > 0 {
             info!(ended = orphans, "connections ended because their sign-in ended");
         }
-        if last_directory.is_none_or(|t| t.elapsed() >= directory_every) {
-            last_directory = Some(std::time::Instant::now());
-            match revocation_pass(&app).await {
-                Ok(0) => {}
-                Ok(n) => info!(revoked = n, "revocation pass ended sessions"),
-                Err(e) => warn!(error = %e, "revocation pass could not run; nothing was revoked"),
-            }
+    }
+}
+
+/// Accounts the directory no longer allows lose their sessions and connections.
+async fn directory_checks(app: Arc<App>) {
+    let every = Duration::from_secs(
+        app.cfg
+            .directory
+            .as_ref()
+            .map_or(600, |d| d.check_interval_secs)
+            .max(30),
+    );
+    let mut tick = tokio::time::interval(every);
+    loop {
+        tick.tick().await;
+        match revocation_pass(&app).await {
+            Ok(0) => {}
+            Ok(n) => info!(revoked = n, "revocation pass ended sessions"),
+            Err(e) => warn!(error = %e, "revocation pass could not run; nothing was revoked"),
         }
     }
 }
@@ -222,32 +230,55 @@ fn users_to_check(app: &App) -> Result<Vec<crate::store::User>, Box<dyn std::err
     Ok(users)
 }
 
+fn revocation_reason(
+    user: &crate::store::User,
+    account: Option<&crate::directory::Account>,
+) -> Option<&'static str> {
+    match account {
+        None => Some("the account no longer exists"),
+        Some(a) if a.disabled => Some("the account is disabled"),
+        Some(a) if a.expired => Some("the account has expired"),
+        Some(a) if user.sid.as_deref().is_some_and(|s| s != a.sid) => Some("the account's SID changed"),
+        _ => None,
+    }
+}
+
 /// Check those users against the directory. A directory that cannot be reached revokes nothing.
+/// Who to check is read under a short hold and the directory is asked without the gate. What it
+/// said is applied under a hold, only to the database it was asked about, and to each user as they
+/// are by then.
 pub async fn revocation_pass(app: &App) -> Result<usize, Box<dyn std::error::Error>> {
     let Some(directory) = app.lookup_directory() else {
         return Ok(0);
     };
-    let Some(password) = app.directory_password()? else {
-        return Ok(0);
+    let (generation, password, users) = {
+        let _shared = app.gate.read().await;
+        let Some(password) = app.directory_password()? else {
+            return Ok(0);
+        };
+        (app.generation(), password, users_to_check(app)?)
     };
-    let users = users_to_check(app)?;
     if users.is_empty() {
         return Ok(0);
     }
     let names: Vec<String> = users.iter().map(|u| u.username.clone()).collect();
     let found = directory.lookup_many(&password, &names).await?;
+
+    let _shared = app.gate.read().await;
+    if app.generation() != generation {
+        info!("an import replaced the database during the revocation pass; its results were discarded");
+        return Ok(0);
+    }
     let mut revoked = 0;
-    for (user, (_, account)) in users.iter().zip(found) {
-        let reason = match &account {
-            None => Some("the account no longer exists"),
-            Some(a) if a.disabled => Some("the account is disabled"),
-            Some(a) if a.expired => Some("the account has expired"),
-            Some(a) if user.sid.as_deref().is_some_and(|s| s != a.sid) => {
-                Some("the account's SID changed")
-            }
-            _ => None,
+    for (checked, (_, account)) in users.iter().zip(found) {
+        let Some(user) = app
+            .store
+            .user_by_id(checked.id)?
+            .filter(|u| !u.local && u.username == checked.username)
+        else {
+            continue;
         };
-        if let Some(reason) = reason {
+        if let Some(reason) = revocation_reason(&user, account.as_ref()) {
             app.store.sessions_delete_user(user.id)?;
             let ended = app.live.end_user(user.id);
             app.store.audit(
@@ -280,8 +311,8 @@ mod tests {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
         let hash = crate::auth::token_hash(cookie.split_once('=').unwrap().1);
-        let (_, mut live) = app.live.register(uid, hash.clone());
-        let (_, mut other) = app.live.register(uid, b"a session that never existed".to_vec());
+        let (_, mut live) = app.live.register(uid, hash.clone(), 0);
+        let (_, mut other) = app.live.register(uid, b"a session that never existed".to_vec(), 0);
         assert_eq!(end_orphaned_connections(&app), 1);
         assert!(other.try_recv().is_ok(), "no sign-in behind it");
         assert!(live.try_recv().is_err(), "its sign-in is live");
@@ -295,8 +326,8 @@ mod tests {
         let app = test_app();
         let uid = app.store.user_create("jdoe", None).unwrap();
         let local = app.store.local_account_set("devtest", "h", "local:1").unwrap();
-        let (_a, _ra) = app.live.register(uid, b"gone".to_vec());
-        let (_b, _rb) = app.live.register(local, b"gone".to_vec());
+        let (_a, _ra) = app.live.register(uid, b"gone".to_vec(), 0);
+        let (_b, _rb) = app.live.register(local, b"gone".to_vec(), 0);
         let ids: Vec<i64> = users_to_check(&app).unwrap().iter().map(|u| u.id).collect();
         assert_eq!(ids, vec![uid], "local accounts are never checked against the directory");
     }
@@ -354,5 +385,46 @@ mod tests {
         let mut a = _a;
         let still = tokio::time::timeout(Duration::from_millis(300), a.read(&mut buf)).await;
         assert!(still.is_err(), "a connection within the limit was closed");
+    }
+
+    async fn closed(addr: SocketAddr, wait: Duration) -> bool {
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        matches!(tokio::time::timeout(wait, c.read(&mut buf)).await, Ok(Ok(0)) | Ok(Err(_)))
+    }
+
+    /// An upgraded WebSocket keeps its connection's place under max_connections until its session
+    /// is established or it ends.
+    #[tokio::test]
+    async fn a_websocket_setting_up_keeps_its_place_under_the_limit() {
+        use tokio::io::AsyncWriteExt;
+        let (listener, addr) = loopback().await;
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "jdoe");
+        let limits = Limits { max_connections: 1, tls_handshake: Duration::from_secs(30) };
+        let router = crate::web::router(Arc::clone(&app));
+        tokio::spawn(accept_loop(listener, None, router, limits, std::future::pending()));
+
+        let mut ws = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /ws HTTP/1.1\r\nHost: proxy.test\r\nOrigin: http://proxy.test\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {cookie}\r\n\r\n"
+        );
+        ws.write_all(request.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 512];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf)).await.unwrap().unwrap();
+            assert!(n > 0, "closed before answering the upgrade");
+            head.extend_from_slice(&buf[..n]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(closed(addr, Duration::from_secs(2)).await, "a pending WebSocket gave up its place");
+
+        drop(ws);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!closed(addr, Duration::from_millis(300)).await, "an ended WebSocket kept its place");
     }
 }

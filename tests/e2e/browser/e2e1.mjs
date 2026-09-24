@@ -125,6 +125,29 @@ try {
   check('a slow answer to an earlier click does not replace the later selection',
     title.includes('jdoe') && ticked === 2, `title=${title} ticked=${ticked}`);
   await admin.page.unroute('**/api/admin/users/*/servers');
+
+  // Add a user while jdoe's pane holds an unsaved change, with the list refresh after the add
+  // slowed: nothing in jdoe's pane may be usable once Save would no longer mean jdoe.
+  await admin.page.click('#ud-checklist li.row input:not(:checked)');
+  check('an unsaved change enables Save', !(await admin.page.isDisabled('#ud-save')));
+  let slowList = false;
+  await admin.page.route('**/api/admin/users', async route => {
+    if (!slowList && route.request().method() === 'GET') {
+      slowList = true;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    await route.continue();
+  });
+  await admin.page.fill('#new-username', 'gone');
+  await admin.page.click('#add-user button[type=submit]');
+  await admin.page.waitForFunction(() => document.querySelector('#status')?.textContent.includes('user added'), null, { timeout: 5000 }).catch(() => {});
+  check('Save is unusable while the list refreshes after Add User', await admin.page.isDisabled('#ud-save'));
+  await admin.page.waitForFunction(() => document.querySelector('#ud-title')?.textContent.includes('gone'), null, { timeout: 5000 }).catch(() => {});
+  const added = await admin.page.textContent('#ud-title');
+  const addedTicked = await admin.page.$$eval('#ud-checklist li.row input:checked', els => els.length);
+  check('after Add User the pane shows the new user with an empty list',
+    added.includes('gone') && addedTicked === 0, `title=${added} ticked=${addedTicked}`);
+  await admin.page.unroute('**/api/admin/users');
   for (const tab of ['servers', 'groups', 'activity', 'migration']) {
     await admin.page.click(`nav.tabs button[data-tab="${tab}"]`);
     await admin.page.waitForTimeout(700);

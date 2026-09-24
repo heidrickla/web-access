@@ -109,9 +109,69 @@ impl Tickets {
     }
 }
 
+/// Failed local-account sign-ins allowed per username within the window before further attempts are
+/// refused without checking the password.
+pub const THROTTLE_FAILURES: usize = 5;
+pub const THROTTLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Local accounts have no directory lockout policy behind them, so the proxy keeps its own.
+#[derive(Default)]
+pub struct Throttle {
+    failures: Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+impl Throttle {
+    pub fn blocked(&self, key: &str) -> bool {
+        self.blocked_at(key, Instant::now())
+    }
+
+    fn blocked_at(&self, key: &str, at: Instant) -> bool {
+        let mut map = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(times) = map.get_mut(key) else {
+            return false;
+        };
+        times.retain(|t| at.saturating_duration_since(*t) < THROTTLE_WINDOW);
+        times.len() >= THROTTLE_FAILURES
+    }
+
+    pub fn fail(&self, key: &str) {
+        self.fail_at(key, Instant::now());
+    }
+
+    fn fail_at(&self, key: &str, at: Instant) {
+        let mut map = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, v| v.last().is_some_and(|t| at.saturating_duration_since(*t) < THROTTLE_WINDOW));
+        map.entry(key.to_owned()).or_default().push(at);
+    }
+
+    pub fn clear(&self, key: &str) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_throttle_blocks_after_five_failures_and_lifts_after_the_window() {
+        let t = Throttle::default();
+        let start = Instant::now();
+        for _ in 0..THROTTLE_FAILURES - 1 {
+            t.fail_at("devtest", start);
+        }
+        assert!(!t.blocked_at("devtest", start));
+        t.fail_at("devtest", start);
+        assert!(t.blocked_at("devtest", start));
+        assert!(!t.blocked_at("someone-else", start));
+        assert!(!t.blocked_at("devtest", start + THROTTLE_WINDOW));
+        t.fail_at("devtest", start);
+        t.clear("devtest");
+        assert!(!t.blocked_at("devtest", start));
+    }
 
     #[test]
     fn a_ticket_is_spent_by_its_first_use() {

@@ -30,8 +30,8 @@ pub struct Config {
     /// the config file.
     #[serde(default)]
     pub data_dir: Option<String>,
-    /// HTTP connections served at once; more are closed on accept. Established RDP sessions are not
-    /// counted: they leave the HTTP cycle when the WebSocket takes over.
+    /// Connections served at once; more are closed on accept. A WebSocket counts until its RDP
+    /// session is established; established sessions are not counted.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
     /// Seeds an empty database, then ignored.

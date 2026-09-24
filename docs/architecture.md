@@ -139,11 +139,27 @@ for requests in flight, swaps the database and its key together, and ends every 
 their identities came from the database it replaced. A freezing export freezes and snapshots with no
 request in flight, so nothing acknowledged is missing from it.
 
+| Rule | Why |
+|---|---|
+| Slow work runs outside the gate: sign-in's password hash or directory bind, the directory checks behind Add User and the service-account password, the periodic account check | a slow directory never holds up an import, or every request queued behind it |
+| Work that left the gate re-reads the database generation when it returns, and discards its result if an import replaced the database meanwhile | a result is only applied to the database it was computed from |
+| Routes that take the gate themselves re-check the caller's session and administrator status once they hold it | authorization comes from the database as it is when the work runs |
+| Import and export run in a task of their own that the request awaits. A request that ends before the task has the gate abandons it; once the task has the gate, it runs to the end | the gate is never released partway through a swap |
+| An export verifies the passphrase against the recovery wrap inside its own snapshot | the archive always opens with the passphrase it was made under |
+| Exports run one at a time. One that fails, or whose archive is not delivered, lifts only a freeze it set, and only in the database it set it in | a failed export cannot undo another export's freeze |
+| A connection records the database generation it was admitted under. Its end is recorded only in that database | numeric ids from a replaced database never land on another user's history |
+
 ### Connections
 
 The listener closes connections beyond `max_connections` on accept, and a TLS handshake not
-finished within 10 seconds. Headers must arrive within 30 seconds and a request complete within 2
-minutes, 30 for an import upload.
+finished within 10 seconds. A WebSocket keeps its connection's place under the limit until its RDP
+session is established or it ends. Headers must arrive within 30 seconds and a request complete
+within 2 minutes; exports, import uploads and import confirmations get 30.
+
+At most four password hashes run at once (64 MiB each). A local account that fails five sign-ins
+within five minutes is refused without its password being checked until the oldest failure is five
+minutes old. Sessions are purged and orphaned connections closed every 30 seconds, independently of
+the directory check.
 
 ### Where saved credentials live
 

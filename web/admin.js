@@ -108,9 +108,11 @@ function serversByGroup() {
 
 /* ---- users -------------------------------------------------------------------------------- */
 
-// The user the detail pane shows. Every detail action targets it, and it is set only together with
-// the rendering, so the two cannot disagree.
+// The user the detail pane shows. Every detail action targets it. It is assigned only in
+// selectUser, together with the rendering, and in showNoUser, so the two cannot disagree.
 let selected = null;
+// The user asked for last, by a click or by Add User. Shown once its data has arrived.
+let wanted = null;
 let selection = 0;            // bumped per click; a response to an older click is discarded
 let assigned = new Set();     // working copy for the selected user
 let savedAssigned = new Set();
@@ -119,13 +121,28 @@ function detailBusy(busy) {
   for (const c of $('user-detail').querySelectorAll('button, input, select')) c.disabled = busy;
 }
 
+function showNoUser() {
+  selected = null;
+  $('user-detail').hidden = true;
+}
+
 loaders.users = async () => {
-  const [u] = await Promise.all([api('GET', '/api/admin/users'), loadCatalogue()]);
-  users = u.users;
-  renderUsers();
-  if (selected && users.some(x => x.id === selected)) await selectUser(selected);
-  else $('user-detail').hidden = true;
-  say(users.length + ' users');
+  // The pane keeps showing its user until the refreshed one replaces it; nothing in it can be used
+  // meanwhile.
+  const mine = selection;
+  detailBusy(true);
+  try {
+    const [u] = await Promise.all([api('GET', '/api/admin/users'), loadCatalogue()]);
+    users = u.users;
+    renderUsers();
+    say(users.length + ' users');
+  } finally {
+    if (mine === selection) detailBusy(false);
+  }
+  // A click made while the list loaded owns the pane.
+  if (mine !== selection) return;
+  if (wanted !== null && users.some(x => x.id === wanted)) await selectUser(wanted);
+  else showNoUser();
 };
 
 function renderUsers() {
@@ -151,16 +168,23 @@ $('user-filter').addEventListener('input', renderUsers);
 
 $('add-user').addEventListener('submit', async ev => {
   ev.preventDefault();
+  const mine = selection;
+  detailBusy(true);
+  let r;
   try {
-    const r = await api('POST', '/api/admin/users', { username: $('new-username').value });
-    $('new-username').value = '';
-    selected = r.id;
-    say(r.verified ? 'user added; found in the directory' : 'user added');
-    await loaders.users();
-  } catch (err) { fail(err); }
+    r = await api('POST', '/api/admin/users', { username: $('new-username').value });
+  } catch (err) {
+    if (mine === selection) detailBusy(false);
+    return fail(err);
+  }
+  $('new-username').value = '';
+  wanted = r.id;
+  say(r.verified ? 'user added; found in the directory' : 'user added');
+  await loaders.users().catch(fail);
 });
 
 async function selectUser(id) {
+  wanted = id;
   const mine = ++selection;
   const u = users.find(x => x.id === id);
   if (!u) return;
@@ -291,7 +315,7 @@ $('ud-remove').addEventListener('click', async () => {
   if (!confirm(`Remove ${u.username}? Their server list and saved credentials are removed, and any open session is ended.`)) return;
   try {
     await api('DELETE', `/api/admin/users/${selected}`);
-    selected = null;
+    wanted = null;
     say('user removed');
     await loaders.users();
   } catch (err) { fail(err); }
