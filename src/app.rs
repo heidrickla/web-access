@@ -21,6 +21,9 @@ pub const META_FROZEN: &str = "frozen";
 /// Set with a freeze an export sets, cleared once the export hands over its archive. Found at
 /// start, it marks a freeze whose export never finished.
 pub const META_FREEZE_PENDING: &str = "freeze_pending";
+/// Names this database's contents. Every import gives the imported database a new one, so a page
+/// loaded before an import is told apart from one loaded after it.
+pub const META_INSTANCE: &str = "instance";
 const META_SEEDED: &str = "seeded_from_config";
 
 pub struct App {
@@ -61,7 +64,19 @@ impl App {
         let secure = cfg.https.is_some();
         let app = Self::from_parts(cfg, store, vault, directory, target_tls, host_name(), secure);
         app.seed_from_config()?;
+        if app.store.meta_get(META_INSTANCE)?.is_none() {
+            new_instance(&app.store)?;
+        }
         Ok(app)
+    }
+
+    /// This database's instance. Empty if it cannot be read, which no page carries, so a change
+    /// that needs it is refused rather than let through.
+    pub fn instance(&self) -> String {
+        match self.store.meta_get(META_INSTANCE) {
+            Ok(Some(v)) => String::from_utf8_lossy(&v).into_owned(),
+            _ => String::new(),
+        }
     }
 
     /// `new`, for the process that serves. Only it settles what an earlier run left behind:
@@ -187,6 +202,11 @@ impl App {
     pub fn lookup_directory(&self) -> Option<&Directory> {
         self.directory.as_ref().filter(|d| d.has_service_account())
     }
+}
+
+/// Give a database a new instance.
+pub fn new_instance(store: &Store) -> Result<(), crate::store::StoreError> {
+    store.meta_set(META_INSTANCE, crate::auth::random_token()[..32].as_bytes())
 }
 
 /// This machine's name, for export file names and the import confirmation.

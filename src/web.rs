@@ -328,7 +328,9 @@ const GATED_BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// every request behind the import it delays.
 async fn gate_requests(State(app): State<Shared>, req: Request, next: Next) -> Response {
     if route_in(SELF_GATED_ROUTES, req.method(), req.uri().path()) {
-        return next.run(req).await;
+        let mut res = next.run(req).await;
+        stamp_instance(&app, &mut res);
+        return res;
     }
     let (parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, GATED_BODY_LIMIT).await {
@@ -340,7 +342,39 @@ async fn gate_requests(State(app): State<Shared>, req: Request, next: Next) -> R
     };
     let req = Request::from_parts(parts, Body::from(bytes));
     let _shared = app.gate.read().await;
-    next.run(req).await
+    if needs_instance(req.method(), req.uri().path()) {
+        let current = app.instance();
+        let sent = req.headers().get(INSTANCE_HEADER).and_then(|v| v.to_str().ok());
+        if current.is_empty() || sent != Some(current.as_str()) {
+            let mut res = ApiError::conflict(
+                "this proxy's data changed after the page was loaded; reload the page",
+            )
+            .into_response();
+            stamp_instance(&app, &mut res);
+            return res;
+        }
+    }
+    let mut res = next.run(req).await;
+    stamp_instance(&app, &mut res);
+    res
+}
+
+/// Carried by every response, and by every change a page sends.
+pub const INSTANCE_HEADER: &str = "x-data-instance";
+
+/// Changes name rows by id, and ids are only meaningful in the database the page loaded them
+/// from. Sign-out names nothing, and the migration routes are what change the database.
+fn needs_instance(method: &Method, path: &str) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        && path.starts_with("/api/")
+        && path != "/api/logout"
+        && !path.starts_with("/api/admin/migration/")
+}
+
+fn stamp_instance(app: &App, res: &mut Response) {
+    if let Ok(v) = HeaderValue::from_str(&app.instance()) {
+        res.headers_mut().insert(INSTANCE_HEADER, v);
+    }
 }
 
 /// How long a request, body included, may take. Migration requests carry or build the whole
@@ -581,25 +615,45 @@ fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult
     // A username reused by a different account never inherits the old one's list or credentials.
     if let Some(bound) = &user.sid {
         if *bound != account.sid {
-            app.store.user_flag_mismatch(user.id)?;
-            app.store.audit(
-                &account.username,
-                "signin.refused",
-                &format!("account SID {} does not match the registered {bound}", account.sid),
-            );
-            return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "this account does not match the one registered here; an administrator must confirm it",
-            ));
+            return Err(sid_mismatch(app, &user, account, bound)?);
         }
     }
+    // The binding is written only if the row is still unbound or bound to this SID, so a second
+    // sign-in that read the row unbound cannot share it with the account that bound it first.
     if !app
         .store
         .user_record_login(user.id, user.incarnation, &account.sid, account.display_name.as_deref())?
     {
-        return Err(refused(app, &account.username, CHANGED));
+        let now_bound = app
+            .store
+            .user_by_id(user.id)?
+            .filter(|u| u.incarnation == user.incarnation)
+            .and_then(|u| u.sid);
+        return Err(match now_bound {
+            Some(bound) if bound != account.sid => sid_mismatch(app, &user, account, &bound)?,
+            _ => refused(app, &account.username, CHANGED),
+        });
     }
     Ok(user)
+}
+
+/// The account signing in is not the one this row is bound to. Flagged for an administrator.
+fn sid_mismatch(
+    app: &App,
+    user: &User,
+    account: &crate::directory::Account,
+    bound: &str,
+) -> ApiResult<ApiError> {
+    app.store.user_flag_mismatch(user.id)?;
+    app.store.audit(
+        &account.username,
+        "signin.refused",
+        &format!("account SID {} does not match the registered {bound}", account.sid),
+    );
+    Ok(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "this account does not match the one registered here; an administrator must confirm it",
+    ))
 }
 
 async fn logout(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Response> {
@@ -905,7 +959,9 @@ pub mod tests {
         let vault = Vault::load(&store, Box::new(KeyFile::from_key(key))).unwrap();
         let directory = cfg.directory.as_ref().map(Directory::unconnected);
         let target_tls = crate::proxy::tls_setup(&cfg.tls).unwrap();
-        Arc::new(App::from_parts(cfg, store, vault, directory, target_tls, host.into(), false))
+        let app = App::from_parts(cfg, store, vault, directory, target_tls, host.into(), false);
+        crate::app::new_instance(&app.store).unwrap();
+        Arc::new(app)
     }
 
     /// Sign a user in directly, returning the cookie header value.
@@ -928,11 +984,13 @@ pub mod tests {
         cookie: Option<&str>,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, serde_json::Value) {
+        // As a page loaded from the database as it is now.
         let mut b = Request::builder()
             .method(method)
             .uri(path)
             .header(header::HOST, "proxy.test")
-            .header(header::ORIGIN, "https://proxy.test");
+            .header(header::ORIGIN, "https://proxy.test")
+            .header(INSTANCE_HEADER, app.instance());
         if let Some(c) = cookie {
             b = b.header(header::COOKIE, c);
         }
@@ -1237,6 +1295,43 @@ pub mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(app.throttle.failures("devtest"), 1, "a failure abandoned mid-hash was not counted");
+    }
+
+    /// A change naming rows by id is refused unless it comes from a page loaded from the database as
+    /// it is now: after an import, a page loaded before it cannot act on rows that took old ids.
+    #[tokio::test]
+    async fn a_change_from_a_page_loaded_before_an_import_is_refused() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        let jdoe = app.store.user_create("jdoe", None).unwrap();
+        let stale = app.instance();
+        crate::app::new_instance(&app.store).unwrap();
+        let patch = |instance: Option<String>| {
+            let mut b = Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/admin/users/{jdoe}"))
+                .header(header::HOST, "proxy.test")
+                .header(header::ORIGIN, "https://proxy.test")
+                .header(header::COOKIE, cookie.clone())
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(i) = instance {
+                b = b.header(INSTANCE_HEADER, i);
+            }
+            b.body(Body::from(json!({"is_admin": true}).to_string())).unwrap()
+        };
+        for sent in [Some(stale), None] {
+            let res = router(Arc::clone(&app)).oneshot(patch(sent.clone())).await.unwrap();
+            assert_eq!(res.status(), StatusCode::CONFLICT, "sent {sent:?}");
+            assert_eq!(
+                res.headers().get(INSTANCE_HEADER).and_then(|v| v.to_str().ok()),
+                Some(app.instance().as_str()),
+                "the refusal did not tell the page the current instance"
+            );
+            assert!(!app.store.user_by_id(jdoe).unwrap().unwrap().is_admin, "a stale change landed");
+        }
+        let res = router(Arc::clone(&app)).oneshot(patch(Some(app.instance()))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(app.store.user_by_id(jdoe).unwrap().unwrap().is_admin);
     }
 
     /// After five failures a local account is refused without its password being checked, even the

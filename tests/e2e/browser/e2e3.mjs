@@ -48,17 +48,27 @@ try {
   check('a frozen host refuses admin edits', (await status(old.page)).includes('frozen'), await status(old.page));
   const frozenSave = await newPage(browser, { storageState: '/work/jdoe-old.json' });
   await frozenSave.page.goto(P1 + '/');
-  const saveStatus = await frozenSave.page.evaluate(async () => {
-    const list = await (await fetch('/api/me/servers')).json();
+  const saved = await frozenSave.page.evaluate(async () => {
+    const res = await fetch('/api/me/servers');
+    const instance = res.headers.get('X-Data-Instance');
+    const list = await res.json();
     const id = list.groups[0].servers[0].id;
     const r = await fetch('/api/credentials/' + id, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Data-Instance': instance },
       body: JSON.stringify({ username: 'x', password: 'y' }),
     });
-    return r.status;
+    return { status: r.status, error: (await r.json()).error };
   });
-  check('a frozen host refuses credential saves', saveStatus === 409, String(saveStatus));
+  check('a frozen host refuses credential saves', saved.status === 409 && saved.error.includes('migrated'),
+    JSON.stringify(saved));
   await frozenSave.ctx.close();
+
+  // An admin page on the new host, loaded before the import.
+  const stale = await newPage(browser);
+  await signIn(stale.page, P2, 'boss', env.USER_PASS);
+  await stale.page.goto(P2 + '/admin');
+  await stale.page.waitForSelector('#tabs:not([hidden])');
+  await stale.page.evaluate(() => { window.loadedBeforeImport = true; });
 
   // Import on the new host.
   const neu = await newPage(browser);
@@ -82,6 +92,14 @@ try {
     || location.pathname === '/', null, { timeout: 30000 });
   check('the import completes', true);
   await neu.ctx.close();
+
+  // The page loaded before the import reloads on its next request, instead of acting on ids that
+  // may now name other rows.
+  await stale.page.click('nav.tabs button[data-tab="groups"]');
+  const reloaded = await stale.page.waitForFunction(() => !window.loadedBeforeImport, null, { timeout: 10000 })
+    .then(() => true, () => false);
+  check('a page loaded before an import reloads instead of acting on old ids', reloaded);
+  await stale.ctx.close();
 
   // jdoe, with the cookie from the OLD host, on the NEW host: still signed in, credential intact.
   const moved = await newPage(browser, { storageState: '/work/jdoe-old.json' });
