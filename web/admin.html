@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<!-- No inline <style>, <script>, style attributes or event handlers: the CSP forbids them. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>web-access admin</title>
+<link rel="stylesheet" href="./app.css">
+</head>
+<body class="admin">
+<header>
+  <h1>web-access admin</h1>
+  <span id="who"></span>
+  <a class="navlink" href="./">My servers</a>
+  <span id="status">loading</span>
+</header>
+<main>
+  <p id="denied" class="empty" hidden>This page is for administrators. <a class="navlink" href="./">Back to your servers</a></p>
+  <div id="banner" class="banner" hidden></div>
+  <nav class="tabs" id="tabs" hidden>
+    <button data-tab="users" class="active">Users</button>
+    <button data-tab="servers">Servers</button>
+    <button data-tab="groups">Groups</button>
+    <button data-tab="activity">Activity</button>
+    <button data-tab="migration">Migration</button>
+  </nav>
+
+  <section id="tab-users" hidden>
+    <div class="split">
+      <div class="card">
+        <h2>Users</h2>
+        <form id="add-user" class="form-row">
+          <label>Add by network username<input id="new-username" placeholder="jdoe or DOMAIN\jdoe" autocomplete="off" spellcheck="false" required></label>
+          <button type="submit" class="primary">Add</button>
+        </form>
+        <input id="user-filter" type="search" placeholder="Filter users" autocomplete="off">
+        <table class="grid" id="user-table">
+          <thead><tr><th>Username</th><th>Name</th><th>Servers</th><th>Last sign-in</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card" id="user-detail" hidden>
+        <h2 id="ud-title"></h2>
+        <dl class="kv" id="ud-facts"></dl>
+        <div class="form-row">
+          <label class="check"><input type="checkbox" id="ud-admin"><span>Administrator</span></label>
+          <button id="ud-reset" class="ghost" hidden>Reset account binding</button>
+          <button id="ud-remove" class="danger">Remove user</button>
+        </div>
+        <h3>Servers</h3>
+        <div class="form-row">
+          <label>Copy servers from<select id="ud-copy-from"></select></label>
+          <button id="ud-copy" class="ghost">Add their servers</button>
+        </div>
+        <div class="toolbar">
+          <input id="ud-filter" type="search" placeholder="Filter servers" autocomplete="off">
+          <button id="ud-save" class="primary">Save</button>
+        </div>
+        <p class="note" id="ud-changes"></p>
+        <div id="ud-checklist" class="checklist"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-servers" hidden>
+    <div class="split">
+      <div class="card">
+        <h2 id="server-form-title">Add a server</h2>
+        <form id="server-form" class="stack">
+          <label>Name<input id="sf-name" required autocomplete="off"></label>
+          <label>Host name or address<input id="sf-host" required autocomplete="off" spellcheck="false"></label>
+          <div class="form-row">
+            <label class="narrow">Port<input id="sf-port" type="number" min="1" max="65535" value="3389"></label>
+            <label>Group<select id="sf-group"></select></label>
+          </div>
+          <div class="form-row">
+            <button type="submit" class="primary" id="sf-go">Add server</button>
+            <button type="button" class="ghost" id="sf-cancel" hidden>Cancel edit</button>
+          </div>
+        </form>
+        <h3>Import from CSV</h3>
+        <p class="note">One server per line: <code>name,host,port,group</code>. Port and group are optional. A server whose name already exists is updated. Nothing is imported unless every line is valid.</p>
+        <div class="stack">
+          <input id="csv-file" type="file" accept=".csv,text/csv,text/plain">
+          <textarea id="csv-text" rows="6" spellcheck="false" placeholder="hist-01,hist-01.plant.example,3389,Historians"></textarea>
+          <div class="form-row"><button id="csv-go" class="primary">Import</button></div>
+          <ul id="csv-errors" class="errors" hidden></ul>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Servers</h2>
+        <input id="server-filter" type="search" placeholder="Filter servers" autocomplete="off">
+        <table class="grid" id="server-table">
+          <thead><tr><th>Name</th><th>Host</th><th>Port</th><th>Group</th><th>Users</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-groups" hidden>
+    <div class="card">
+      <h2>Groups</h2>
+      <p class="note">Groups organise each user's server list. The order here is the order users see.</p>
+      <form id="add-group" class="form-row">
+        <label>New group<input id="new-group" required autocomplete="off"></label>
+        <button type="submit" class="primary">Add</button>
+      </form>
+      <table class="grid" id="group-table">
+        <thead><tr><th>Name</th><th>Servers</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-activity" hidden>
+    <div class="card">
+      <h2>Activity</h2>
+      <table class="grid" id="audit-table">
+        <thead><tr><th>Time</th><th>Who</th><th>What</th><th>Detail</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="form-row"><button id="audit-more" class="ghost">Load older</button></div>
+    </div>
+  </section>
+
+  <section id="tab-migration" hidden>
+    <div class="split">
+      <div class="stack">
+        <div class="card">
+          <h2>This proxy</h2>
+          <dl class="kv" id="mig-facts"></dl>
+        </div>
+        <div class="card" id="unlock-card" hidden>
+          <h2>Unlock the credential store</h2>
+          <p class="note">This database was moved here from another host. Enter the recovery passphrase to make saved credentials usable on this host.</p>
+          <form id="unlock-form" class="form-row">
+            <label>Recovery passphrase<input id="unlock-pass" type="password" autocomplete="off" required></label>
+            <button type="submit" class="primary">Unlock</button>
+          </form>
+        </div>
+        <div class="card">
+          <h2 id="recovery-title">Recovery passphrase</h2>
+          <p class="note">Encrypts exports and lets saved credentials move to a new host. Keep it with the proxy's documentation: without it an export cannot be imported. At least 12 characters.</p>
+          <form id="recovery-form" class="stack">
+            <label id="rec-current-label">Current passphrase<input id="rec-current" type="password" autocomplete="off"></label>
+            <label>New passphrase<input id="rec-new" type="password" autocomplete="new-password" required minlength="12"></label>
+            <label>Repeat it<input id="rec-repeat" type="password" autocomplete="new-password" required minlength="12"></label>
+            <div class="form-row"><button type="submit" class="primary" id="rec-go">Set passphrase</button></div>
+          </form>
+        </div>
+        <div class="card" id="directory-card" hidden>
+          <h2>Directory service account</h2>
+          <p class="note" id="directory-note"></p>
+          <form id="directory-form" class="form-row">
+            <label>Password<input id="dir-pass" type="password" autocomplete="off" required></label>
+            <button type="submit" class="primary">Save</button>
+          </form>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="card">
+          <h2>Export</h2>
+          <p class="note">Downloads a zip of every user, server, assignment, saved credential and sign-in session, encrypted with the recovery passphrase.</p>
+          <form id="export-form" class="stack">
+            <label>Recovery passphrase<input id="exp-pass" type="password" autocomplete="off" required></label>
+            <label class="check"><input type="checkbox" id="exp-freeze"><span>Freeze this proxy after exporting (for a cutover)</span></label>
+            <p class="note">Frozen, the proxy keeps signing users in and carrying sessions, but refuses new saved credentials and admin changes, so nothing made after the export is lost.</p>
+            <div class="form-row">
+              <button type="submit" class="primary" id="exp-go">Export</button>
+              <button type="button" class="ghost" id="unfreeze" hidden>Unfreeze</button>
+            </div>
+          </form>
+        </div>
+        <div class="card">
+          <h2>Import</h2>
+          <p class="note">Replaces this proxy's data with an export. The current database is kept as a backup file in the data directory first.</p>
+          <form id="import-upload" class="stack">
+            <input id="imp-file" type="file" accept=".zip,application/zip" required>
+            <div class="form-row"><button type="submit" class="primary" id="imp-upload-go">Upload</button></div>
+          </form>
+          <form id="import-confirm" class="stack" hidden>
+            <dl class="kv" id="imp-facts"></dl>
+            <label>Recovery passphrase<input id="imp-pass" type="password" autocomplete="off" required></label>
+            <label id="imp-host-label" hidden><span id="imp-host-hint"></span><input id="imp-host" autocomplete="off" spellcheck="false"></label>
+            <div class="form-row">
+              <button type="submit" class="primary" id="imp-go">Import</button>
+              <button type="button" class="ghost" id="imp-cancel">Cancel</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+<script type="module" src="./admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,1138 @@
+//! The database: users, server groups, servers, assignments, saved credentials, sessions, audit.
+//!
+//! One SQLite file under `data_dir`. Access is serialised through a mutex; every query here is small,
+//! and the scale is thousands of rows, not millions.
+
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA_V1: &str = "
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);
+CREATE TABLE users (
+    id           INTEGER PRIMARY KEY,
+    username     TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    sid          TEXT,
+    is_admin     INTEGER NOT NULL DEFAULT 0,
+    sid_mismatch INTEGER NOT NULL DEFAULT 0,
+    created      INTEGER NOT NULL,
+    last_login   INTEGER
+);
+CREATE TABLE server_groups (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    sort INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE servers (
+    id       INTEGER PRIMARY KEY,
+    name     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    host     TEXT NOT NULL,
+    port     INTEGER NOT NULL DEFAULT 3389,
+    group_id INTEGER REFERENCES server_groups(id) ON DELETE SET NULL
+);
+CREATE TABLE assignments (
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, server_id)
+) WITHOUT ROWID;
+CREATE TABLE credentials (
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    username  TEXT NOT NULL,
+    domain    TEXT,
+    nonce     BLOB NOT NULL,
+    secret    BLOB NOT NULL,
+    updated   INTEGER NOT NULL,
+    PRIMARY KEY (user_id, server_id)
+) WITHOUT ROWID;
+CREATE TABLE sessions (
+    token_hash BLOB PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created    INTEGER NOT NULL,
+    expires    INTEGER NOT NULL
+);
+CREATE INDEX sessions_user ON sessions(user_id);
+CREATE TABLE session_log (
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    ended     INTEGER NOT NULL,
+    PRIMARY KEY (user_id, server_id)
+) WITHOUT ROWID;
+CREATE TABLE audit (
+    id     INTEGER PRIMARY KEY,
+    at     INTEGER NOT NULL,
+    actor  TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX audit_at ON audit(at);
+";
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("database: {0}")]
+    Sql(#[from] rusqlite::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("the database schema version {found} is newer than this build supports ({supported})")]
+    Newer { found: i64, supported: i64 },
+    #[error("not found")]
+    NotFound,
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub sid: Option<String>,
+    pub is_admin: bool,
+    pub sid_mismatch: bool,
+    pub created: i64,
+    pub last_login: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserRow {
+    pub user: User,
+    pub server_count: i64,
+    pub saved_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub id: i64,
+    pub name: String,
+    pub sort: i64,
+    pub server_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Server {
+    pub id: i64,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub group_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerRow {
+    pub server: Server,
+    pub assigned: i64,
+}
+
+/// A server as it appears in a user's own list.
+#[derive(Debug, Clone)]
+pub struct ListedServer {
+    pub server: Server,
+    pub group_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredCredential {
+    pub username: String,
+    pub domain: Option<String>,
+    pub nonce: Vec<u8>,
+    pub secret: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditRow {
+    pub id: i64,
+    pub at: i64,
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Counts {
+    pub users: i64,
+    pub servers: i64,
+    pub assignments: i64,
+    pub credentials: i64,
+}
+
+/// One row of a server import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRow {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub group: Option<String>,
+}
+
+pub struct Store {
+    path: PathBuf,
+    conn: Mutex<Connection>,
+}
+
+/// Open a database file, apply pragmas, and bring its schema up to date.
+pub fn open_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    configure(&conn)?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+fn configure(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    Ok(())
+}
+
+pub fn schema_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
+/// Forward-only. A database from a newer build is refused rather than guessed at.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    let found = schema_version(conn)?;
+    if found > SCHEMA_VERSION {
+        return Err(StoreError::Newer {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if found < 1 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"))?;
+    }
+    Ok(())
+}
+
+fn user_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
+    Ok(User {
+        id: r.get(0)?,
+        username: r.get(1)?,
+        display_name: r.get(2)?,
+        sid: r.get(3)?,
+        is_admin: r.get::<_, i64>(4)? != 0,
+        sid_mismatch: r.get::<_, i64>(5)? != 0,
+        created: r.get(6)?,
+        last_login: r.get(7)?,
+    })
+}
+
+const USER_COLS: &str = "u.id, u.username, u.display_name, u.sid, u.is_admin, u.sid_mismatch, u.created, u.last_login";
+
+fn server_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Server> {
+    Ok(Server {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        host: r.get(2)?,
+        port: r.get::<_, i64>(3)? as u16,
+        group_id: r.get(4)?,
+    })
+}
+
+const SERVER_COLS: &str = "s.id, s.name, s.host, s.port, s.group_id";
+
+impl Store {
+    pub fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            path: path.to_owned(),
+            conn: Mutex::new(open_connection(path)?),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        configure(&conn)?;
+        migrate(&conn)?;
+        Ok(Self {
+            path: PathBuf::from(":memory:"),
+            conn: Mutex::new(conn),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn c(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    // ---- meta ------------------------------------------------------------------------------
+
+    pub fn meta_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .c()
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn meta_set(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.c().execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn meta_delete(&self, key: &str) -> Result<()> {
+        self.c().execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    pub fn flag(&self, key: &str) -> Result<bool> {
+        Ok(self.meta_get(key)?.is_some_and(|v| v == b"1"))
+    }
+
+    pub fn set_flag(&self, key: &str, on: bool) -> Result<()> {
+        if on {
+            self.meta_set(key, b"1")
+        } else {
+            self.meta_delete(key)
+        }
+    }
+
+    // ---- users -----------------------------------------------------------------------------
+
+    pub fn user_by_id(&self, id: i64) -> Result<Option<User>> {
+        Ok(self
+            .c()
+            .query_row(
+                &format!("SELECT {USER_COLS} FROM users u WHERE u.id = ?1"),
+                [id],
+                user_from,
+            )
+            .optional()?)
+    }
+
+    pub fn user_by_name(&self, username: &str) -> Result<Option<User>> {
+        Ok(self
+            .c()
+            .query_row(
+                &format!("SELECT {USER_COLS} FROM users u WHERE u.username = ?1"),
+                [username],
+                user_from,
+            )
+            .optional()?)
+    }
+
+    pub fn users_list(&self) -> Result<Vec<UserRow>> {
+        let c = self.c();
+        let mut stmt = c.prepare(&format!(
+            "SELECT {USER_COLS},
+                    (SELECT COUNT(*) FROM assignments a WHERE a.user_id = u.id),
+                    (SELECT COUNT(*) FROM credentials k WHERE k.user_id = u.id)
+             FROM users u ORDER BY u.username"
+        ))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(UserRow {
+                    user: user_from(r)?,
+                    server_count: r.get(8)?,
+                    saved_count: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn user_create(&self, username: &str, display_name: Option<&str>) -> Result<i64> {
+        let c = self.c();
+        let exists: bool = c
+            .query_row("SELECT 1 FROM users WHERE username = ?1", [username], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if exists {
+            return Err(StoreError::Conflict(format!("{username} is already a user")));
+        }
+        c.execute(
+            "INSERT INTO users (username, display_name, created) VALUES (?1, ?2, ?3)",
+            params![username, display_name, now()],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    /// Record a successful sign-in, binding the SID if this is the first.
+    pub fn user_record_login(&self, id: i64, sid: &str, display_name: Option<&str>) -> Result<()> {
+        self.c().execute(
+            "UPDATE users SET sid = COALESCE(sid, ?2),
+                              display_name = COALESCE(?3, display_name),
+                              last_login = ?4
+             WHERE id = ?1",
+            params![id, sid, display_name, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn user_flag_mismatch(&self, id: i64) -> Result<()> {
+        self.c()
+            .execute("UPDATE users SET sid_mismatch = 1 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn user_set_admin(&self, id: i64, admin: bool) -> Result<()> {
+        let n = self.c().execute(
+            "UPDATE users SET is_admin = ?2 WHERE id = ?1",
+            params![id, admin as i64],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Unbind the SID so the next sign-in binds afresh. Saved credentials are bound to the old SID
+    /// and could not be opened by the new one, so they go too.
+    pub fn user_clear_sid(&self, id: i64) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let n = tx.execute(
+            "UPDATE users SET sid = NULL, sid_mismatch = 0 WHERE id = ?1",
+            [id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        tx.execute("DELETE FROM credentials WHERE user_id = ?1", [id])?;
+        tx.execute("DELETE FROM sessions WHERE user_id = ?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn user_delete(&self, id: i64) -> Result<()> {
+        let n = self.c().execute("DELETE FROM users WHERE id = ?1", [id])?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Users holding at least one unexpired session: the set the revocation sweep checks.
+    pub fn users_with_sessions(&self, at: i64) -> Result<Vec<User>> {
+        let c = self.c();
+        let mut stmt = c.prepare(&format!(
+            "SELECT {USER_COLS} FROM users u
+             WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.expires > ?1)"
+        ))?;
+        let rows = stmt
+            .query_map([at], user_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ---- groups ----------------------------------------------------------------------------
+
+    pub fn groups_list(&self) -> Result<Vec<Group>> {
+        let c = self.c();
+        let mut stmt = c.prepare(
+            "SELECT g.id, g.name, g.sort,
+                    (SELECT COUNT(*) FROM servers s WHERE s.group_id = g.id)
+             FROM server_groups g ORDER BY g.sort, g.name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Group {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    sort: r.get(2)?,
+                    server_count: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn group_create(&self, name: &str) -> Result<i64> {
+        let c = self.c();
+        group_insert(&c, name)
+    }
+
+    pub fn group_rename(&self, id: i64, name: &str) -> Result<()> {
+        let c = self.c();
+        let taken: Option<i64> = c
+            .query_row(
+                "SELECT id FROM server_groups WHERE name = ?1 AND id <> ?2",
+                params![name, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Err(StoreError::Conflict(format!("a group named {name} exists")));
+        }
+        let n = c.execute(
+            "UPDATE server_groups SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Set the display order to the order of `ids`.
+    pub fn group_order(&self, ids: &[i64]) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE server_groups SET sort = ?2 WHERE id = ?1",
+                params![id, i as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn group_delete(&self, id: i64) -> Result<()> {
+        let c = self.c();
+        let used: i64 = c.query_row(
+            "SELECT COUNT(*) FROM servers WHERE group_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if used > 0 {
+            return Err(StoreError::Conflict(format!(
+                "the group still holds {used} server(s)"
+            )));
+        }
+        let n = c.execute("DELETE FROM server_groups WHERE id = ?1", [id])?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    // ---- servers ---------------------------------------------------------------------------
+
+    pub fn servers_list(&self) -> Result<Vec<ServerRow>> {
+        let c = self.c();
+        let mut stmt = c.prepare(&format!(
+            "SELECT {SERVER_COLS}, (SELECT COUNT(*) FROM assignments a WHERE a.server_id = s.id)
+             FROM servers s ORDER BY s.name"
+        ))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ServerRow {
+                    server: server_from(r)?,
+                    assigned: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn server_by_id(&self, id: i64) -> Result<Option<Server>> {
+        Ok(self
+            .c()
+            .query_row(
+                &format!("SELECT {SERVER_COLS} FROM servers s WHERE s.id = ?1"),
+                [id],
+                server_from,
+            )
+            .optional()?)
+    }
+
+    pub fn server_create(
+        &self,
+        name: &str,
+        host: &str,
+        port: u16,
+        group_id: Option<i64>,
+    ) -> Result<i64> {
+        let c = self.c();
+        name_free(&c, name, None)?;
+        group_exists(&c, group_id)?;
+        c.execute(
+            "INSERT INTO servers (name, host, port, group_id) VALUES (?1, ?2, ?3, ?4)",
+            params![name, host, port as i64, group_id],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn server_update(
+        &self,
+        id: i64,
+        name: &str,
+        host: &str,
+        port: u16,
+        group_id: Option<i64>,
+    ) -> Result<()> {
+        let c = self.c();
+        name_free(&c, name, Some(id))?;
+        group_exists(&c, group_id)?;
+        let n = c.execute(
+            "UPDATE servers SET name = ?2, host = ?3, port = ?4, group_id = ?5 WHERE id = ?1",
+            params![id, name, host, port as i64, group_id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn server_delete(&self, id: i64) -> Result<()> {
+        let n = self.c().execute("DELETE FROM servers WHERE id = ?1", [id])?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Create or update servers by name, creating named groups as needed. All or nothing.
+    pub fn servers_import(&self, rows: &[ImportRow]) -> Result<(usize, usize)> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let (mut created, mut updated) = (0, 0);
+        for row in rows {
+            let group_id = match &row.group {
+                None => None,
+                Some(name) => {
+                    let found: Option<i64> = tx
+                        .query_row(
+                            "SELECT id FROM server_groups WHERE name = ?1",
+                            [name],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    Some(match found {
+                        Some(id) => id,
+                        None => group_insert(&tx, name)?,
+                    })
+                }
+            };
+            let existing: Option<i64> = tx
+                .query_row("SELECT id FROM servers WHERE name = ?1", [&row.name], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            match existing {
+                Some(id) => {
+                    tx.execute(
+                        "UPDATE servers SET host = ?2, port = ?3, group_id = ?4 WHERE id = ?1",
+                        params![id, row.host, row.port as i64, group_id],
+                    )?;
+                    updated += 1;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO servers (name, host, port, group_id) VALUES (?1, ?2, ?3, ?4)",
+                        params![row.name, row.host, row.port as i64, group_id],
+                    )?;
+                    created += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((created, updated))
+    }
+
+    pub fn servers_empty(&self) -> Result<bool> {
+        let n: i64 = self
+            .c()
+            .query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0))?;
+        Ok(n == 0)
+    }
+
+    // ---- assignments -----------------------------------------------------------------------
+
+    /// THE AUTHORIZATION PREDICATE. `assigned_servers` applies the same condition as a join.
+    pub fn is_assigned(&self, user_id: i64, server_id: i64) -> Result<bool> {
+        Ok(self
+            .c()
+            .query_row(
+                "SELECT 1 FROM assignments WHERE user_id = ?1 AND server_id = ?2",
+                params![user_id, server_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn assigned_servers(&self, user_id: i64) -> Result<Vec<ListedServer>> {
+        let c = self.c();
+        // Ungrouped servers sort after every group.
+        let mut stmt = c.prepare(&format!(
+            "SELECT {SERVER_COLS}, g.name
+             FROM assignments a
+             JOIN servers s ON s.id = a.server_id
+             LEFT JOIN server_groups g ON g.id = s.group_id
+             WHERE a.user_id = ?1
+             ORDER BY COALESCE(g.sort, 1000000000), g.name, s.name COLLATE NOCASE"
+        ))?;
+        let rows = stmt
+            .query_map([user_id], |r| {
+                Ok(ListedServer {
+                    server: server_from(r)?,
+                    group_name: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn assignment_ids(&self, user_id: i64) -> Result<Vec<i64>> {
+        let c = self.c();
+        let mut stmt =
+            c.prepare("SELECT server_id FROM assignments WHERE user_id = ?1 ORDER BY server_id")?;
+        let rows = stmt
+            .query_map([user_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace a user's assignments with exactly `ids`. Returns (added, removed).
+    pub fn set_assignments(&self, user_id: i64, ids: &[i64]) -> Result<(usize, usize)> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let user_exists = tx
+            .query_row("SELECT 1 FROM users WHERE id = ?1", [user_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !user_exists {
+            return Err(StoreError::NotFound);
+        }
+        let wanted: HashSet<i64> = ids.iter().copied().collect();
+        for id in &wanted {
+            let ok = tx
+                .query_row("SELECT 1 FROM servers WHERE id = ?1", [id], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !ok {
+                return Err(StoreError::Invalid(format!("no server with id {id}")));
+            }
+        }
+        let current: HashSet<i64> = {
+            let mut stmt = tx.prepare("SELECT server_id FROM assignments WHERE user_id = ?1")?;
+            let v = stmt
+                .query_map([user_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<HashSet<i64>>>()?;
+            v
+        };
+        let mut added = 0;
+        for id in wanted.difference(&current) {
+            tx.execute(
+                "INSERT INTO assignments (user_id, server_id) VALUES (?1, ?2)",
+                params![user_id, id],
+            )?;
+            added += 1;
+        }
+        let mut removed = 0;
+        for id in current.difference(&wanted) {
+            tx.execute(
+                "DELETE FROM assignments WHERE user_id = ?1 AND server_id = ?2",
+                params![user_id, id],
+            )?;
+            // A credential for a server the user can no longer reach has no purpose.
+            tx.execute(
+                "DELETE FROM credentials WHERE user_id = ?1 AND server_id = ?2",
+                params![user_id, id],
+            )?;
+            removed += 1;
+        }
+        tx.commit()?;
+        Ok((added, removed))
+    }
+
+    /// Add every assignment `from` holds to `to`. Returns how many were new.
+    pub fn copy_assignments(&self, from: i64, to: i64) -> Result<usize> {
+        let c = self.c();
+        let n = c.execute(
+            "INSERT OR IGNORE INTO assignments (user_id, server_id)
+             SELECT ?2, server_id FROM assignments WHERE user_id = ?1",
+            params![from, to],
+        )?;
+        Ok(n)
+    }
+
+    // ---- credentials -----------------------------------------------------------------------
+
+    pub fn credential_get(&self, user_id: i64, server_id: i64) -> Result<Option<StoredCredential>> {
+        Ok(self
+            .c()
+            .query_row(
+                "SELECT username, domain, nonce, secret FROM credentials
+                 WHERE user_id = ?1 AND server_id = ?2",
+                params![user_id, server_id],
+                |r| {
+                    Ok(StoredCredential {
+                        username: r.get(0)?,
+                        domain: r.get(1)?,
+                        nonce: r.get(2)?,
+                        secret: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn credential_put(&self, user_id: i64, server_id: i64, cred: &StoredCredential) -> Result<()> {
+        self.c().execute(
+            "INSERT INTO credentials (user_id, server_id, username, domain, nonce, secret, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(user_id, server_id) DO UPDATE SET
+                username = excluded.username, domain = excluded.domain,
+                nonce = excluded.nonce, secret = excluded.secret, updated = excluded.updated",
+            params![
+                user_id,
+                server_id,
+                cred.username,
+                cred.domain,
+                cred.nonce,
+                cred.secret,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn credential_delete(&self, user_id: i64, server_id: i64) -> Result<bool> {
+        Ok(self.c().execute(
+            "DELETE FROM credentials WHERE user_id = ?1 AND server_id = ?2",
+            params![user_id, server_id],
+        )? > 0)
+    }
+
+    pub fn saved_server_ids(&self, user_id: i64) -> Result<HashSet<i64>> {
+        let c = self.c();
+        let mut stmt = c.prepare("SELECT server_id FROM credentials WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map([user_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<HashSet<i64>>>()?;
+        Ok(rows)
+    }
+
+    // ---- sessions --------------------------------------------------------------------------
+
+    pub fn session_create(&self, token_hash: &[u8], user_id: i64, expires: i64) -> Result<()> {
+        self.c().execute(
+            "INSERT INTO sessions (token_hash, user_id, created, expires) VALUES (?1, ?2, ?3, ?4)",
+            params![token_hash, user_id, now(), expires],
+        )?;
+        Ok(())
+    }
+
+    /// The user behind an unexpired session.
+    pub fn session_user(&self, token_hash: &[u8], at: i64) -> Result<Option<User>> {
+        Ok(self
+            .c()
+            .query_row(
+                &format!(
+                    "SELECT {USER_COLS} FROM sessions s JOIN users u ON u.id = s.user_id
+                     WHERE s.token_hash = ?1 AND s.expires > ?2"
+                ),
+                params![token_hash, at],
+                user_from,
+            )
+            .optional()?)
+    }
+
+    pub fn session_delete(&self, token_hash: &[u8]) -> Result<()> {
+        self.c()
+            .execute("DELETE FROM sessions WHERE token_hash = ?1", [token_hash])?;
+        Ok(())
+    }
+
+    pub fn sessions_delete_user(&self, user_id: i64) -> Result<usize> {
+        Ok(self
+            .c()
+            .execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?)
+    }
+
+    pub fn sessions_purge(&self, at: i64) -> Result<usize> {
+        Ok(self
+            .c()
+            .execute("DELETE FROM sessions WHERE expires <= ?1", [at])?)
+    }
+
+    // ---- session log -----------------------------------------------------------------------
+
+    pub fn session_ended(&self, user_id: i64, server_id: i64, at: i64) -> Result<()> {
+        self.c().execute(
+            "INSERT INTO session_log (user_id, server_id, ended) VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id, server_id) DO UPDATE SET ended = excluded.ended",
+            params![user_id, server_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Server id -> when this user's last session to it ended, for ends after `since`.
+    pub fn recent_ends(&self, user_id: i64, since: i64) -> Result<HashMap<i64, i64>> {
+        let c = self.c();
+        let mut stmt = c.prepare(
+            "SELECT server_id, ended FROM session_log WHERE user_id = ?1 AND ended > ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, since], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<HashMap<i64, i64>>>()?;
+        Ok(rows)
+    }
+
+    // ---- audit -----------------------------------------------------------------------------
+
+    /// Best effort: an audit write that fails is logged, never allowed to fail the action.
+    pub fn audit(&self, actor: &str, action: &str, detail: &str) {
+        if let Err(e) = self.c().execute(
+            "INSERT INTO audit (at, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![now(), actor, action, detail],
+        ) {
+            tracing::warn!(error = %e, %actor, %action, "audit write failed");
+        }
+    }
+
+    pub fn audit_list(&self, limit: i64, before: Option<i64>) -> Result<Vec<AuditRow>> {
+        let c = self.c();
+        let mut stmt = c.prepare(
+            "SELECT id, at, actor, action, detail FROM audit
+             WHERE (?2 IS NULL OR id < ?2) ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit, before], |r| {
+                Ok(AuditRow {
+                    id: r.get(0)?,
+                    at: r.get(1)?,
+                    actor: r.get(2)?,
+                    action: r.get(3)?,
+                    detail: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ---- whole-database operations ---------------------------------------------------------
+
+    pub fn counts(&self) -> Result<Counts> {
+        let c = self.c();
+        counts_of(&c)
+    }
+
+    /// SQLite's own consistency check. Err carries its first complaint.
+    pub fn integrity(&self) -> std::result::Result<(), String> {
+        let c = self.c();
+        let verdict: rusqlite::Result<String> =
+            c.query_row("PRAGMA integrity_check", [], |r| r.get(0));
+        match verdict {
+            Ok(v) if v == "ok" => Ok(()),
+            Ok(v) => Err(v),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// A consistent copy of the whole database, written to `dest`, which must not exist.
+    pub fn snapshot_to(&self, dest: &Path) -> Result<Counts> {
+        let c = self.c();
+        let counts = counts_of(&c)?;
+        c.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+        Ok(counts)
+    }
+
+    /// Replace the database file with `new_file`, which has already been validated. The current
+    /// file is renamed over; the caller keeps its own backup first.
+    pub fn replace_with(&self, new_file: &Path) -> Result<()> {
+        let mut c = self.c();
+        // Release the file before renaming over it: Windows refuses to replace an open file.
+        let placeholder = Connection::open_in_memory()?;
+        let old = std::mem::replace(&mut *c, placeholder);
+        drop(old);
+        let installed = std::fs::rename(new_file, &self.path);
+        // Reopen whichever file is now in place, so a failed rename leaves the old data serving.
+        *c = open_connection(&self.path)?;
+        installed?;
+        Ok(())
+    }
+}
+
+fn counts_of(c: &Connection) -> Result<Counts> {
+    let one = |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [], |r| r.get(0))?) };
+    Ok(Counts {
+        users: one("SELECT COUNT(*) FROM users")?,
+        servers: one("SELECT COUNT(*) FROM servers")?,
+        assignments: one("SELECT COUNT(*) FROM assignments")?,
+        credentials: one("SELECT COUNT(*) FROM credentials")?,
+    })
+}
+
+fn group_insert(c: &Connection, name: &str) -> Result<i64> {
+    let exists = c
+        .query_row("SELECT 1 FROM server_groups WHERE name = ?1", [name], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if exists {
+        return Err(StoreError::Conflict(format!("a group named {name} exists")));
+    }
+    let next: i64 = c.query_row(
+        "SELECT COALESCE(MAX(sort), -1) + 1 FROM server_groups",
+        [],
+        |r| r.get(0),
+    )?;
+    c.execute(
+        "INSERT INTO server_groups (name, sort) VALUES (?1, ?2)",
+        params![name, next],
+    )?;
+    Ok(c.last_insert_rowid())
+}
+
+fn name_free(c: &Connection, name: &str, except: Option<i64>) -> Result<()> {
+    let taken: Option<i64> = c
+        .query_row(
+            "SELECT id FROM servers WHERE name = ?1 AND (?2 IS NULL OR id <> ?2)",
+            params![name, except],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if taken.is_some() {
+        return Err(StoreError::Conflict(format!("a server named {name} exists")));
+    }
+    Ok(())
+}
+
+fn group_exists(c: &Connection, group_id: Option<i64>) -> Result<()> {
+    if let Some(id) = group_id {
+        let ok = c
+            .query_row("SELECT 1 FROM server_groups WHERE id = ?1", [id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !ok {
+            return Err(StoreError::Invalid(format!("no group with id {id}")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn assignment_replacement_reports_what_changed() {
+        let s = store();
+        let u = s.user_create("jdoe", None).unwrap();
+        let a = s.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let b = s.server_create("eng-02", "eng-02.example", 3389, None).unwrap();
+        assert_eq!(s.set_assignments(u, &[a, b]).unwrap(), (2, 0));
+        assert_eq!(s.set_assignments(u, &[b]).unwrap(), (0, 1));
+        assert_eq!(s.assignment_ids(u).unwrap(), vec![b]);
+        assert!(matches!(
+            s.set_assignments(u, &[b, 999]),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(s.assignment_ids(u).unwrap(), vec![b], "a refused set changes nothing");
+    }
+
+    #[test]
+    fn removing_an_assignment_removes_its_saved_credential() {
+        let s = store();
+        let u = s.user_create("jdoe", None).unwrap();
+        let a = s.server_create("hist-01", "h", 3389, None).unwrap();
+        s.set_assignments(u, &[a]).unwrap();
+        let cred = StoredCredential {
+            username: "x".into(),
+            domain: None,
+            nonce: vec![0; 12],
+            secret: vec![1; 20],
+        };
+        s.credential_put(u, a, &cred).unwrap();
+        s.set_assignments(u, &[]).unwrap();
+        assert!(s.credential_get(u, a).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_group_with_servers_cannot_be_deleted() {
+        let s = store();
+        let g = s.group_create("Historians").unwrap();
+        let sv = s.server_create("hist-01", "h", 3389, Some(g)).unwrap();
+        assert!(matches!(s.group_delete(g), Err(StoreError::Conflict(_))));
+        s.server_delete(sv).unwrap();
+        s.group_delete(g).unwrap();
+    }
+
+    #[test]
+    fn server_names_are_unique_regardless_of_case() {
+        let s = store();
+        s.server_create("Hist-01", "h", 3389, None).unwrap();
+        assert!(matches!(
+            s.server_create("hist-01", "h2", 3389, None),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn import_creates_groups_and_updates_by_name() {
+        let s = store();
+        let rows = vec![
+            ImportRow { name: "a".into(), host: "a.example".into(), port: 3389, group: Some("G1".into()) },
+            ImportRow { name: "b".into(), host: "b.example".into(), port: 3390, group: None },
+        ];
+        assert_eq!(s.servers_import(&rows).unwrap(), (2, 0));
+        let again = vec![ImportRow { name: "A".into(), host: "a2.example".into(), port: 3389, group: Some("g1".into()) }];
+        assert_eq!(s.servers_import(&again).unwrap(), (0, 1));
+        assert_eq!(s.groups_list().unwrap().len(), 1);
+        let a = s.servers_list().unwrap().into_iter().find(|r| r.server.name == "a").unwrap();
+        assert_eq!(a.server.host, "a2.example");
+    }
+
+    #[test]
+    fn a_session_is_refused_at_expiry() {
+        let s = store();
+        let u = s.user_create("jdoe", None).unwrap();
+        s.session_create(b"hash", u, 1000).unwrap();
+        assert!(s.session_user(b"hash", 999).unwrap().is_some());
+        assert!(s.session_user(b"hash", 1000).unwrap().is_none());
+    }
+
+    #[test]
+    fn clearing_the_sid_drops_credentials_and_sessions() {
+        let s = store();
+        let u = s.user_create("jdoe", None).unwrap();
+        let a = s.server_create("hist-01", "h", 3389, None).unwrap();
+        s.user_record_login(u, "S-1-5-21-1", None).unwrap();
+        s.credential_put(u, a, &StoredCredential { username: "x".into(), domain: None, nonce: vec![0; 12], secret: vec![1] }).unwrap();
+        s.session_create(b"h", u, now() + 100).unwrap();
+        s.user_clear_sid(u).unwrap();
+        let user = s.user_by_id(u).unwrap().unwrap();
+        assert!(user.sid.is_none());
+        assert!(s.credential_get(u, a).unwrap().is_none());
+        assert!(s.session_user(b"h", now()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_first_login_binds_the_sid_and_later_ones_do_not_change_it() {
+        let s = store();
+        let u = s.user_create("jdoe", None).unwrap();
+        s.user_record_login(u, "S-1-5-21-1", Some("J Doe")).unwrap();
+        s.user_record_login(u, "S-1-5-21-2", None).unwrap();
+        let user = s.user_by_id(u).unwrap().unwrap();
+        assert_eq!(user.sid.as_deref(), Some("S-1-5-21-1"));
+        assert_eq!(user.display_name.as_deref(), Some("J Doe"));
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        assert!(matches!(migrate(&conn), Err(StoreError::Newer { .. })));
+    }
+}

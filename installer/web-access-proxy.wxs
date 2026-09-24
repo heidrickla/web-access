@@ -6,15 +6,14 @@
   organisation already deploys things: GPO, SCCM or Intune, with a real uninstall and a real
   upgrade path. A script that copies files and calls sc.exe is not that.
 
-  Build:  wix extension add -g WixToolset.Firewall.wixext
-          wix build installer/web-access-proxy.wxs -ext WixToolset.Firewall.wixext -o web-access-proxy.msi
+  Build:  installer/build.ps1
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
 
   <Package Name="web-access proxy"
            Manufacturer="Lewis Heidrick"
-           Version="0.1.0"
+           Version="0.2.0"
            UpgradeCode="7c4a1c6e-2f5b-4d8a-9e13-5b0a2d6f8c41"
            Scope="perMachine"
            Compressed="yes">
@@ -35,13 +34,13 @@
       <Component Id="ProxyExe" Directory="INSTALLFOLDER" Guid="a1d2f3b4-5c6d-4e7f-8a90-b1c2d3e4f501">
         <File Id="web_access_proxy.exe" Source="payload\web-access-proxy.exe" KeyPath="yes" />
 
-        <!-- LocalService, not LocalSystem. The proxy needs to open sockets and read one config
-             file; it never authenticates as itself to anything, because credentials pass through
-             to the target untouched. There is no reason for it to hold machine identity. -->
+        <!-- LocalService, not LocalSystem. The proxy opens sockets and reads and writes its data
+             directory; directory binds use the signing-in user's own credentials or the configured
+             service account, never the machine's identity. -->
         <ServiceInstall Id="ServiceInstall"
                         Name="WebAccessProxy"
                         DisplayName="web-access RDP proxy"
-                        Description="Terminates browser WebSocket connections and proxies RDCleanPath to allowlisted targets. Does not decode RDP."
+                        Description="Browser-based RDP gateway: signs users in against Active Directory, serves each user's server list, and relays RDP sessions to the servers assigned to them."
                         Type="ownProcess"
                         Start="auto"
                         ErrorControl="normal"
@@ -65,19 +64,28 @@
              wrong the first time anyone changed it. -->
         <fw:FirewallException Id="InboundWebSocket"
                               Name="web-access proxy"
-                              Description="Inbound WebSocket connections to the web-access RDP proxy"
+                              Description="Inbound connections to the web-access RDP proxy"
                               Scope="localSubnet"
                               Profile="all"
                               Protocol="tcp"
                               IgnoreFailure="no" />
       </Component>
 
-      <!-- NeverOverwrite so an upgrade does not replace an administrator's allowlist with the
-           example. The allowlist is a security control; silently resetting it on upgrade would be
-           a failure mode, not a convenience. -->
+      <!-- NeverOverwrite so an upgrade does not replace an administrator's config with the example. -->
       <Component Id="ConfigFile" Directory="DATAFOLDER" Guid="b2e3a4c5-6d7e-4f80-9ab1-c2d3e4f50612"
                  NeverOverwrite="yes">
         <File Id="config.toml" Source="..\config.example.toml" Name="config.toml" KeyPath="yes" />
+      </Component>
+
+      <!-- The data directory holds the database, its backups and the certificates. Inheritance
+           from ProgramData is cut: SYSTEM and Administrators have full control, the service account
+           may modify, and nobody else has access. Permanent, so uninstalling leaves the data and
+           its protection in place. -->
+      <Component Id="DataFolderAcl" Directory="DATAFOLDER" Guid="c3f4b5d6-7e8f-4091-8bc2-d3e4f5061723"
+                 Permanent="yes" KeyPath="yes">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)" />
+        </CreateFolder>
       </Component>
     </ComponentGroup>
 

@@ -1,41 +1,41 @@
 # web-access proxy configuration.
 #
-# This file is a security control. A host absent from [[target]] cannot be named by any client, and
-# a target no [[policy]] grants cannot be reached by anyone. Review it like firewall rules.
+# Users, servers, groups and assignments are managed on the admin pages (https://<proxy>/admin), not
+# here. This file holds what the proxy needs before anyone can sign in.
 
-listen = "0.0.0.0:8443"
+listen = "0.0.0.0:443"
 
+# Accounts that are always administrators. Sign in as one of these to reach the admin pages.
+admins = ["jdoe"]
+
+# Where the database lives. Defaults to the directory holding this file.
+# data_dir = 'C:\ProgramData\web-access'
+
+# HTTPS. PEM files: the certificate chain for the name users browse to, and its private key.
+# Without this section the listener speaks plain HTTP.
+[https]
+cert = 'C:\ProgramData\web-access\proxy-cert.pem'
+key = 'C:\ProgramData\web-access\proxy-key.pem'
+
+# How the proxy checks the RDP servers' own certificates.
+#   "ca"       validate them against ca_bundle
+#   "insecure" accept any certificate
+# There is no default.
 [tls]
-# How the proxy decides WHO it connected to, having used DNS to decide WHERE.
-#   "ca"       validate the target certificate against ca_bundle
-#   "insecure" accept any certificate; reachability without identity
-# There is no default. State it.
 verify = "ca"
-# Linux:   /etc/web-access/internal-ca.pem
-# Windows: C:\ProgramData\web-access\internal-ca.pem
-# THE SERVICE WILL NOT START until this file exists and verify is set. That is intended: an
-# unconfigured gateway refusing to run is the safe state.
-ca_bundle = "C:\\ProgramData\\web-access\\internal-ca.pem"
+ca_bundle = 'C:\ProgramData\web-access\server-ca.pem'
 
-# Targets. `id` is what a client names; it is never an address.
-# `port` defaults to 3389 and comes from here, never from the client.
-[[target]]
-id = "historian-01"
-host = "historian-01.plant.example"
-port = 3389
-tags = ["l3", "historian"]
-
-[[target]]
-id = "eng-ws-04"
-host = "eng-ws-04.plant.example"
-tags = ["l3", "engineering"]
-
-# Policies grant TAGS to GROUPS from the identity provider, not hosts to people. Adding a historian
-# is one [[target]] entry and no change here.
-[[policy]]
-group = "OT-Historian-Admins"
-allow = ["historian"]
-
-[[policy]]
-group = "OT-Engineering"
-allow = ["engineering", "historian"]
+# The Active Directory users sign in against, over LDAPS.
+[directory]
+domain = "corp.example.com"
+# With netbios set, sign-in binds as NETBIOS\user, which works whatever UPN suffix an account has.
+netbios = "CORP"
+# Domain controllers, tried in order.
+urls = ["ldaps://dc1.corp.example.com", "ldaps://dc2.corp.example.com"]
+# CA that issued the domain controllers' certificates. Omit to use the Windows certificate store.
+ca_bundle = 'C:\ProgramData\web-access\directory-ca.pem'
+# Optional read-only account. With it, the proxy checks usernames when an administrator adds them,
+# and ends the sessions of accounts disabled in the directory. Its password is set on the admin
+# Migration page or with `web-access-proxy.exe set-secret directory`, never in this file.
+# service_account = "svc-webaccess"
+# check_interval_secs = 600
