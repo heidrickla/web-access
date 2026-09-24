@@ -434,9 +434,15 @@ let remoteFiles = [];           // what the remote has on its clipboard
 let nextStream = 1;
 const pending = new Map();      // streamId -> resolve/reject for a request we issued
 
+/// Send through `owner`, and only while it is the current session: work started for a session
+/// that has since ended must not reach the next one.
+function extOn(owner, ident, value) {
+  if (!owner || session !== owner) throw new Error('the session this was for has ended');
+  return owner.invokeExtension(new Extension(ident, value));
+}
+
 function ext(ident, value) {
-  if (!session) throw new Error('no session');
-  return session.invokeExtension(new Extension(ident, value));
+  return extOn(session, ident, value);
 }
 
 function humanSize(n) {
@@ -447,12 +453,12 @@ function humanSize(n) {
   return v.toFixed(v < 10 ? 1 : 0) + ' ' + units[i];
 }
 
-function askRemote(fileIndex, flags, position, size) {
+function askRemote(owner, fileIndex, flags, position, size) {
   const streamId = nextStream++;
   return new Promise((resolve, reject) => {
     pending.set(streamId, { resolve, reject });
     try {
-      ext('request_file_contents', { stream_id: streamId, file_index: fileIndex, flags, position, size });
+      extOn(owner, 'request_file_contents', { stream_id: streamId, file_index: fileIndex, flags, position, size });
     } catch (err) {
       pending.delete(streamId);
       reject(err);
@@ -467,7 +473,31 @@ function askRemote(fileIndex, flags, position, size) {
   });
 }
 
+/// The remote asks for part of a file this page offered. The answer goes back through the
+/// session that asked, and nowhere if that session ended while the file was being read.
+async function answerFileRequest(owner, req) {
+  const file = outgoing[req.index];
+  try {
+    if (!file) throw new Error('no file at index ' + req.index);
+    let data;
+    if (req.flags & FLAG_SIZE) {
+      data = new Uint8Array(8);
+      new DataView(data.buffer).setBigUint64(0, BigInt(file.size), true);
+    } else {
+      const slice = file.slice(Number(req.position), Number(req.position) + Number(req.size));
+      data = new Uint8Array(await slice.arrayBuffer());
+    }
+    extOn(owner, 'submit_file_contents', { stream_id: req.streamId, is_error: false, data });
+  } catch (err) {
+    if (session !== owner) return;   // ended meanwhile: nobody to answer or tell
+    // An error reply is required, or the remote's paste hangs rather than failing.
+    try { extOn(owner, 'submit_file_contents', { stream_id: req.streamId, is_error: true, data: new Uint8Array() }); } catch { /* session gone */ }
+    say('upload failed: ' + describe(err), true);
+  }
+}
+
 async function downloadRemoteFile(index, li) {
+  const owner = session;   // the file is on this session's remote clipboard, and nowhere else
   const meta = remoteFiles[index];
   const bar = document.createElement('progress');
   bar.max = 1; bar.value = 0;
@@ -475,14 +505,14 @@ async function downloadRemoteFile(index, li) {
   try {
     let total = Number(meta.size) || 0;
     if (!total) {
-      const sized = await askRemote(index, FLAG_SIZE, 0, 8);
+      const sized = await askRemote(owner, index, FLAG_SIZE, 0, 8);
       const view = new DataView(sized.buffer, sized.byteOffset, sized.byteLength);
       total = Number(view.getBigUint64(0, true));
     }
     const parts = [];
     for (let at = 0; at < total; at += CHUNK) {
       const want = Math.min(CHUNK, total - at);
-      parts.push(await askRemote(index, FLAG_RANGE, at, want));
+      parts.push(await askRemote(owner, index, FLAG_RANGE, at, want));
       bar.value = Math.min(1, (at + want) / total);
     }
     const url = URL.createObjectURL(new Blob(parts));
@@ -693,25 +723,7 @@ async function runSession(server, ticket, creds) {
         renderIncoming();
         if (remoteFiles.length) say(remoteFiles.length + ' file(s) copied on the remote — open the panel to download');
       }))
-      .extension(new Extension('file_contents_request_callback', async req => {
-        const file = outgoing[req.index];
-        try {
-          if (!file) throw new Error('no file at index ' + req.index);
-          let data;
-          if (req.flags & FLAG_SIZE) {
-            data = new Uint8Array(8);
-            new DataView(data.buffer).setBigUint64(0, BigInt(file.size), true);
-          } else {
-            const slice = file.slice(Number(req.position), Number(req.position) + Number(req.size));
-            data = new Uint8Array(await slice.arrayBuffer());
-          }
-          ext('submit_file_contents', { stream_id: req.streamId, is_error: false, data });
-        } catch (err) {
-          // An error reply is required, or the remote's paste hangs rather than failing.
-          try { ext('submit_file_contents', { stream_id: req.streamId, is_error: true, data: new Uint8Array() }); } catch { /* session gone */ }
-          say('upload failed: ' + describe(err), true);
-        }
-      }))
+      .extension(new Extension('file_contents_request_callback', req => answerFileRequest(mine, req)))
       .extension(new Extension('file_contents_response_callback', resp => {
         const waiting = pending.get(resp.streamId);
         if (!waiting) return;

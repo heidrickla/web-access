@@ -6,6 +6,7 @@ status=0
 stage() { echo "== $1"; shift; "$@" || { echo "== FAILED"; status=1; }; }
 
 stage "build" bash -c 'cd ../.. && cargo build --offline --release -q'
+stage "page scripts" docker run --rm -v "$PWD/../..:/repo:ro" -w /repo mcr.microsoft.com/playwright:v1.63.0-noble bash tests/js/run.sh
 stage "fixtures" ./up.sh
 ./proxy.sh stop 1; ./proxy.sh stop 2; rm -rf data1 log1
 stage "proxy 1" ./proxy.sh start 1

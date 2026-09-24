@@ -85,7 +85,8 @@ mutate "a connection entry outlives its task" src/live.rs 's/        self.app.li
 mutate "a directory sign-in lands on a local account" src/web.rs 's/    if user.local {/    if false {/' a_directory_sign_in_never_lands_on_a_local_account
 mutate "a local failure is counted only if its request waits" src/web.rs 's/            counter.throttle.fail(&name);//; s/        return Ok(Checked::Refused("local password did not match"));/        app.throttle.fail(username); return Ok(Checked::Refused("local password did not match"));/' an_abandoned_local_sign_in_still_counts_as_a_failure
 mutate "a freeze is not marked pending" src/admin.rs 's/            app.store.set_flag(META_FREEZE_PENDING, true)?;//' a_freeze_is_pending_until_its_archive_is_handed_over
-mutate "a handed-over freeze stays pending" src/admin.rs 's/^            app.store.set_flag(META_FREEZE_PENDING, false)?;$//' a_freeze_is_pending_until_its_archive_is_handed_over
+mutate "a handed-over freeze stays pending" src/admin.rs 's/^                app.store.set_flag(META_FREEZE_PENDING, false)?;$//' a_freeze_is_pending_until_its_archive_is_handed_over
+mutate "the freeze stops being pending before the handover" src/admin.rs 's/^    Ok(delivery)$/    if froze { app.store.set_flag(META_FREEZE_PENDING, false)?; } Ok(delivery)/' a_freeze_is_pending_until_its_archive_is_handed_over
 mutate "start keeps a stranded freeze" src/app.rs 's/        app.lift_stranded_freeze()?;//' a_stranded_freeze_is_lifted_when_the_service_starts_and_only_then
 mutate "a command-line tool lifts a freeze in progress" src/app.rs 's/        app.seed_from_config()?;/        app.seed_from_config()?; app.lift_stranded_freeze()?;/' a_stranded_freeze_is_lifted_when_the_service_starts_and_only_then
 mutate "the service start keeps a stranded freeze" src/server.rs 's/    let app = Arc::new(App::for_serving(cfg)?);/    let app = Arc::new(App::new(cfg)?);/' the_service_start_lifts_a_stranded_freeze

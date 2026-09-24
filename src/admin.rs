@@ -702,7 +702,8 @@ async fn export(
 ) -> ApiResult<Response> {
     let export = export_supervised(&app, token, req.passphrase, req.freeze)
         .await?
-        .into_export();
+        .hand_over()
+        .await?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip".to_owned()),
@@ -751,8 +752,20 @@ pub struct Delivery {
 }
 
 impl Delivery {
-    /// Hand the archive to the response; a freeze it set stays.
-    pub fn into_export(self) -> migrate::Export {
+    /// Hand the archive to the response. A freeze it set stops being pending, under a hold and
+    /// only in the database it was set in, and stays. Called immediately before the response is
+    /// built; cancelled while waiting for the hold, the delivery is dropped and lifts its freeze.
+    pub async fn hand_over(self) -> ApiResult<migrate::Export> {
+        if let Some(FreezeUndo(Some((app, generation, _)))) = &self.undo {
+            let _shared = app.gate.read().await;
+            if app.generation() == *generation {
+                app.store.set_flag(META_FREEZE_PENDING, false)?;
+            }
+        }
+        Ok(self.into_export())
+    }
+
+    fn into_export(self) -> migrate::Export {
         let Delivery { export, undo } = self;
         if let Some(undo) = undo {
             undo.disarm();
@@ -846,10 +859,6 @@ async fn export_task(
             if freeze { "export.freeze" } else { "export" },
             &delivery.export.file_name,
         );
-        // Handed over: from here the freeze is the one the administrator asked for.
-        if froze {
-            app.store.set_flag(META_FREEZE_PENDING, false)?;
-        }
     }
     Ok(delivery)
 }
@@ -1266,10 +1275,29 @@ mod tests {
         let held = app.gate.write().await;
         assert!(app.store.flag(META_FREEZE_PENDING).unwrap(), "a freeze mid-export was not marked pending");
         drop(held);
-        task.await.unwrap().unwrap().into_export();
+        let delivery = task.await.unwrap().unwrap();
+        assert!(
+            app.store.flag(META_FREEZE_PENDING).unwrap(),
+            "the freeze stopped being pending before the archive was handed over"
+        );
+        delivery.hand_over().await.unwrap();
         assert!(!app.store.flag(META_FREEZE_PENDING).unwrap(), "a handed-over freeze stayed pending");
         assert!(!app.lift_stranded_freeze().unwrap());
         assert!(app.frozen());
+    }
+
+    /// A process that ends with an archive finished but not yet handed over leaves a freeze the
+    /// next start lifts.
+    #[tokio::test]
+    async fn a_freeze_whose_archive_was_never_collected_is_lifted_at_the_next_start() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        let delivery = export_supervised(&app, token_of(&cookie), PASS.into(), true).await.unwrap();
+        // The process ends here: nothing runs the delivery's drop.
+        std::mem::forget(delivery);
+        assert!(app.lift_stranded_freeze().unwrap(), "no pending freeze was found at start");
+        assert!(!app.frozen());
     }
 
     /// An archive dropped before the response takes it lifts its freeze; one handed over keeps it.
