@@ -36,15 +36,18 @@ try {
   check('a collapsed group stays collapsed across a reload', histOpen === false);
   await page.click('#expand-all');
 
-  // Connect, typing credentials and asking to save them.
+  // Connect, typing credentials and asking to save them. The dialog stays open longer than a connect
+  // ticket lives, as it would for a user fetching a password, and the connection must still work.
   await page.click('button.srv:has-text("xrdp-01")');
   await page.waitForSelector('dialog#signin[open]');
+  await page.waitForTimeout(65000);
   await page.fill('#u', 'ops');
   await page.fill('#p', env.OPS_PASS);
   await page.check('#save');
   await shot(page, '03-server-signin');
   await page.click('#signin-go');
   await waitConnected(page);
+  check('a dialog open longer than a ticket lives still connects', await connected(page));
   await xrdpLogin(page);
   await shot(page, '04-desktop');
   check('the desktop is shown full window', await connected(page));
@@ -103,6 +106,25 @@ try {
   await admin.page.click('#user-table tbody tr:has-text("jdoe")');
   await admin.page.waitForSelector('#user-detail:not([hidden])');
   await shot(admin.page, '07-admin-users');
+
+  // Click one user, then another, with the first answer slowed: the pane must end on the second
+  // user with the second user's servers, or Save would write one user's list onto another.
+  let slowed = false;
+  await admin.page.route('**/api/admin/users/*/servers', async route => {
+    if (!slowed && route.request().method() === 'GET') {
+      slowed = true;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    await route.continue();
+  });
+  await admin.page.click('#user-table tbody tr:has-text("asmith")');
+  await admin.page.click('#user-table tbody tr:has-text("jdoe")');
+  await admin.page.waitForTimeout(2500);
+  const title = await admin.page.textContent('#ud-title');
+  const ticked = await admin.page.$$eval('#ud-checklist li.row input:checked', els => els.length);
+  check('a slow answer to an earlier click does not replace the later selection',
+    title.includes('jdoe') && ticked === 2, `title=${title} ticked=${ticked}`);
+  await admin.page.unroute('**/api/admin/users/*/servers');
   for (const tab of ['servers', 'groups', 'activity', 'migration']) {
     await admin.page.click(`nav.tabs button[data-tab="${tab}"]`);
     await admin.page.waitForTimeout(700);

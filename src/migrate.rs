@@ -124,11 +124,21 @@ pub fn utc_stamp(secs: i64) -> String {
 /// export cannot be made under a passphrase nobody can later import with.
 pub fn export(app: &App, passphrase: &str) -> Result<Export> {
     Vault::verify_recovery(&app.store, passphrase)?;
+    let (db, counts) = snapshot(app)?;
+    package(app, passphrase, &db, counts)
+}
+
+/// A consistent copy of the whole database, and what it holds.
+pub fn snapshot(app: &App) -> Result<(Vec<u8>, Counts)> {
     let tmp = TempFile(temp_path(&app.cfg.data_dir(), "export"));
     let counts = app.store.snapshot_to(&tmp.0)?;
     let db = std::fs::read(&tmp.0)?;
-    drop(tmp);
-    let blob = vault::encrypt_with_passphrase(passphrase, AAD_EXPORT, &db)?;
+    Ok((db, counts))
+}
+
+/// Encrypt a snapshot under the passphrase and wrap it with its manifest.
+pub fn package(app: &App, passphrase: &str, db: &[u8], counts: Counts) -> Result<Export> {
+    let blob = vault::encrypt_with_passphrase(passphrase, AAD_EXPORT, db)?;
     let exported_at = now();
     let manifest = Manifest {
         format: FORMAT,
@@ -281,6 +291,8 @@ pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
     std::mem::forget(guard); // renamed into place; nothing left to remove
     app.vault.install(key);
     app.tickets.clear();
+    // Connections were admitted against identities the imported database may give to someone else.
+    app.live.end_all();
     tracing::info!(backup = %backup.display(), ?counts, "database imported");
     Ok(counts)
 }

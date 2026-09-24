@@ -49,3 +49,4 @@ check "cross-origin POST refused" 403 "$(code -b jdoe.jar -H 'Origin: http://evi
 
 echo "server_id=$sid jdoe_id=$jdoe_id" > ids.env
 echo "passed=$pass failed=$fail"
+[ "$fail" -eq 0 ]

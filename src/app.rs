@@ -29,6 +29,9 @@ pub struct App {
     pub secure_cookies: bool,
     pub host_name: String,
     pub imports: Mutex<HashMap<String, PendingImport>>,
+    /// Requests hold it shared; an import, and an export that freezes, hold it exclusively. So no
+    /// request straddles a database swap, and no edit lands between a freeze and its snapshot.
+    pub gate: tokio::sync::RwLock<()>,
 }
 
 impl App {
@@ -50,6 +53,7 @@ impl App {
             live: LiveSessions::default(),
             target_tls,
             imports: Mutex::new(HashMap::new()),
+            gate: tokio::sync::RwLock::new(()),
         };
         app.seed_from_config()?;
         Ok(app)

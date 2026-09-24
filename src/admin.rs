@@ -643,17 +643,55 @@ async fn export(
     AdminUser(admin): AdminUser,
     Json(req): Json<ExportForm>,
 ) -> ApiResult<Response> {
-    let export = {
+    // The passphrase is checked before anything is frozen.
+    {
         let app = app.clone();
         let pass = req.passphrase.clone();
-        tokio::task::spawn_blocking(move || migrate::export(&app, &pass))
+        tokio::task::spawn_blocking(move || Vault::verify_recovery(&app.store, &pass))
             .await
-            .map_err(ApiError::internal)??
-    };
-    // Frozen AFTER the snapshot, so the exported copy is not itself frozen.
-    if req.freeze {
-        app.store.set_flag(crate::app::META_FROZEN, true)?;
+            .map_err(ApiError::internal)?
+            .map_err(migrate::MigrateError::from)?;
     }
+    let was_frozen = app.frozen();
+    let snapshot = if req.freeze {
+        // Exclusive: requests in flight finish first, and no edit can land between the freeze and
+        // the snapshot, so nothing acknowledged is missing from the export. The imported copy
+        // arrives frozen and the import clears it.
+        let _exclusive = app.gate.write().await;
+        app.store.set_flag(crate::app::META_FROZEN, true)?;
+        take_snapshot(&app).await
+    } else {
+        // This route is exempt from the middleware's shared hold, so it takes its own.
+        let _shared = app.gate.read().await;
+        take_snapshot(&app).await
+    };
+    let unfreeze_on_failure = |app: &Shared| {
+        if req.freeze && !was_frozen {
+            let _ = app.store.set_flag(crate::app::META_FROZEN, false);
+        }
+    };
+    let (db, counts) = match snapshot {
+        Ok(v) => v,
+        Err(e) => {
+            unfreeze_on_failure(&app);
+            return Err(e);
+        }
+    };
+    let export = {
+        let app2 = app.clone();
+        let pass = req.passphrase.clone();
+        match tokio::task::spawn_blocking(move || migrate::package(&app2, &pass, &db, counts)).await {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => {
+                unfreeze_on_failure(&app);
+                return Err(e.into());
+            }
+            Err(e) => {
+                unfreeze_on_failure(&app);
+                return Err(ApiError::internal(e));
+            }
+        }
+    };
     app.store.audit(
         &admin.username,
         if req.freeze { "export.freeze" } else { "export" },
@@ -672,6 +710,13 @@ async fn export(
         .into_response())
 }
 
+async fn take_snapshot(app: &Shared) -> ApiResult<(Vec<u8>, crate::store::Counts)> {
+    let app = app.clone();
+    Ok(tokio::task::spawn_blocking(move || migrate::snapshot(&app))
+        .await
+        .map_err(ApiError::internal)??)
+}
+
 async fn unfreeze(State(app): State<Shared>, AdminUser(admin): AdminUser) -> ApiResult<StatusCode> {
     app.store.set_flag(crate::app::META_FROZEN, false)?;
     app.store.audit(&admin.username, "unfreeze", "");
@@ -683,6 +728,8 @@ async fn upload_import(
     AdminUser(admin): AdminUser,
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
+    // The body has arrived by now; only the staging runs under the gate.
+    let _shared = app.gate.read().await;
     let (upload_id, manifest) = migrate::stage(&app, &body)?;
     let current = app.store.counts()?;
     app.store.audit(
@@ -712,14 +759,7 @@ async fn confirm_import(
     Path(upload): Path<String>,
     Json(req): Json<ConfirmForm>,
 ) -> ApiResult<Json<Value>> {
-    let counts = {
-        let app = app.clone();
-        tokio::task::spawn_blocking(move || {
-            migrate::confirm(&app, &upload, &req.passphrase, req.confirm_host.as_deref())
-        })
-        .await
-        .map_err(ApiError::internal)??
-    };
+    let counts = import_exclusive(&app, upload, req.passphrase, req.confirm_host).await?;
     // Written into the imported database, so the record travels with the data it describes.
     app.store.audit(
         &admin.username,
@@ -730,6 +770,23 @@ async fn confirm_import(
         ),
     );
     Ok(Json(json!({ "counts": counts })))
+}
+
+/// The swap runs with the gate held exclusively: every request in flight finishes first, and none
+/// starts until the new database and its key are both in place.
+pub async fn import_exclusive(
+    app: &Shared,
+    upload: String,
+    passphrase: String,
+    confirm_host: Option<String>,
+) -> ApiResult<crate::store::Counts> {
+    let _exclusive = app.gate.write().await;
+    let app = app.clone();
+    Ok(tokio::task::spawn_blocking(move || {
+        migrate::confirm(&app, &upload, &passphrase, confirm_host.as_deref())
+    })
+    .await
+    .map_err(ApiError::internal)??)
 }
 
 #[derive(Deserialize)]
@@ -843,6 +900,73 @@ mod tests {
         assert_eq!(s, StatusCode::NO_CONTENT);
         let (s, _) = call(&app, "POST", "/api/admin/groups", Some(&cookie), Some(json!({"name": "G"}))).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    const PASS: &str = "a long recovery phrase";
+
+    /// True once something is waiting for the gate exclusively while the caller holds it shared.
+    /// tokio's RwLock is fair: a queued writer makes every new shared hold wait, so `try_read`
+    /// fails. With no writer queued it keeps succeeding. Waits up to 30 s for the writer to queue
+    /// (a debug build's Argon2 runs before it).
+    async fn writer_queued(app: &crate::web::Shared) -> bool {
+        for _ in 0..300 {
+            if app.gate.try_read().is_err() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// An import must wait for requests in flight, so none straddles the database swap.
+    #[tokio::test]
+    async fn an_import_waits_for_requests_in_flight_and_ends_every_connection() {
+        use crate::web::tests::test_app_keyed;
+        let old = test_app_keyed([1; 32], "oldhost");
+        let new = test_app_keyed([2; 32], "newhost");
+        old.vault.set_recovery(&old.store, None, PASS).unwrap();
+        old.store.user_create("jdoe", None).unwrap();
+        let exported = migrate::export(&old, PASS).unwrap();
+        let (upload, _) = migrate::stage(&new, &exported.bytes).unwrap();
+        let (_, mut connection) = new.live.register(1, b"s".to_vec());
+
+        let in_flight = new.gate.read().await;
+        let new2 = new.clone();
+        let task = tokio::spawn(async move { import_exclusive(&new2, upload, PASS.into(), None).await });
+        assert!(writer_queued(&new).await, "the import never waited on the gate");
+        assert!(!task.is_finished(), "the import finished while a request was in flight");
+        assert!(new.store.user_by_name("jdoe").unwrap().is_none(), "swapped under a request in flight");
+        drop(in_flight);
+        task.await.unwrap().unwrap();
+        assert!(new.store.user_by_name("jdoe").unwrap().is_some());
+        assert!(connection.try_recv().is_ok(), "a connection outlived the import");
+    }
+
+    /// A freezing export takes the gate exclusively, so no edit lands between freeze and snapshot.
+    #[tokio::test]
+    async fn a_freezing_export_waits_for_edits_in_flight_and_a_wrong_passphrase_freezes_nothing() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+
+        let (s, _) = call(&app, "POST", "/api/admin/migration/export", Some(&cookie),
+            Some(json!({"passphrase": "not the phrase at all", "freeze": true}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(!app.frozen(), "a refused export froze the host");
+
+        let in_flight = app.gate.read().await;
+        let app2 = app.clone();
+        let cookie2 = cookie.clone();
+        let task = tokio::spawn(async move {
+            call(&app2, "POST", "/api/admin/migration/export", Some(&cookie2),
+                Some(json!({"passphrase": PASS, "freeze": true}))).await
+        });
+        assert!(writer_queued(&app).await, "the freezing export never waited on the gate");
+        assert!(!app.frozen(), "frozen while an edit was in flight");
+        drop(in_flight);
+        let (s, _) = task.await.unwrap();
+        assert_eq!(s, StatusCode::OK);
+        assert!(app.frozen());
     }
 
     #[test]
