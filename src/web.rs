@@ -569,12 +569,10 @@ async fn check_directory(app: &App, username: &str, password: &str) -> ApiResult
 fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult<User> {
     let user = match app.store.user_by_name(&account.username)? {
         Some(u) => u,
-        None => {
-            let id = app
-                .store
-                .user_create(&account.username, account.display_name.as_deref())?;
-            app.store.user_by_id(id)?.ok_or_else(ApiError::not_found)?
-        }
+        // Created and read back in one step, so the row carried on is the row created.
+        None => app
+            .store
+            .user_create_returning(&account.username, account.display_name.as_deref())?,
     };
     // A local account created under this name while the directory was asked is not the directory's.
     if user.local {
@@ -1064,16 +1062,15 @@ pub mod tests {
         assert!(app.store.session_user(b"h", start + ttl).unwrap().is_none(), "24h");
     }
 
-    /// A sign-in whose account was deleted, and its id given to a new account, before its session
-    /// was created gets no session.
+    /// Behind ids that are never reused: a sign-in whose account row was replaced on the same id
+    /// before its session was created gets no session.
     #[tokio::test]
     async fn a_sign_in_gets_no_session_on_a_row_that_reused_its_id() {
         let app = test_app();
         let alice_id = app.store.user_create("alice", None).unwrap();
         let alice = app.store.user_by_id(alice_id).unwrap().unwrap();
         app.store.user_delete(alice_id).unwrap();
-        let bob = app.store.user_create("bob", None).unwrap();
-        assert_eq!(bob, alice_id, "SQLite did not reuse the id, so this proves nothing");
+        let bob = app.store.user_create_at(alice_id, "bob").unwrap();
         let refused = start_session(&app, &alice).unwrap_err();
         assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
         let fresh = app.store.user_by_id(bob).unwrap().unwrap();

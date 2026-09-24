@@ -98,5 +98,12 @@ mutate "sign-in ignores a refused session" src/web.rs 's/    if !app.store.sessi
 mutate "a session end lands on a row that reused its id" src/store.rs 's/              WHERE EXISTS (SELECT 1 FROM users WHERE id = ?1 AND incarnation = ?2)/              WHERE EXISTS (SELECT 1 FROM users WHERE id = ?1 AND ?2 = ?2)/' a_late_session_end_never_lands_on_a_row_that_reused_its_id
 mutate "a session end lands on a server that reused its id" src/store.rs 's/                AND EXISTS (SELECT 1 FROM servers WHERE id = ?3 AND incarnation = ?4)/                AND EXISTS (SELECT 1 FROM servers WHERE id = ?3 AND ?4 = ?4)/' a_late_session_end_never_lands_on_a_row_that_reused_its_id
 mutate "a new row keeps no incarnation" src/store.rs 's/^BEGIN UPDATE users SET incarnation = random() WHERE id = NEW.id; END;$/BEGIN SELECT 1; END;/' a_late_session_end_never_lands_on_a_row_that_reused_its_id
+mutate "user ids are reused" src/store.rs 's/^    id           INTEGER PRIMARY KEY AUTOINCREMENT,$/    id           INTEGER PRIMARY KEY,/' a_deleted_rows_id_is_never_given_to_a_new_row
+mutate "server ids are reused" src/store.rs 's/^    id          INTEGER PRIMARY KEY AUTOINCREMENT,$/    id          INTEGER PRIMARY KEY,/' a_deleted_rows_id_is_never_given_to_a_new_row
+mutate "the rebuild leaves foreign keys off" src/store.rs '/^fn rebuild_with_foreign_keys_off/,/^}/ s/    conn.execute_batch("PRAGMA foreign_keys = ON;")?;//' a_version_3_database_migrates_to_ids_that_are_never_reused
+mutate "the rebuild skips its reference check" src/store.rs 's/        if broken > 0 {/        if false {/' a_migration_that_would_break_references_changes_nothing
+mutate "a refused rebuild is left half done" src/store.rs 's/        let _ = conn.execute_batch("ROLLBACK;");//' a_migration_that_would_break_references_changes_nothing
+mutate "the service reads its config twice" src/server.rs 's/^    let app = Arc::new(App::for_serving(cfg)?);$/    let app = Arc::new(App::for_serving(Config::load(config_path)?)?);/' the_directory_served_is_the_directory_locked
+mutate "run serves a directory it holds no lock for" src/server.rs 's/    if cfg.data_dir() != serving.data_dir {/    if false {/' the_directory_served_is_the_directory_locked
 
 if [ "$bad" -eq 0 ]; then echo "all mutations caught"; else echo "$bad mutation(s) not caught"; exit 1; fi
