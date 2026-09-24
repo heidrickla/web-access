@@ -94,6 +94,27 @@ try {
   await again.page.click('li.row:has-text("xrdp-01") button.forget');
   await again.page.waitForFunction(() => !document.querySelector('li.row .mark.saved'), null, { timeout: 10000 }).catch(() => {});
   check('forgetting removes the saved marker', !(await again.page.isVisible('li.row .mark.saved')));
+
+  // Two quick clicks on different servers, the first one's answer slowed: the second click starts
+  // nothing while the first is opening.
+  await again.page.click('#expand-all');
+  let connects = 0;
+  again.page.on('request', r => { if (r.method() === 'POST' && r.url().endsWith('/api/connect')) connects++; });
+  let slowConnect = false;
+  await again.page.route('**/api/connect', async route => {
+    if (!slowConnect) {
+      slowConnect = true;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    await route.continue();
+  });
+  await again.page.click('button.srv:has-text("xrdp-01")');
+  await again.page.click('button.srv:has-text("hist-01")');
+  await again.page.waitForSelector('dialog#signin[open]', { timeout: 10000 }).catch(() => {});
+  await again.page.waitForTimeout(500);
+  check('a second click while a server is opening starts nothing', connects === 1, `connect requests=${connects}`);
+  await again.page.keyboard.press('Escape');
+  await again.page.unroute('**/api/connect');
   await again.ctx.close();
 
   // Admin pages as the bootstrap admin.

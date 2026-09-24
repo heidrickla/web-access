@@ -592,9 +592,23 @@ function askCredentials(server, prefill = {}) {
   });
 }
 
+// The server being opened or connected. One at a time, from the click until its session ends: a
+// second click meanwhile would start a second session over the same page.
+let opening = null;
+
 async function openServer(id) {
   const server = servers.get(id);
-  if (!server || session) return;
+  if (!server) return;
+  if (opening) return say(opening.name + ' is already opening or open');
+  opening = server;
+  try {
+    await connectTo(server, id);
+  } finally {
+    opening = null;
+  }
+}
+
+async function connectTo(server, id) {
   let prefill = {};
   // Two rounds at most: a saved credential, then one typed after the saved one was refused.
   for (let round = 0; round < 2; round++) {
@@ -651,6 +665,7 @@ async function openServer(id) {
 /// Connect, run until the session ends, and report whether a desktop was ever reached.
 async function runSession(server, ticket, creds) {
   const outcome = { connected: false };
+  let mine = null;   // this attempt's session; the page's state is cleared only while it is current
   say('connecting to ' + server.name);
   try {
     await clientReady;
@@ -719,7 +734,8 @@ async function runSession(server, ticket, creds) {
       });
     if (creds.domain) builder.serverDomain(creds.domain);
 
-    session = await builder.connect();
+    mine = await builder.connect();
+    session = mine;
     outcome.connected = true;
 
     // Saved only once the server has accepted them, so a mistyped password is never kept.
@@ -738,24 +754,26 @@ async function runSession(server, ticket, creds) {
     canvas.focus();
     say('connected to ' + server.name);
 
-    await session.run();
+    await mine.run();
     say('disconnected from ' + server.name);
   } catch (err) {
     const text = describe(err);
     say((outcome.connected ? 'session ended: ' : 'could not connect to ' + server.name + ': ') + text, true);
   } finally {
     creds.password = '';
-    document.body.classList.remove('connected');
-    $('rail').hidden = true;
-    openRail(false);
-    session = null;
-    // Transfer state belongs to the session.
-    outgoing = [];
-    remoteFiles = [];
-    for (const { reject } of pending.values()) reject(new Error('session ended'));
-    pending.clear();
-    renderOutgoing();
-    renderIncoming();
+    if (session === mine) {
+      document.body.classList.remove('connected');
+      $('rail').hidden = true;
+      openRail(false);
+      session = null;
+      // Transfer state belongs to the session.
+      outgoing = [];
+      remoteFiles = [];
+      for (const { reject } of pending.values()) reject(new Error('session ended'));
+      pending.clear();
+      renderOutgoing();
+      renderIncoming();
+    }
   }
   return outcome;
 }

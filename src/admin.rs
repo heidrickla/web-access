@@ -700,7 +700,9 @@ async fn export(
     AdminToken(token): AdminToken,
     Json(req): Json<ExportForm>,
 ) -> ApiResult<Response> {
-    let export = export_supervised(&app, token, req.passphrase, req.freeze).await?;
+    let export = export_supervised(&app, token, req.passphrase, req.freeze)
+        .await?
+        .into_export();
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip".to_owned()),
@@ -714,12 +716,57 @@ async fn export(
         .into_response())
 }
 
+/// Lifts the freeze an export set, unless disarmed. It travels with the archive, so an archive
+/// dropped anywhere short of the response (a failure, an abandoned request, a result nobody
+/// collected) leaves no freeze behind. It holds the export lock until the freeze is settled, so
+/// the next export cannot mistake this one's freeze for an earlier one and then lose it.
+pub struct FreezeUndo(Option<(Shared, u64, tokio::sync::OwnedMutexGuard<()>)>);
+
+impl FreezeUndo {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for FreezeUndo {
+    fn drop(&mut self) {
+        if let Some((app, generation, lock)) = self.0.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    rt.spawn(async move {
+                        unfreeze_if_current(&app, generation).await;
+                        drop(lock);
+                    });
+                }
+                Err(_) => tracing::warn!("an export that was not delivered could not lift its freeze"),
+            }
+        }
+    }
+}
+
+/// An export on its way to the requester.
+pub struct Delivery {
+    export: migrate::Export,
+    undo: Option<FreezeUndo>,
+}
+
+impl Delivery {
+    /// Hand the archive to the response; a freeze it set stays.
+    pub fn into_export(self) -> migrate::Export {
+        let Delivery { export, undo } = self;
+        if let Some(undo) = undo {
+            undo.disarm();
+        }
+        export
+    }
+}
+
 pub async fn export_supervised(
     app: &Shared,
     token: Vec<u8>,
     passphrase: String,
     freeze: bool,
-) -> ApiResult<migrate::Export> {
+) -> ApiResult<Delivery> {
     let app = app.clone();
     supervised(move |gone| export_task(app, token, passphrase, freeze, gone)).await
 }
@@ -730,7 +777,7 @@ async fn export_task(
     passphrase: String,
     freeze: bool,
     gone: Arc<AtomicBool>,
-) -> ApiResult<migrate::Export> {
+) -> ApiResult<Delivery> {
     // A wrong passphrase is turned away before anything waits on the gate. The check that counts
     // is made on the snapshot itself.
     {
@@ -742,8 +789,8 @@ async fn export_task(
             .map_err(migrate::MigrateError::from)?;
     }
     // One export at a time, so a failed export can only undo a freeze it set itself.
-    let _one = app.export_lock.lock().await;
-    let (admin, (db, counts), froze_at) = if freeze {
+    let one = Arc::clone(&app.export_lock).lock_owned().await;
+    let (admin, (db, counts), generation, froze) = if freeze {
         // Exclusive: requests in flight finish first, and no edit lands between the freeze and the
         // snapshot, so nothing acknowledged is missing from the export. The imported copy arrives
         // frozen and the import clears it.
@@ -753,7 +800,7 @@ async fn export_task(
         let froze = !app.frozen();
         app.store.set_flag(META_FROZEN, true)?;
         match snapshot_of(&app, &passphrase).await {
-            Ok(s) => (admin, s, froze.then(|| app.generation())),
+            Ok(s) => (admin, s, app.generation(), froze),
             Err(e) => {
                 if froze {
                     let _ = app.store.set_flag(META_FROZEN, false);
@@ -764,31 +811,37 @@ async fn export_task(
     } else {
         let _shared = app.gate.read().await;
         still_wanted(&gone)?;
-        (revalidate_admin(&app, &token)?, snapshot_of(&app, &passphrase).await?, None)
+        let admin = revalidate_admin(&app, &token)?;
+        (admin, snapshot_of(&app, &passphrase).await?, app.generation(), false)
     };
-    let packaged = {
+    // From here a freeze this export set travels with its archive, with the export lock: every
+    // early return below drops it, and dropping it lifts the freeze.
+    let (undo, _one) = if froze {
+        (Some(FreezeUndo(Some((app.clone(), generation, one)))), None)
+    } else {
+        (None, Some(one))
+    };
+    let export = {
         let app = app.clone();
         let pass = passphrase.clone();
         tokio::task::spawn_blocking(move || migrate::package(&app, &pass, &db, counts))
             .await
-            .map_err(ApiError::internal)
-            .and_then(|r| r.map_err(ApiError::from))
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::from)?
     };
-    // An archive nobody receives leaves no freeze behind.
-    let delivered = packaged.and_then(|e| still_wanted(&gone).map(|()| e));
-    if delivered.is_err() {
-        if let Some(generation) = froze_at {
-            unfreeze_if_current(&app, generation).await;
-        }
-    }
-    let export = delivered?;
+    let delivery = Delivery { export, undo };
+    // Recorded under a hold, only in the database the snapshot came from, and only while someone
+    // is waiting for the archive.
     let _shared = app.gate.read().await;
-    app.store.audit(
-        &admin.username,
-        if freeze { "export.freeze" } else { "export" },
-        &export.file_name,
-    );
-    Ok(export)
+    still_wanted(&gone)?;
+    if app.generation() == generation {
+        app.store.audit(
+            &admin.username,
+            if freeze { "export.freeze" } else { "export" },
+            &delivery.export.file_name,
+        );
+    }
+    Ok(delivery)
 }
 
 async fn snapshot_of(app: &Shared, passphrase: &str) -> ApiResult<(Vec<u8>, crate::store::Counts)> {
@@ -1154,8 +1207,67 @@ mod tests {
         until("the export froze the proxy", || app.frozen()).await;
         task.abort();
         let _ = task.await;
-        until("the export finished", || app.export_lock.try_lock().is_ok()).await;
-        assert!(!app.frozen(), "an undelivered export left the proxy frozen");
+        until("the undelivered export lifts its freeze", || !app.frozen()).await;
+    }
+
+    /// Cancelled at its last step, while waiting on the gate to record itself, an export lifts its
+    /// freeze and records nothing.
+    #[tokio::test]
+    async fn an_export_cancelled_while_waiting_to_record_itself_lifts_its_freeze() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        // An unobstructed export's duration bounds how long packaging takes.
+        let start = std::time::Instant::now();
+        export_supervised(&app, token_of(&cookie), PASS.into(), false).await.unwrap().into_export();
+        let unobstructed = start.elapsed();
+
+        let app2 = app.clone();
+        let token = token_of(&cookie);
+        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the snapshot is taken", || app.frozen() && app.gate.try_write().is_ok()).await;
+        let held = app.gate.write().await;
+        // Packaging finishes and the export waits on the gate to record itself.
+        tokio::time::sleep(unobstructed * 2).await;
+        task.abort();
+        let _ = task.await;
+        drop(held);
+        until("the export lifts its freeze", || !app.frozen()).await;
+        let actions: Vec<String> = app.store.audit_list(50, None).unwrap().into_iter().map(|r| r.action).collect();
+        assert!(!actions.iter().any(|a| a == "export.freeze"), "an export nobody received was recorded: {actions:?}");
+    }
+
+    /// An archive dropped before the response takes it lifts its freeze; one handed over keeps it.
+    #[tokio::test]
+    async fn a_delivery_lifts_its_freeze_unless_handed_over() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        let delivery = export_supervised(&app, token_of(&cookie), PASS.into(), true).await.unwrap();
+        assert!(app.frozen());
+        drop(delivery);
+        assert!(app.export_lock.try_lock().is_err(), "the next export could start before the freeze was settled");
+        until("the dropped archive lifts its freeze", || !app.frozen()).await;
+        until("the export lock comes free", || app.export_lock.try_lock().is_ok()).await;
+        export_supervised(&app, token_of(&cookie), PASS.into(), true).await.unwrap().into_export();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(app.frozen(), "a delivered export lost its freeze");
+    }
+
+    /// An export whose database an import replaced after its snapshot records nothing in the new one.
+    #[tokio::test]
+    async fn an_export_records_nothing_in_a_database_replaced_since_its_snapshot() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        let app2 = app.clone();
+        let token = token_of(&cookie);
+        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the snapshot is taken", || app.frozen() && app.gate.try_write().is_ok()).await;
+        app.bump_generation();
+        task.await.unwrap().unwrap().into_export();
+        let actions: Vec<String> = app.store.audit_list(50, None).unwrap().into_iter().map(|r| r.action).collect();
+        assert!(!actions.iter().any(|a| a.starts_with("export")), "{actions:?}");
     }
 
     /// An export that fails lifts only a freeze it set itself.
@@ -1172,6 +1284,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         until("the export finished", || app.export_lock.try_lock().is_ok()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(app.frozen(), "a failed export lifted a freeze it did not set");
     }
 
@@ -1182,7 +1295,7 @@ mod tests {
         let (_, cookie) = signed_in(&app, "boss");
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
         let start = std::time::Instant::now();
-        export_supervised(&app, token_of(&cookie), PASS.into(), false).await.unwrap();
+        export_supervised(&app, token_of(&cookie), PASS.into(), false).await.unwrap().into_export();
         let unobstructed = start.elapsed();
 
         let one = app.export_lock.lock().await;
@@ -1193,7 +1306,7 @@ mod tests {
         assert!(!task.is_finished(), "an export ran while another held the export lock");
         assert!(!app.frozen(), "an export froze the proxy while another held the export lock");
         drop(one);
-        task.await.unwrap().unwrap();
+        task.await.unwrap().unwrap().into_export();
         assert!(app.frozen());
     }
 

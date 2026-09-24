@@ -123,6 +123,21 @@ impl Session<'_> {
         outcome
     }
 
+    /// Record the opening in the database the connection was admitted from. False, and nothing
+    /// written, when an import has replaced that database since admission.
+    async fn record_open(&self, target: &Server, addr: SocketAddr) -> bool {
+        let _shared = self.app.gate.read().await;
+        if self.app.live.generation_of(self.live_id) != Some(self.app.generation()) {
+            return false;
+        }
+        self.app.store.audit(
+            &self.user.username,
+            "session.open",
+            &format!("{} ({} -> {addr})", target.name, target.host),
+        );
+        true
+    }
+
     /// The admission decision, under the import gate so it cannot straddle a database swap. The
     /// connection was registered before this, so a revocation at any later moment still reaches it.
     pub async fn admit(&self, target_id: &str, proxy_auth: &str) -> Result<Server, Refusal> {
@@ -206,16 +221,15 @@ impl Session<'_> {
             }
         };
 
+        if !self.record_open(&target, addr).await {
+            warn!(%peer, %subject, target = %target.name, detail = Refusal::Superseded.detail(), "refused");
+            return self.refuse(ws).await;
+        }
         // Name AND address, together, because they are the two halves of "which machine was this".
         info!(
             %peer, %subject, target = %target.name,
             host = %target.host, %addr, verify = ?self.app.target_tls.mode,
             "opening session"
-        );
-        self.app.store.audit(
-            subject,
-            "session.open",
-            &format!("{} ({} -> {addr})", target.name, target.host),
         );
 
         // 3. X.224, in the clear, exactly as the client sent it.
@@ -549,6 +563,26 @@ mod tests {
         let current = crate::live::Ended { generation: app.generation(), ..ended };
         record_end(&app, &current).await;
         assert_eq!(app.store.recent_ends(uid, 0).unwrap().len(), 1);
+    }
+
+    /// A session whose database an import replaced after admission records no opening in the new one.
+    #[tokio::test]
+    async fn a_session_opened_across_an_import_records_nothing_in_the_new_database() {
+        let app = test_app();
+        let (uid, cookie) = signed_in(&app, "jdoe");
+        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let server = app.store.server_by_id(s).unwrap().unwrap();
+        let user = app.store.user_by_id(uid).unwrap().unwrap();
+        let hash = hash_of(&cookie);
+        let (live_id, _ended) = app.live.register(uid, hash.clone(), app.generation());
+        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: Default::default() };
+        let addr: SocketAddr = "127.0.0.1:3389".parse().unwrap();
+        let opened = |app: &App| app.store.audit_list(50, None).unwrap().iter().filter(|r| r.action == "session.open").count();
+        assert!(session.record_open(&server, addr).await);
+        assert_eq!(opened(&app), 1);
+        app.bump_generation();
+        assert!(!session.record_open(&server, addr).await, "an opening was recorded across an import");
+        assert_eq!(opened(&app), 1);
     }
 
     /// A connection still setting up keeps its place under max_connections.
