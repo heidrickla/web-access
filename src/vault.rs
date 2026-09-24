@@ -244,6 +244,48 @@ pub fn check_strength(passphrase: &str) -> Result<()> {
     Ok(())
 }
 
+/// A local account's password as `argon2id$<salt hex>$<hash hex>`, the same Argon2id parameters as
+/// the recovery passphrase.
+pub fn hash_password(password: &str) -> Result<String> {
+    let mut salt = [0u8; SALT_LEN];
+    SystemRandom::new()
+        .fill(&mut salt)
+        .map_err(|_| VaultError::Protect("the OS random source failed".into()))?;
+    let hash = derive(password, &salt)?;
+    Ok(format!("argon2id${}${}", hex(&salt), hex(&hash)))
+}
+
+/// Compare in constant time. A malformed stored value never verifies.
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    let mut parts = stored.split('$');
+    let (Some("argon2id"), Some(salt), Some(want), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Some(salt), Some(want)) = (unhex(salt), unhex(want)) else {
+        return false;
+    };
+    match derive(password, &salt) {
+        Ok(got) => got.len() == want.len() && got.iter().zip(&want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0,
+        Err(_) => false,
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// Associated data binding a saved credential to one user and one server.
 pub fn credential_aad(sid: &str, server_id: i64) -> Vec<u8> {
     format!("credential\0{sid}\0{server_id}").into_bytes()
@@ -511,6 +553,18 @@ mod tests {
         // And the re-wrap persisted: a fresh open under the second host's key is unlocked.
         let third = vault_with(&store, [2; KEY_LEN]);
         assert!(third.is_unlocked());
+    }
+
+    #[test]
+    fn a_local_password_verifies_and_a_wrong_one_does_not() {
+        let stored = hash_password("dev account password").unwrap();
+        assert!(stored.starts_with("argon2id$"));
+        assert!(verify_password("dev account password", &stored));
+        assert!(!verify_password("dev account passworD", &stored));
+        assert!(!verify_password("", &stored));
+        assert_ne!(stored, hash_password("dev account password").unwrap(), "salted");
+        assert!(!verify_password("x", "argon2id$zz$00"));
+        assert!(!verify_password("x", "plain"));
     }
 
     #[test]

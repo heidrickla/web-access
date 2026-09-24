@@ -14,6 +14,7 @@ if [ ! -f fixtures.env ]; then
     echo "RECOVERY_PASS=Rec-$(openssl rand -hex 10)"
   } > fixtures.env
 fi
+grep -q '^LOCAL_PASS=' fixtures.env || echo "LOCAL_PASS=Loc-$(openssl rand -hex 10)" >> fixtures.env
 
 docker build -q -t wa-test-dc dc >/dev/null
 docker build -q -t wa-test-rdp rdp >/dev/null

@@ -119,7 +119,12 @@ fn server_tls(h: &Https) -> Result<rustls::ServerConfig, Box<dyn std::error::Err
 /// Periodic housekeeping: expired sessions go, and accounts the directory no longer allows lose
 /// their sessions and live RDP connections.
 async fn checks(app: Arc<App>) {
-    let every = Duration::from_secs(app.cfg.directory.check_interval_secs.max(30));
+    let interval = app
+        .cfg
+        .directory
+        .as_ref()
+        .map_or(600, |d| d.check_interval_secs);
+    let every = Duration::from_secs(interval.max(30));
     let mut tick = tokio::time::interval(every);
     loop {
         tick.tick().await;
@@ -137,18 +142,18 @@ async fn checks(app: Arc<App>) {
 /// Check every user holding a session against the directory. A directory that cannot be reached
 /// revokes nothing.
 pub async fn revocation_pass(app: &App) -> Result<usize, Box<dyn std::error::Error>> {
-    if !app.directory.has_service_account() {
+    let Some(directory) = app.lookup_directory() else {
         return Ok(0);
-    }
+    };
     let Some(password) = app.directory_password()? else {
         return Ok(0);
     };
-    let users = app.store.users_with_sessions(now())?;
+    let users = app.store.directory_users_with_sessions(now())?;
     if users.is_empty() {
         return Ok(0);
     }
     let names: Vec<String> = users.iter().map(|u| u.username.clone()).collect();
-    let found = app.directory.lookup_many(&password, &names).await?;
+    let found = directory.lookup_many(&password, &names).await?;
     let mut revoked = 0;
     for (user, (_, account)) in users.iter().zip(found) {
         let reason = match &account {

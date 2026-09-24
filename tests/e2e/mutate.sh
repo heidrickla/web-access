@@ -28,4 +28,7 @@ mutate "assignment predicate always true" src/store.rs 's/"SELECT 1 FROM assignm
 mutate "session expiry ignored" src/store.rs 's/WHERE s.token_hash = ?1 AND s.expires > ?2"/WHERE s.token_hash = ?1 AND ?2 = ?2"/' a_session_lasts_a_full_day_and_no_longer
 mutate "frozen host accepts saves" src/web.rs 's/        return Some("saving is paused while this proxy is being migrated");/        let _ = 0;/' a_frozen_proxy_refuses_saves
 mutate "import skips the passphrase check" src/migrate.rs 's/let db = vault::decrypt_with_passphrase(passphrase, AAD_EXPORT, blob)?;/let db = vault::decrypt_with_passphrase(passphrase, AAD_EXPORT, blob).unwrap_or_default();/' a_tampered_export_changes_nothing
+mutate "local accounts sign in when not allowed" src/web.rs 's/    if !app.cfg.allow_local_accounts {/    if false {/' a_local_account_cannot_sign_in_unless_allowed
+mutate "any local password verifies" src/web.rs 's/    if !ok {/    if false \&\& !ok {/' a_local_account_signs_in_with_no_directory_at_all
+mutate "the sweep checks local accounts against the directory" src/store.rs 's/WHERE u.local_hash IS NULL$/WHERE 1 = 1/' the_revocation_sweep_never_sees_local_accounts
 mutate "clearing the SID keeps saved credentials" src/store.rs 's/tx.execute("DELETE FROM credentials WHERE user_id = ?1", \[id\])?;//' clearing_the_sid_drops_credentials_and_sessions

@@ -12,6 +12,7 @@ from this tree, and headless Chromium driving the real pages. Linux host with Do
 | API | `./smoke.sh` | sign-in refusals, both username forms, service account, adding users, CSV import, assignments, recovery passphrase, tickets, non-admin and cross-origin refusals |
 | Browser 1 | `./run-e2e.sh e2e1` | sign-in page, grouped list, filter, collapsed state, connect and save, one-click reconnect, browser restart and reattach, forget, admin tabs, non-admin denial |
 | Browser 2 and 3 | `./phases23.sh` | disabling the account ends the live session and the sign-in; export and freeze, frozen refusals, import on a second proxy, the user still signed in with the saved credential after cutover |
+| Local accounts | `./smoke-local.sh` | a proxy with no directory (`proxy3.toml`): `local-account` on the command line, sign-in, admin, assignment, connect ticket |
 | Guards | `./mutate.sh` | breaks each guard in a scratch copy and expects its unit test to fail |
 
 xrdp is not an NLA server and the browser client does not send autologon, so the browser tests type

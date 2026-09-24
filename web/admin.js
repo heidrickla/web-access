@@ -129,6 +129,7 @@ function renderUsers() {
     if (q && !(u.username + ' ' + (u.display_name || '')).toLowerCase().includes(q)) continue;
     const name = el('td', {}, u.username);
     if (u.is_admin || u.bootstrap_admin) name.append(el('span', { class: 'tag good', text: 'admin' }));
+    if (u.local) name.append(el('span', { class: 'tag', text: 'local' }));
     if (u.sid_mismatch) name.append(el('span', { class: 'tag warn', text: 'check account' }));
     const tr = el('tr', { class: 'pick' + (u.id === selected ? ' selected' : ''), onclick: () => selectUser(u.id).catch(fail) },
       name,
@@ -165,9 +166,11 @@ async function selectUser(id) {
   $('ud-title').textContent = u.display_name ? `${u.display_name} (${u.username})` : u.username;
   const facts = $('ud-facts');
   facts.innerHTML = '';
-  const binding = u.sid_mismatch
-    ? 'a different account with this username tried to sign in; reset the binding only if the account was legitimately recreated'
-    : (u.sid_bound ? 'bound at first sign-in' : 'binds at first sign-in');
+  const binding = u.local
+    ? 'local account: signs in with a password kept on this proxy, not the directory'
+    : u.sid_mismatch
+      ? 'a different account with this username tried to sign in; reset the binding only if the account was legitimately recreated'
+      : (u.sid_bound ? 'bound at first sign-in' : 'binds at first sign-in');
   for (const [k, v] of [
     ['Added', when(u.created)],
     ['Last sign-in', when(u.last_login)],
@@ -178,7 +181,7 @@ async function selectUser(id) {
   $('ud-admin').checked = u.is_admin || u.bootstrap_admin;
   $('ud-admin').disabled = u.bootstrap_admin;
   $('ud-admin').title = u.bootstrap_admin ? 'An administrator by config.toml' : '';
-  $('ud-reset').hidden = !u.sid_bound && !u.sid_mismatch;
+  $('ud-reset').hidden = u.local || (!u.sid_bound && !u.sid_mismatch);
 
   const from = $('ud-copy-from');
   from.innerHTML = '';

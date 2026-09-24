@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// v2: local accounts. A user row with a password hash signs in against it, never the directory.
+const SCHEMA_V2: &str = "ALTER TABLE users ADD COLUMN local_hash TEXT;";
 
 const SCHEMA_V1: &str = "
 CREATE TABLE meta (
@@ -111,6 +114,8 @@ pub struct User {
     pub sid_mismatch: bool,
     pub created: i64,
     pub last_login: Option<i64>,
+    /// A local account: signs in against a hash in this database, not the directory.
+    pub local: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +224,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     if found < 1 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"))?;
     }
+    if found < 2 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"))?;
+    }
     Ok(())
 }
 
@@ -232,10 +240,11 @@ fn user_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         sid_mismatch: r.get::<_, i64>(5)? != 0,
         created: r.get(6)?,
         last_login: r.get(7)?,
+        local: r.get::<_, i64>(8)? != 0,
     })
 }
 
-const USER_COLS: &str = "u.id, u.username, u.display_name, u.sid, u.is_admin, u.sid_mismatch, u.created, u.last_login";
+const USER_COLS: &str = "u.id, u.username, u.display_name, u.sid, u.is_admin, u.sid_mismatch, u.created, u.last_login, u.local_hash IS NOT NULL";
 
 fn server_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Server> {
     Ok(Server {
@@ -347,8 +356,8 @@ impl Store {
             .query_map([], |r| {
                 Ok(UserRow {
                     user: user_from(r)?,
-                    server_count: r.get(8)?,
-                    saved_count: r.get(9)?,
+                    server_count: r.get(9)?,
+                    saved_count: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -381,6 +390,44 @@ impl Store {
             params![id, sid, display_name, now()],
         )?;
         Ok(())
+    }
+
+    /// Create a local account, or reset the password of an existing one. An existing directory
+    /// user of the same name is refused: the two would be indistinguishable at sign-in.
+    pub fn local_account_set(&self, username: &str, hash: &str, sid: &str) -> Result<i64> {
+        let c = self.c();
+        let existing: Option<(i64, bool)> = c
+            .query_row(
+                "SELECT id, local_hash IS NOT NULL FROM users WHERE username = ?1",
+                [username],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+        match existing {
+            Some((_, false)) => Err(StoreError::Conflict(format!(
+                "{username} is a directory user; choose another name for the local account"
+            ))),
+            Some((id, true)) => {
+                c.execute("UPDATE users SET local_hash = ?2 WHERE id = ?1", params![id, hash])?;
+                Ok(id)
+            }
+            None => {
+                c.execute(
+                    "INSERT INTO users (username, display_name, sid, created, local_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![username, format!("{username} (local)"), sid, now(), hash],
+                )?;
+                Ok(c.last_insert_rowid())
+            }
+        }
+    }
+
+    pub fn local_hash(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .c()
+            .query_row("SELECT local_hash FROM users WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .flatten())
     }
 
     pub fn user_flag_mismatch(&self, id: i64) -> Result<()> {
@@ -426,12 +473,14 @@ impl Store {
         Ok(())
     }
 
-    /// Users holding at least one unexpired session: the set the revocation sweep checks.
-    pub fn users_with_sessions(&self, at: i64) -> Result<Vec<User>> {
+    /// Directory users holding at least one unexpired session: the set the revocation sweep checks.
+    /// Local accounts are not in the directory, so they are never swept.
+    pub fn directory_users_with_sessions(&self, at: i64) -> Result<Vec<User>> {
         let c = self.c();
         let mut stmt = c.prepare(&format!(
             "SELECT {USER_COLS} FROM users u
-             WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.expires > ?1)"
+             WHERE u.local_hash IS NULL
+               AND EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.expires > ?1)"
         ))?;
         let rows = stmt
             .query_map([at], user_from)?
@@ -1127,6 +1176,45 @@ mod tests {
         let user = s.user_by_id(u).unwrap().unwrap();
         assert_eq!(user.sid.as_deref(), Some("S-1-5-21-1"));
         assert_eq!(user.display_name.as_deref(), Some("J Doe"));
+    }
+
+    #[test]
+    fn a_version_1_database_gains_local_accounts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;")).unwrap();
+        conn.execute(
+            "INSERT INTO users (username, created) VALUES ('jdoe', 1)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let local: i64 = conn
+            .query_row("SELECT local_hash IS NOT NULL FROM users WHERE username = 'jdoe'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(local, 0);
+    }
+
+    #[test]
+    fn a_local_account_is_created_reset_and_kept_apart_from_directory_users() {
+        let s = store();
+        let id = s.local_account_set("devtest", "h1", "local:1").unwrap();
+        assert!(s.user_by_id(id).unwrap().unwrap().local);
+        assert_eq!(s.local_account_set("devtest", "h2", "local:ignored").unwrap(), id);
+        assert_eq!(s.local_hash(id).unwrap().as_deref(), Some("h2"));
+        s.user_create("jdoe", None).unwrap();
+        assert!(matches!(s.local_account_set("jdoe", "h", "local:2"), Err(StoreError::Conflict(_))));
+    }
+
+    #[test]
+    fn the_revocation_sweep_never_sees_local_accounts() {
+        let s = store();
+        let local = s.local_account_set("devtest", "h", "local:1").unwrap();
+        let dir = s.user_create("jdoe", None).unwrap();
+        s.session_create(b"a", local, now() + 100).unwrap();
+        s.session_create(b"b", dir, now() + 100).unwrap();
+        let swept: Vec<i64> = s.directory_users_with_sessions(now()).unwrap().iter().map(|u| u.id).collect();
+        assert_eq!(swept, vec![dir]);
     }
 
     #[test]

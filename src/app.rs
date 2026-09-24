@@ -20,7 +20,8 @@ pub struct App {
     pub cfg: Config,
     pub store: Store,
     pub vault: Vault,
-    pub directory: Directory,
+    /// None when only local accounts sign in.
+    pub directory: Option<Directory>,
     pub tickets: Tickets,
     pub live: LiveSessions,
     pub target_tls: TlsSetup,
@@ -36,7 +37,7 @@ impl App {
         std::fs::create_dir_all(&data_dir)?;
         let store = Store::open(&cfg.database_path())?;
         let vault = Vault::load(&store, local_protector(&data_dir)?)?;
-        let directory = Directory::new(&cfg.directory)?;
+        let directory = cfg.directory.as_ref().map(Directory::new).transpose()?;
         let target_tls = tls_setup(&cfg.tls)?;
         let app = Self {
             secure_cookies: cfg.https.is_some(),
@@ -112,6 +113,11 @@ impl App {
 
     pub fn is_admin(&self, user: &crate::store::User) -> bool {
         user.is_admin || self.cfg.is_bootstrap_admin(&user.username)
+    }
+
+    /// The directory, when it has a service account for lookups.
+    pub fn lookup_directory(&self) -> Option<&Directory> {
+        self.directory.as_ref().filter(|d| d.has_service_account())
     }
 }
 
