@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring up the web-access test fixtures on buildbox: a Samba AD DC and an xrdp target.
+# Bring up the web-access test fixtures: a Samba AD DC and an xrdp target.
 # Fixture passwords are generated here, kept in fixtures.env (0600), and never printed.
 set -euo pipefail
 cd "$(dirname "$0")"
