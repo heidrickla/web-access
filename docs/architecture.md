@@ -149,6 +149,7 @@ request in flight, so nothing acknowledged is missing from it.
 | Exports run one at a time. One that fails, or whose archive is not delivered, lifts only a freeze it set, and only in the database it set it in | a failed export cannot undo another export's freeze |
 | A connection records the database generation it was admitted under. Its opening and its end are recorded only in that database | identities from a replaced database never land on another user's history |
 | A freeze an export set travels with its archive: an archive dropped before the response takes it lifts the freeze, and the next export waits until it has | a cancelled export leaves no freeze, whichever step it was cancelled at, and cannot take a later export's freeze with it |
+| A freeze an export set is marked pending in the database until the archive is handed over; a pending freeze found when the service starts is lifted. Command-line tools leave it alone | a stop, crash or power loss mid-export does not leave the proxy frozen, and a tool run during an export cannot lift its freeze |
 
 ### Connections
 

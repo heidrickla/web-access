@@ -5,7 +5,7 @@
 //! the master key for that host, and swaps the database in while running. Users, servers,
 //! assignments, saved credentials and sign-in sessions all carry over.
 
-use crate::app::{App, META_FROZEN};
+use crate::app::{App, META_FREEZE_PENDING, META_FROZEN};
 use crate::store::{now, Counts, Store, StoreError, SCHEMA_VERSION};
 use crate::vault::{self, Vault, VaultError};
 use ring::digest::{digest, SHA256};
@@ -283,6 +283,7 @@ pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
         }
         let key = app.vault.adopt(&staged, passphrase)?;
         staged.set_flag(META_FROZEN, false)?;
+        staged.set_flag(META_FREEZE_PENDING, false)?;
         (key, staged.counts()?)
     };
 
