@@ -74,6 +74,7 @@ async fn users(State(app): State<Shared>, _: AdminUser) -> ApiResult<Json<Value>
                 "bootstrap_admin": app.cfg.is_bootstrap_admin(&u.username),
                 "sid_bound": u.sid.is_some(),
                 "sid_mismatch": u.sid_mismatch,
+                "local": u.local,
                 "created": u.created,
                 "last_login": u.last_login,
                 "servers": r.server_count,
@@ -101,9 +102,9 @@ async fn add_user(
     // not block the add; the result says whether it was checked.
     let mut verified = false;
     let mut display_name = None;
-    if app.directory.has_service_account() {
+    if let Some(directory) = app.lookup_directory() {
         if let Ok(Some(pw)) = app.directory_password() {
-            match app.directory.lookup_many(&pw, &[username.clone()]).await {
+            match directory.lookup_many(&pw, &[username.clone()]).await {
                 Ok(found) => match found.into_iter().next().and_then(|(_, a)| a) {
                     Some(account) => {
                         verified = true;
@@ -583,9 +584,10 @@ async fn migration_status(State(app): State<Shared>, _: AdminUser) -> ApiResult<
         "counts": counts,
         "live_sessions": app.live.count(),
         "directory": {
-            "service_account": app.cfg.directory.service_account,
+            "service_account": app.cfg.service_account(),
             "password_set": app.directory_password_set(),
         },
+        "local_accounts": app.cfg.allow_local_accounts,
     })))
 }
 
@@ -741,18 +743,15 @@ async fn set_directory_password(
     Json(req): Json<PasswordForm>,
 ) -> ApiResult<Json<Value>> {
     not_frozen(&app)?;
-    let account = app
-        .cfg
-        .directory
-        .service_account
-        .clone()
-        .ok_or_else(|| ApiError::bad_request("no service_account is configured in config.toml"))?;
+    let (Some(account), Some(directory)) = (app.cfg.service_account(), app.lookup_directory()) else {
+        return Err(ApiError::bad_request("no service_account is configured in config.toml"));
+    };
     if req.password.is_empty() {
         return Err(ApiError::bad_request("enter the service account's password"));
     }
     // Checked before it is kept: a wrong password would silently disable every lookup.
-    let probe = normalize_username(&account).unwrap_or_default();
-    let verified = match app.directory.lookup_many(&req.password, &[probe]).await {
+    let probe = normalize_username(account).unwrap_or_default();
+    let verified = match directory.lookup_many(&req.password, &[probe]).await {
         Ok(_) => true,
         Err(crate::directory::DirError::Config(m)) => return Err(ApiError::bad_request(m)),
         Err(e) => {

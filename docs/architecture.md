@@ -79,6 +79,7 @@ The proxy never decodes RDP. It decides who may reach which server, and relays.
 | PASS-THROUGH, unless the user saves: the user's own credentials go to the server; a user may save them on the proxy, per server | settled (Lewis, 2026-09-23). Saving reverses pass-through for that user and server only |
 | SIGN-IN: Active Directory over LDAPS, a simple bind as the user; the proxy host is not domain-joined | settled (Lewis, 2026-09-23) |
 | Sign in as the logged-on Windows user | roadmap: Kerberos via an SPN and keytab, accepted with `sspi` |
+| LOCAL ACCOUNTS for testing: an Argon2id hash in the database, created on the command line, signing in only with `allow_local_accounts = true`; the directory section becomes optional | settled (Lewis, 2026-09-24) |
 | WHERE SAVED CREDENTIALS LIVE: a proxy-side encrypted store, per user and per server | settled (Lewis, 2026-09-23). See below |
 | SERVER LISTS: maintained by hand on the proxy, per user; IT revokes access by disabling the account | settled (Lewis, 2026-09-23) |
 | Sign-in lasts 24 hours and survives a browser restart | settled: shifts run 9 to 18 hours (Lewis, 2026-09-23) |

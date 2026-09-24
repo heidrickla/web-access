@@ -80,6 +80,20 @@ night's export restores a host.
     web-access-proxy.exe import config.toml in.zip [--replace]     apply an export, service stopped
     web-access-proxy.exe set-secret recovery config.toml           set or change the recovery passphrase
     web-access-proxy.exe set-secret directory config.toml          set the service account's password
+    web-access-proxy.exe local-account config.toml <name> [--admin]   create a local account, or reset its password
+
+## Local accounts
+
+For testing, and for a proxy with no directory to reach. A local account signs in with a password
+kept on the proxy (Argon2id hash), never checked against Active Directory, and only while the config
+has `allow_local_accounts = true`. Create one from an elevated prompt on the proxy host:
+
+    web-access-proxy.exe local-account C:\ProgramData\web-access\config.toml devtest --admin
+
+With `allow_local_accounts = true`, the `[directory]` section may be left out entirely; then only
+local accounts can sign in. A local account cannot share a name with a directory user. The Users tab
+marks local accounts, and removing one there deletes it. The directory's periodic account check
+skips them.
 
 ## Configuration
 
@@ -92,7 +106,8 @@ night's export restores a host.
 | `data_dir` | database location; defaults to the directory holding the config |
 | `[https]` | PEM certificate chain and key |
 | `[tls]` | how RDP servers' certificates are checked: `verify = "ca"` with `ca_bundle`, or `"insecure"`. No default |
-| `[directory]` | `domain`, optional `netbios`, `urls` (ldaps only), `ca_bundle`, optional `service_account` and `check_interval_secs` |
+| `[directory]` | `domain`, optional `netbios`, `urls` (ldaps only), `ca_bundle`, optional `service_account` and `check_interval_secs`. Optional when local accounts are allowed |
+| `allow_local_accounts` | let local accounts sign in; default false |
 
 ## Build
 

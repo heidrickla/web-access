@@ -6,6 +6,8 @@
 //!     web-access-proxy import <config.toml> <in.zip> [--replace]   apply an export; service stopped
 //!     web-access-proxy set-secret recovery <config.toml>      set or change the recovery passphrase
 //!     web-access-proxy set-secret directory <config.toml>     set the service account's password
+//!     web-access-proxy local-account <config.toml> <name> [--admin]   create a local account, or
+//!                                                             reset its password
 
 mod admin;
 mod app;
@@ -85,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("export") => cli::export(&args[1..]),
             Some("import") => cli::import(&args[1..]),
             Some("set-secret") => cli::set_secret(&args[1..]).await,
+            Some("local-account") => cli::local_account(&args[1..]),
             _ => {
                 let config_path = config_path_from_args();
                 server::run(&config_path, async {
@@ -181,20 +184,47 @@ mod cli {
                 println!("recovery passphrase set; keep it with the proxy's documentation");
             }
             Some("directory") => {
-                let account = app
-                    .cfg
-                    .directory
-                    .service_account
-                    .clone()
-                    .ok_or("no service_account is configured in config.toml")?;
+                let (Some(account), Some(directory)) =
+                    (app.cfg.service_account(), app.lookup_directory())
+                else {
+                    return Err("no service_account is configured in config.toml".into());
+                };
                 let pass = prompt::secret(&format!("Password for {account}: "))?;
-                let probe = crate::directory::normalize_username(&account).unwrap_or_default();
-                app.directory.lookup_many(&pass, &[probe]).await?;
+                let probe = crate::directory::normalize_username(account).unwrap_or_default();
+                directory.lookup_many(&pass, &[probe]).await?;
                 app.set_directory_password(&pass)?;
                 app.store.audit("console", "directory.password", "");
                 println!("service account password verified and stored");
             }
             _ => return Err("usage: set-secret recovery|directory <config.toml>".into()),
+        }
+        Ok(())
+    }
+
+    /// A local account signs in against a hash in the database, never the directory. For testing, and
+    /// for a proxy with no directory at all.
+    pub fn local_account(args: &[String]) -> Result {
+        let app = app(args.first())?;
+        let name = args
+            .get(1)
+            .filter(|a| !a.starts_with("--"))
+            .ok_or("usage: local-account <config.toml> <name> [--admin]")?;
+        let username = crate::directory::normalize_username(name).ok_or("that is not a valid username")?;
+        let password = prompt::secret(&format!("Password for {username} (12 characters or more): "))?;
+        crate::vault::check_strength(&password).map_err(|e| e.to_string())?;
+        if prompt::secret("Repeat it: ")? != password {
+            return Err("the two entries differ".into());
+        }
+        let hash = crate::vault::hash_password(&password)?;
+        let sid = format!("local:{}", &crate::auth::random_token()[..32]);
+        let id = app.store.local_account_set(&username, &hash, &sid)?;
+        if args.iter().any(|a| a == "--admin") {
+            app.store.user_set_admin(id, true)?;
+        }
+        app.store.audit("console", "local-account.set", &username);
+        println!("local account {username} is ready");
+        if !app.cfg.allow_local_accounts {
+            println!("it cannot sign in until config.toml has allow_local_accounts = true");
         }
         Ok(())
     }

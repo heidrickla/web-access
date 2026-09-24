@@ -1,0 +1,6 @@
+listen = "127.0.0.1:8445"
+data_dir = "data3"
+allow_local_accounts = true
+
+[tls]
+verify = "insecure"

@@ -2,10 +2,13 @@ fixtures.env
 dc-ca.pem
 data1/
 data2/
+data3/
 log1
 log2
+log3
 pid1
 pid2
+pid3
 *.jar
 ids.env
 shots/

@@ -8,6 +8,10 @@ listen = "0.0.0.0:443"
 # Accounts that are always administrators. Sign in as one of these to reach the admin pages.
 admins = ["jdoe"]
 
+# Local accounts, created with `web-access-proxy.exe local-account`, sign in with a password kept on
+# this proxy instead of the directory. With this on, [directory] may be left out entirely.
+# allow_local_accounts = true
+
 # Where the database lives. Defaults to the directory holding this file.
 # data_dir = 'C:\ProgramData\web-access'
 

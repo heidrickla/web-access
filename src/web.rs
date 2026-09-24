@@ -287,20 +287,69 @@ fn me_of(app: &App, user: &User) -> Me {
     }
 }
 
+const REFUSED: &str = "the username or password is not correct, or the account cannot sign in";
+
+fn refused(app: &App, username: &str, why: &str) -> ApiError {
+    app.store.audit(username, "signin.refused", why);
+    ApiError::new(StatusCode::UNAUTHORIZED, REFUSED)
+}
+
 async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiResult<Response> {
     let username = normalize_username(&req.username)
         .ok_or_else(|| ApiError::bad_request("enter your username"))?;
     if req.password.len() > 1024 {
         return Err(ApiError::bad_request("that password is too long"));
     }
-    let account = match app.directory.authenticate(&username, &req.password).await {
+    // A local account never reaches the directory, and a directory user never reaches a hash.
+    let user = match app.store.user_by_name(&username)?.filter(|u| u.local) {
+        Some(local) => local_sign_in(&app, local, &req.password).await?,
+        None => directory_sign_in(&app, &username, &req.password).await?,
+    };
+
+    let token = auth::random_token();
+    let expires = now() + auth::SESSION_TTL.as_secs() as i64;
+    app.store
+        .session_create(&auth::token_hash(&token), user.id, expires)?;
+    let _ = app.store.sessions_purge(now());
+    app.store.audit(&user.username, "signin", if user.local { "local account" } else { "" });
+
+    let user = app.store.user_by_id(user.id)?.ok_or_else(ApiError::not_found)?;
+    Ok((
+        [(header::SET_COOKIE, auth::session_cookie(&token, app.secure_cookies))],
+        Json(me_of(&app, &user)),
+    )
+        .into_response())
+}
+
+async fn local_sign_in(app: &App, user: User, password: &str) -> ApiResult<User> {
+    if !app.cfg.allow_local_accounts {
+        return Err(refused(app, &user.username, "local accounts are not allowed by config.toml"));
+    }
+    let stored = app.store.local_hash(user.id)?.unwrap_or_default();
+    let candidate = password.to_owned();
+    let ok = tokio::task::spawn_blocking(move || crate::vault::verify_password(&candidate, &stored))
+        .await
+        .map_err(ApiError::internal)?;
+    if !ok {
+        return Err(refused(app, &user.username, "local password did not match"));
+    }
+    // Saved credentials are bound to a SID; a local account gets a synthetic one.
+    let sid = user
+        .sid
+        .clone()
+        .unwrap_or_else(|| format!("local:{}", &auth::random_token()[..32]));
+    app.store.user_record_login(user.id, &sid, None)?;
+    Ok(user)
+}
+
+async fn directory_sign_in(app: &App, username: &str, password: &str) -> ApiResult<User> {
+    let Some(directory) = &app.directory else {
+        return Err(refused(app, username, "no directory is configured"));
+    };
+    let account = match directory.authenticate(username, password).await {
         Ok(a) => a,
         Err(DirError::InvalidCredentials) => {
-            app.store.audit(&username, "signin.refused", "directory refused the credentials");
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "the username or password is not correct, or the account cannot sign in",
-            ));
+            return Err(refused(app, username, "directory refused the credentials"));
         }
         Err(e) => {
             tracing::warn!(%username, error = %e, "sign-in could not reach a decision");
@@ -334,20 +383,7 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
     }
     app.store
         .user_record_login(user.id, &account.sid, account.display_name.as_deref())?;
-
-    let token = auth::random_token();
-    let expires = now() + auth::SESSION_TTL.as_secs() as i64;
-    app.store
-        .session_create(&auth::token_hash(&token), user.id, expires)?;
-    let _ = app.store.sessions_purge(now());
-    app.store.audit(&user.username, "signin", "");
-
-    let user = app.store.user_by_id(user.id)?.ok_or_else(ApiError::not_found)?;
-    Ok((
-        [(header::SET_COOKIE, auth::session_cookie(&token, app.secure_cookies))],
-        Json(me_of(&app, &user)),
-    )
-        .into_response())
+    Ok(user)
 }
 
 async fn logout(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Response> {
@@ -604,25 +640,30 @@ pub mod tests {
 
     /// As `test_app`, with this host's local key and name, to stand in for two different hosts.
     pub fn test_app_keyed(key: [u8; 32], host: &str) -> Shared {
+        build(key, host, "", true)
+    }
+
+    /// Local accounts allowed or not, with or without a directory.
+    pub fn test_app_local(allow: bool, with_directory: bool) -> Shared {
+        build([9; 32], "testhost", &format!("allow_local_accounts = {allow}\n"), with_directory)
+    }
+
+    fn build(key: [u8; 32], host: &str, top: &str, with_directory: bool) -> Shared {
         let dir = std::env::temp_dir().join(format!("web-access-test-{}", &auth::random_token()[..12]));
         std::fs::create_dir_all(&dir).unwrap();
+        let directory_section = if with_directory {
+            "[directory]\ndomain = \"corp.example.com\"\nurls = [\"ldaps://dc.corp.example.com\"]\n"
+        } else {
+            ""
+        };
         let text = format!(
-            r#"
-listen = "127.0.0.1:0"
-data_dir = {:?}
-admins = ["boss"]
-[tls]
-verify = "insecure"
-[directory]
-domain = "corp.example.com"
-urls = ["ldaps://dc.corp.example.com"]
-"#,
+            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nadmins = [\"boss\"]\n{top}[tls]\nverify = \"insecure\"\n{directory_section}",
             dir.to_string_lossy()
         );
         let cfg = Config::parse("test", &text).unwrap();
         let store = crate::store::Store::open(&cfg.database_path()).unwrap();
         let vault = Vault::load(&store, Box::new(KeyFile::from_key(key))).unwrap();
-        let directory = Directory::unconnected(&cfg.directory);
+        let directory = cfg.directory.as_ref().map(Directory::unconnected);
         let target_tls = crate::proxy::tls_setup(&cfg.tls).unwrap();
         Arc::new(App {
             secure_cookies: false,
@@ -792,6 +833,64 @@ urls = ["ldaps://dc.corp.example.com"]
         app.store.session_create(b"h", uid, start + ttl).unwrap();
         assert!(app.store.session_user(b"h", start + ttl - 60).unwrap().is_some(), "23h59m");
         assert!(app.store.session_user(b"h", start + ttl).unwrap().is_none(), "24h");
+    }
+
+    async fn login_as(app: &Shared, username: &str, password: &str) -> (StatusCode, Option<String>) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header(header::HOST, "proxy.test")
+            .header(header::ORIGIN, "https://proxy.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"username": username, "password": password}).to_string()))
+            .unwrap();
+        let res = router(Arc::clone(app)).oneshot(req).await.unwrap();
+        let cookie = res
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(str::to_owned);
+        (res.status(), cookie)
+    }
+
+    fn local_account(app: &App, name: &str, password: &str) -> i64 {
+        let hash = crate::vault::hash_password(password).unwrap();
+        app.store.local_account_set(name, &hash, "local:test").unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_local_account_signs_in_with_no_directory_at_all() {
+        let app = test_app_local(true, false);
+        local_account(&app, "devtest", "a dev test password");
+        let (s, cookie) = login_as(&app, "devtest", "a dev test password").await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, me) = call(&app, "GET", "/api/me", cookie.as_deref(), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(me["username"], "devtest");
+        let (s, _) = login_as(&app, "devtest", "not the password").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        // Without a directory, any other name is refused rather than tried anywhere.
+        let (s, _) = login_as(&app, "jdoe", "whatever it is").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_local_account_cannot_sign_in_unless_allowed() {
+        let app = test_app_local(false, true);
+        local_account(&app, "devtest", "a dev test password");
+        let (s, cookie) = login_as(&app, "devtest", "a dev test password").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert!(cookie.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_local_account_named_as_a_bootstrap_admin_reaches_the_admin_pages() {
+        let app = test_app_local(true, false);
+        local_account(&app, "boss", "a dev test password");
+        let (_, cookie) = login_as(&app, "boss", "a dev test password").await;
+        let (s, _) = call(&app, "GET", "/api/admin/users", cookie.as_deref(), None).await;
+        assert_eq!(s, StatusCode::OK);
     }
 
     #[tokio::test]

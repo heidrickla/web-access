@@ -16,10 +16,16 @@ pub struct Config {
     pub https: Option<Https>,
     /// How the proxy validates RDP targets' certificates.
     pub tls: Tls,
-    pub directory: DirectoryConfig,
+    /// Active Directory sign-in. Optional when local accounts are allowed.
+    #[serde(default)]
+    pub directory: Option<DirectoryConfig>,
     /// Accounts that are always administrators, so the management plane cannot lock itself out.
     #[serde(default)]
     pub admins: Vec<String>,
+    /// Let accounts created with `local-account` sign in. They are checked against a hash in the
+    /// database, never against the directory.
+    #[serde(default)]
+    pub allow_local_accounts: bool,
     /// Holds the database and, off Windows, the local key file. Defaults to the directory holding
     /// the config file.
     #[serde(default)]
@@ -160,7 +166,14 @@ impl Config {
         if self.tls.verify == VerifyMode::Ca && self.tls.ca_bundle.is_none() {
             return Err(ConfigError::MissingCaBundle);
         }
-        let d = &self.directory;
+        let Some(d) = &self.directory else {
+            if self.allow_local_accounts {
+                return Ok(());
+            }
+            return Err(ConfigError::Directory(
+                "nobody could sign in: add a [directory] section, or allow_local_accounts = true".into(),
+            ));
+        };
         if d.domain.trim().is_empty() || !d.domain.contains('.') {
             return Err(ConfigError::Directory(
                 "domain must be a DNS domain such as corp.example.com".into(),
@@ -175,6 +188,11 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// The service account, if a directory with one is configured.
+    pub fn service_account(&self) -> Option<&str> {
+        self.directory.as_ref()?.service_account.as_deref()
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -213,7 +231,8 @@ urls = ["ldaps://dc1.corp.example.com"]
     fn a_minimal_config_parses() {
         let c = Config::parse("t", GOOD).unwrap();
         assert!(c.https.is_none());
-        assert_eq!(c.directory.timeout_secs, 10);
+        assert_eq!(c.directory.as_ref().unwrap().timeout_secs, 10);
+        assert!(!c.allow_local_accounts);
         assert!(c.is_bootstrap_admin("jdoe"));
         assert!(!c.is_bootstrap_admin("someone"));
     }
@@ -230,7 +249,27 @@ urls = ["ldaps://dc1.corp.example.com"]
     fn the_shipped_example_parses() {
         let c = Config::parse("config.toml", include_str!("../config.example.toml")).unwrap();
         assert!(c.https.is_some());
-        assert_eq!(c.directory.urls.len(), 2);
+        assert_eq!(c.directory.as_ref().unwrap().urls.len(), 2);
+    }
+
+    const LOCAL_ONLY: &str = r#"
+listen = "0.0.0.0:443"
+allow_local_accounts = true
+[tls]
+verify = "insecure"
+"#;
+
+    #[test]
+    fn local_accounts_alone_need_no_directory() {
+        let c = Config::parse("t", LOCAL_ONLY).unwrap();
+        assert!(c.directory.is_none());
+        assert!(c.service_account().is_none());
+    }
+
+    #[test]
+    fn a_config_nobody_can_sign_in_with_is_refused() {
+        let text = LOCAL_ONLY.replace("allow_local_accounts = true\n", "");
+        assert!(matches!(Config::parse("t", &text), Err(ConfigError::Directory(_))));
     }
 
     #[test]
