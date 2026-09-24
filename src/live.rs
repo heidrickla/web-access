@@ -16,6 +16,8 @@ struct Live {
     server_id: Option<i64>,
     /// True once bytes flow to the server.
     established: bool,
+    /// The database generation the connection's identities came from.
+    generation: u64,
     cancel: Option<oneshot::Sender<()>>,
 }
 
@@ -25,6 +27,7 @@ pub struct Ended {
     pub user_id: i64,
     pub server_id: Option<i64>,
     pub established: bool,
+    pub generation: u64,
 }
 
 #[derive(Default)]
@@ -39,7 +42,12 @@ impl LiveSessions {
     }
 
     /// Register a connection at upgrade. The receiver fires when it must end.
-    pub fn register(&self, user_id: i64, token_hash: Vec<u8>) -> (u64, oneshot::Receiver<()>) {
+    pub fn register(
+        &self,
+        user_id: i64,
+        token_hash: Vec<u8>,
+        generation: u64,
+    ) -> (u64, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.lock().insert(
@@ -49,10 +57,15 @@ impl LiveSessions {
                 token_hash,
                 server_id: None,
                 established: false,
+                generation,
                 cancel: Some(tx),
             },
         );
         (id, rx)
+    }
+
+    pub fn generation_of(&self, id: u64) -> Option<u64> {
+        self.lock().get(&id).map(|l| l.generation)
     }
 
     pub fn set_server(&self, id: u64, server_id: i64) {
@@ -72,6 +85,7 @@ impl LiveSessions {
             user_id: l.user_id,
             server_id: l.server_id,
             established: l.established,
+            generation: l.generation,
         })
     }
 
@@ -153,16 +167,47 @@ impl LiveSessions {
     }
 }
 
+/// Removes a connection's entry however its task ends, a panic included.
+pub struct LiveGuard {
+    app: std::sync::Arc<crate::app::App>,
+    id: u64,
+}
+
+impl LiveGuard {
+    pub fn new(app: std::sync::Arc<crate::app::App>, id: u64) -> Self {
+        Self { app, id }
+    }
+}
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.app.live.remove(self.id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_panicking_session_task_leaves_no_entry() {
+        let app = crate::web::tests::test_app();
+        let (id, _rx) = app.live.register(1, b"s".to_vec(), 0);
+        let guard = LiveGuard::new(std::sync::Arc::clone(&app), id);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("a session task failing hard");
+        });
+        assert!(task.await.is_err());
+        assert_eq!(app.live.count(), 0);
+    }
+
     #[test]
     fn ending_a_user_signals_only_their_connections_including_pending_ones() {
         let live = LiveSessions::default();
-        let (a, mut ra) = live.register(1, b"s1".to_vec());
-        let (_, mut rb) = live.register(1, b"s1".to_vec()); // still setting up: no server yet
-        let (_, mut rc) = live.register(2, b"s2".to_vec());
+        let (a, mut ra) = live.register(1, b"s1".to_vec(), 0);
+        let (_, mut rb) = live.register(1, b"s1".to_vec(), 0); // still setting up: no server yet
+        let (_, mut rc) = live.register(2, b"s2".to_vec(), 0);
         live.set_server(a, 10);
         live.set_established(a);
         assert_eq!(live.end_user(1), 2);
@@ -174,8 +219,8 @@ mod tests {
     #[test]
     fn signing_out_ends_only_that_sessions_connections() {
         let live = LiveSessions::default();
-        let (_, mut r1) = live.register(1, b"phone".to_vec());
-        let (_, mut r2) = live.register(1, b"desk".to_vec());
+        let (_, mut r1) = live.register(1, b"phone".to_vec(), 0);
+        let (_, mut r2) = live.register(1, b"desk".to_vec(), 0);
         assert_eq!(live.end_session(b"phone"), 1);
         assert!(r1.try_recv().is_ok());
         assert!(r2.try_recv().is_err());
@@ -184,14 +229,14 @@ mod tests {
     #[test]
     fn only_established_sessions_count_as_connected() {
         let live = LiveSessions::default();
-        let (a, _ra) = live.register(1, b"s".to_vec());
+        let (a, _ra) = live.register(1, b"s".to_vec(), 0);
         live.set_server(a, 10);
         assert!(live.servers_for(1).is_empty());
         live.set_established(a);
         assert_eq!(live.servers_for(1), HashSet::from([10]));
         assert_eq!(
             live.remove(a),
-            Some(Ended { user_id: 1, server_id: Some(10), established: true })
+            Some(Ended { user_id: 1, server_id: Some(10), established: true, generation: 0 })
         );
         assert_eq!(live.count(), 0);
     }
@@ -199,8 +244,8 @@ mod tests {
     #[test]
     fn removing_an_assignment_ends_connections_to_that_server_only() {
         let live = LiveSessions::default();
-        let (a, mut ra) = live.register(1, b"s".to_vec());
-        let (b, mut rb) = live.register(1, b"s".to_vec());
+        let (a, mut ra) = live.register(1, b"s".to_vec(), 0);
+        let (b, mut rb) = live.register(1, b"s".to_vec(), 0);
         live.set_server(a, 10);
         live.set_server(b, 11);
         assert_eq!(live.end_user_server(1, 10), 1);

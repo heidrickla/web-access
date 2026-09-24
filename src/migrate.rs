@@ -120,18 +120,19 @@ pub fn utc_stamp(secs: i64) -> String {
     format!("{y:04}{m:02}{d:02}T{h:02}{mi:02}{s:02}Z")
 }
 
-/// Snapshot, encrypt and package. The passphrase must open this database's recovery wrap, so an
-/// export cannot be made under a passphrase nobody can later import with.
+/// Snapshot, encrypt and package.
 pub fn export(app: &App, passphrase: &str) -> Result<Export> {
-    Vault::verify_recovery(&app.store, passphrase)?;
-    let (db, counts) = snapshot(app)?;
+    let (db, counts) = snapshot_verified(app, passphrase)?;
     package(app, passphrase, &db, counts)
 }
 
-/// A consistent copy of the whole database, and what it holds.
-pub fn snapshot(app: &App) -> Result<(Vec<u8>, Counts)> {
+/// A consistent copy of the whole database, and what it holds. The passphrase must open the
+/// recovery wrap IN THE COPY, the one the import will use, so a passphrase changed since it was
+/// last checked cannot produce an export nobody can import.
+pub fn snapshot_verified(app: &App, passphrase: &str) -> Result<(Vec<u8>, Counts)> {
     let tmp = TempFile(temp_path(&app.cfg.data_dir(), "export"));
     let counts = app.store.snapshot_to(&tmp.0)?;
+    Vault::verify_recovery(&Store::open(&tmp.0)?, passphrase)?;
     let db = std::fs::read(&tmp.0)?;
     Ok((db, counts))
 }
@@ -289,6 +290,7 @@ pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
     app.store.snapshot_to(&backup)?;
     app.store.replace_with(&staged_path)?;
     std::mem::forget(guard); // renamed into place; nothing left to remove
+    app.bump_generation();
     app.vault.install(key);
     app.tickets.clear();
     // Connections were admitted against identities the imported database may give to someone else.
@@ -396,6 +398,18 @@ mod tests {
         assert_eq!(v["credential"]["password"], "p@ss");
         // The staged upload is gone once used.
         assert!(matches!(confirm(&new, &upload, PASS, None), Err(MigrateError::Expired)));
+    }
+
+    /// The passphrase is checked against the recovery wrap inside the snapshot, the one an import
+    /// will need, not against whatever the live database held when the export was asked for.
+    #[tokio::test]
+    async fn an_export_is_checked_against_the_wrap_in_its_own_snapshot() {
+        let app = test_app_keyed([1; 32], "oldhost");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        app.vault.set_recovery(&app.store, Some(PASS), "a changed recovery phrase").unwrap();
+        assert!(matches!(snapshot_verified(&app, PASS), Err(MigrateError::WrongPassphrase)));
+        let (db, _) = snapshot_verified(&app, "a changed recovery phrase").unwrap();
+        assert!(!db.is_empty());
     }
 
     #[tokio::test]

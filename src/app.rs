@@ -9,7 +9,11 @@ use crate::proxy::{tls_setup, TlsSetup};
 use crate::store::{ImportRow, Store};
 use crate::vault::{local_protector, Vault, VaultError};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Password hashes computed at once. Each Argon2 run holds 64 MiB.
+pub const HASH_PERMITS: usize = 4;
 
 const META_DIRECTORY_PASSWORD: &str = "directory_password";
 const AAD_DIRECTORY_PASSWORD: &[u8] = b"directory service password";
@@ -29,9 +33,18 @@ pub struct App {
     pub secure_cookies: bool,
     pub host_name: String,
     pub imports: Mutex<HashMap<String, PendingImport>>,
-    /// Requests hold it shared; an import, and an export that freezes, hold it exclusively. So no
-    /// request straddles a database swap, and no edit lands between a freeze and its snapshot.
+    /// Requests hold it shared; an import, and an export, hold it exclusively. So no request
+    /// straddles a database swap, and no edit lands between a freeze and its snapshot.
     pub gate: tokio::sync::RwLock<()>,
+    /// Bumped by every import. Work that read the database, left the gate for something slow, and
+    /// came back checks it before acting on what it read.
+    generation: AtomicU64,
+    /// Bounds concurrent password hashing, whatever the connection count.
+    pub hash_permits: Arc<tokio::sync::Semaphore>,
+    /// One export at a time, so a failed export can only undo a freeze it set itself.
+    pub export_lock: tokio::sync::Mutex<()>,
+    /// Failed local-account sign-ins, per username.
+    pub throttle: crate::auth::Throttle,
 }
 
 impl App {
@@ -42,9 +55,24 @@ impl App {
         let vault = Vault::load(&store, local_protector(&data_dir)?)?;
         let directory = cfg.directory.as_ref().map(Directory::new).transpose()?;
         let target_tls = tls_setup(&cfg.tls)?;
-        let app = Self {
-            secure_cookies: cfg.https.is_some(),
-            host_name: host_name(),
+        let secure = cfg.https.is_some();
+        let app = Self::from_parts(cfg, store, vault, directory, target_tls, host_name(), secure);
+        app.seed_from_config()?;
+        Ok(app)
+    }
+
+    pub fn from_parts(
+        cfg: Config,
+        store: Store,
+        vault: Vault,
+        directory: Option<Directory>,
+        target_tls: TlsSetup,
+        host_name: String,
+        secure_cookies: bool,
+    ) -> Self {
+        Self {
+            secure_cookies,
+            host_name,
             cfg,
             store,
             vault,
@@ -54,9 +82,20 @@ impl App {
             target_tls,
             imports: Mutex::new(HashMap::new()),
             gate: tokio::sync::RwLock::new(()),
-        };
-        app.seed_from_config()?;
-        Ok(app)
+            generation: AtomicU64::new(0),
+            hash_permits: Arc::new(tokio::sync::Semaphore::new(HASH_PERMITS)),
+            export_lock: tokio::sync::Mutex::new(()),
+            throttle: crate::auth::Throttle::default(),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Called by an import, under the exclusive gate, once the new database is in place.
+    pub fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// `[[target]]` entries become servers in an "Imported" group, once, into an empty database.

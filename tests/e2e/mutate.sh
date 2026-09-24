@@ -35,7 +35,7 @@ mutate() { # name file sed-expr test-filter
   mv "$2.orig" "$2"
 }
 
-mutate "admin guard admits everyone" src/web.rs 's/if app.is_admin(&current.user) {/if true {/' a_non_admin_is_refused_on_every_admin_route
+mutate "admin guard admits everyone" src/web.rs 's/    if app.is_admin(&user) {/    if true {/' a_non_admin_is_refused_on_every_admin_route
 mutate "origin guard admits any origin" src/web.rs 's/if safe || same_origin(req.headers()) {/if true {/' a_cross_origin_post_is_refused
 mutate "tickets are reusable" src/auth.rs 's/\.remove(token)?;/.get(token).map(|i| Issued { ticket: i.ticket, minted: i.minted })?;/' a_ticket_is_spent_by_its_first_use
 mutate "credential AAD ignores the server" src/vault.rs 's/format!("credential\\0{sid}\\0{server_id}")/format!("credential\\0{sid}")/' a_credential_round_trips_and_is_bound_to_its_user_and_server
@@ -55,8 +55,28 @@ mutate "no TLS handshake deadline" src/server.rs 's/tokio::time::timeout(limits.
 mutate "no connection limit" src/server.rs 's/Semaphore::new(limits.max_connections)/Semaphore::new(1 << 20)/' connections_over_the_limit_are_closed_on_accept
 mutate "import without the exclusive gate" src/admin.rs '/pub async fn import_exclusive/,/^}/ s/let _exclusive = app.gate.write().await;//' an_import_waits_for_requests_in_flight_and_ends_every_connection
 mutate "import keeps connections" src/migrate.rs 's/    app.live.end_all();//' an_import_waits_for_requests_in_flight_and_ends_every_connection
-mutate "freezing export without the exclusive gate" src/admin.rs '/if req.freeze {$/,/take_snapshot/ s/let _exclusive = app.gate.write().await;//' a_freezing_export_waits_for_edits_in_flight_and_a_wrong_passphrase_freezes_nothing
+mutate "freezing export without the exclusive gate" src/admin.rs '/= if freeze {$/,/snapshot_of/ s/let _exclusive = app.gate.write().await;//' a_freezing_export_waits_for_edits_in_flight_and_a_wrong_passphrase_freezes_nothing
 mutate "the gate is held while the body arrives" src/web.rs 's/    let (parts, body) = req.into_parts();/    let _early = app.gate.read().await; let (parts, body) = req.into_parts();/' a_slow_body_does_not_hold_the_gate
 mutate "sign-out keeps connections" src/web.rs 's/    app.live.end_session(&current.token_hash);//' signing_out_ends_its_connections
+mutate "an import runs inside its request" src/admin.rs 's/    tokio::spawn(op(gone)).await.map_err(ApiError::internal)?/    op(gone).await/' an_import_that_has_the_gate_finishes_after_its_request_ends
+mutate "an export runs inside its request" src/admin.rs 's/    tokio::spawn(op(gone)).await.map_err(ApiError::internal)?/    op(gone).await/' an_export_nobody_receives_leaves_no_freeze
+mutate "an abandoned import still runs" src/admin.rs '/pub async fn import_exclusive/,/^}/ s/still_wanted(&gone)?;//' an_import_abandoned_before_it_has_the_gate_does_not_run
+mutate "the import trusts the session it started with" src/admin.rs '/pub async fn import_exclusive/,/^}/ s/let admin = revalidate_admin(&app, &token)?;/let admin = app.store.user_by_name("boss")?.unwrap();/' a_migration_request_is_authorized_again_once_it_has_the_gate
+mutate "the export trusts the session it started with" src/admin.rs '/^async fn export_task/,/^}/ s/let admin = revalidate_admin(&app, &token)?;/let admin = app.store.user_by_name("boss")?.unwrap();/' a_migration_request_is_authorized_again_once_it_has_the_gate
+mutate "the upload trusts the session it started with" src/admin.rs '/^async fn upload_import/,/^}/ s/let admin = revalidate_admin(&app, &token)?;/let admin = app.store.user_by_name("boss")?.unwrap();/' a_migration_request_is_authorized_again_once_it_has_the_gate
+mutate "exports run concurrently" src/admin.rs 's/    let _one = app.export_lock.lock().await;//' exports_run_one_at_a_time
+mutate "a failed export lifts a freeze it did not set" src/admin.rs 's/        let froze = !app.frozen();/        let froze = true;/' an_export_undoes_only_a_freeze_it_set
+mutate "an undelivered export stays frozen" src/admin.rs 's/            unfreeze_if_current(&app, generation).await;//' an_export_nobody_receives_leaves_no_freeze
+mutate "the export trusts a passphrase checked on the live database" src/migrate.rs 's/    Vault::verify_recovery(&Store::open(&tmp.0)?, passphrase)?;//' an_export_is_checked_against_the_wrap_in_its_own_snapshot
+mutate "an import leaves the generation alone" src/migrate.rs 's/    app.bump_generation();//' an_import_waits_for_requests_in_flight_and_ends_every_connection
+mutate "admission ignores the generation" src/proxy.rs 's/        if self.app.live.generation_of(self.live_id) != Some(self.app.generation()) {/        if false {/' admission_refuses_a_connection_from_before_an_import
+mutate "a session end is recorded in a replaced database" src/proxy.rs 's/    if e.generation != app.generation() {/    if false {/' a_session_ended_by_an_import_writes_nothing_into_the_new_database
+mutate "sign-in hashes under the gate" src/web.rs 's/    ("POST", "\/api\/login"),//' a_local_sign_in_hashes_within_the_bound_and_outside_the_gate
+mutate "sign-in hashes without a permit" src/web.rs 's/    let permit = Arc::clone(&app.hash_permits)/    let permit = Arc::new(tokio::sync::Semaphore::new(1))/' a_local_sign_in_hashes_within_the_bound_and_outside_the_gate
+mutate "sign-in records into a replaced database" src/web.rs 's/    if app.generation() != generation {/    if false {/' a_sign_in_that_straddles_an_import_is_not_recorded
+mutate "local sign-in is never throttled" src/web.rs 's/    if app.throttle.blocked(username) {/    if false {/' repeated_local_failures_are_refused_without_hashing
+mutate "a WebSocket upgrade gives up its connection's place" src/server.rs 's/        req.extensions_mut().insert(permit.clone());//' a_websocket_setting_up_keeps_its_place_under_the_limit
+mutate "a connection entry outlives its task" src/live.rs 's/        self.app.live.remove(self.id);//' a_panicking_session_task_leaves_no_entry
+mutate "a directory sign-in lands on a local account" src/web.rs 's/    if user.local {/    if false {/' a_directory_sign_in_never_lands_on_a_local_account
 
 if [ "$bad" -eq 0 ]; then echo "all mutations caught"; else echo "$bad mutation(s) not caught"; exit 1; fi

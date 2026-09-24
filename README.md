@@ -93,7 +93,7 @@ has `allow_local_accounts = true`. Create one from an elevated prompt on the pro
 With `allow_local_accounts = true`, the `[directory]` section may be left out entirely; then only
 local accounts can sign in. A local account cannot share a name with a directory user. The Users tab
 marks local accounts, and removing one there deletes it. The directory's periodic account check
-skips them.
+skips them. Five failed sign-ins within five minutes refuse the account for five minutes.
 
 ## Configuration
 
@@ -108,7 +108,7 @@ skips them.
 | `[tls]` | how RDP servers' certificates are checked: `verify = "ca"` with `ca_bundle`, or `"insecure"`. No default |
 | `[directory]` | `domain`, optional `netbios`, `urls` (ldaps only), `ca_bundle`, optional `service_account` and `check_interval_secs`. Optional when local accounts are allowed |
 | `allow_local_accounts` | let local accounts sign in; default false |
-| `max_connections` | HTTP connections served at once, default 1024; RDP sessions are not counted once connected |
+| `max_connections` | connections served at once, default 1024; a WebSocket counts until its RDP session is connected |
 
 ## Build
 

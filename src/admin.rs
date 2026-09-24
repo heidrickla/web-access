@@ -1,11 +1,12 @@
 //! The management plane: users, their server lists, servers, groups, activity, migration.
 //! Every route requires an administrator.
 
+use crate::app::META_FROZEN;
 use crate::directory::normalize_username;
 use crate::migrate;
 use crate::store::{ImportRow, User};
 use crate::vault::Vault;
-use crate::web::{AdminUser, ApiError, ApiResult, Shared};
+use crate::web::{revalidate_admin, AdminToken, AdminUser, ApiError, ApiResult, Shared};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -16,6 +17,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Largest export accepted for import.
 const IMPORT_LIMIT: usize = 1 << 30;
@@ -90,37 +93,60 @@ struct NewUser {
     username: String,
 }
 
+/// Refused when an import replaced the database while a route was away from the gate.
+fn same_generation(app: &Shared, generation: u64) -> ApiResult<()> {
+    if app.generation() == generation {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "this proxy's data was replaced while that request ran; try it again",
+        ))
+    }
+}
+
 async fn add_user(
     State(app): State<Shared>,
-    AdminUser(admin): AdminUser,
+    AdminToken(token): AdminToken,
     Json(req): Json<NewUser>,
 ) -> ApiResult<Json<Value>> {
-    not_frozen(&app)?;
     let username = normalize_username(&req.username)
         .ok_or_else(|| ApiError::bad_request("that is not a valid username"))?;
+    // Self-gated: the directory is asked without the gate held.
+    let (generation, password) = {
+        let _shared = app.gate.read().await;
+        revalidate_admin(&app, &token)?;
+        not_frozen(&app)?;
+        let password = match app.lookup_directory() {
+            Some(_) => app.directory_password().ok().flatten(),
+            None => None,
+        };
+        (app.generation(), password)
+    };
     // With a service account, check the account exists before adding it. A directory outage does
     // not block the add; the result says whether it was checked.
     let mut verified = false;
     let mut display_name = None;
-    if let Some(directory) = app.lookup_directory() {
-        if let Ok(Some(pw)) = app.directory_password() {
-            match directory.lookup_many(&pw, &[username.clone()]).await {
-                Ok(found) => match found.into_iter().next().and_then(|(_, a)| a) {
-                    Some(account) => {
-                        verified = true;
-                        display_name = account.display_name;
-                    }
-                    None => {
-                        return Err(ApiError::new(
-                            StatusCode::NOT_FOUND,
-                            format!("the directory has no account named {username}"),
-                        ))
-                    }
-                },
-                Err(e) => tracing::warn!(error = %e, "could not check the new user in the directory"),
-            }
+    if let (Some(directory), Some(pw)) = (app.lookup_directory(), password) {
+        match directory.lookup_many(&pw, &[username.clone()]).await {
+            Ok(found) => match found.into_iter().next().and_then(|(_, a)| a) {
+                Some(account) => {
+                    verified = true;
+                    display_name = account.display_name;
+                }
+                None => {
+                    return Err(ApiError::new(
+                        StatusCode::NOT_FOUND,
+                        format!("the directory has no account named {username}"),
+                    ))
+                }
+            },
+            Err(e) => tracing::warn!(error = %e, "could not check the new user in the directory"),
         }
     }
+    let _shared = app.gate.read().await;
+    same_generation(&app, generation)?;
+    let admin = revalidate_admin(&app, &token)?;
+    not_frozen(&app)?;
     let id = app.store.user_create(&username, display_name.as_deref())?;
     app.store.audit(&admin.username, "user.add", &username);
     Ok(Json(json!({ "id": id, "verified": verified })))
@@ -638,65 +664,43 @@ struct ExportForm {
     freeze: bool,
 }
 
+/// Set when the request that started a supervised operation goes away.
+struct Requester(Arc<AtomicBool>);
+
+impl Drop for Requester {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Run a migration operation in a task of its own, which the request awaits. A request that ends
+/// early (deadline, disconnect) does not cut the operation short or release its hold on the gate;
+/// the operation is told through `gone` and decides what that means.
+async fn supervised<T, F>(op: impl FnOnce(Arc<AtomicBool>) -> F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = ApiResult<T>> + Send + 'static,
+{
+    let gone = Arc::new(AtomicBool::new(false));
+    let _requester = Requester(Arc::clone(&gone));
+    tokio::spawn(op(gone)).await.map_err(ApiError::internal)?
+}
+
+/// A requester that left before an operation got the gate has abandoned it.
+fn still_wanted(gone: &AtomicBool) -> ApiResult<()> {
+    if gone.load(Ordering::SeqCst) {
+        Err(ApiError::new(StatusCode::REQUEST_TIMEOUT, "the request ended before it could start"))
+    } else {
+        Ok(())
+    }
+}
+
 async fn export(
     State(app): State<Shared>,
-    AdminUser(admin): AdminUser,
+    AdminToken(token): AdminToken,
     Json(req): Json<ExportForm>,
 ) -> ApiResult<Response> {
-    // The passphrase is checked before anything is frozen.
-    {
-        let app = app.clone();
-        let pass = req.passphrase.clone();
-        tokio::task::spawn_blocking(move || Vault::verify_recovery(&app.store, &pass))
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(migrate::MigrateError::from)?;
-    }
-    let was_frozen = app.frozen();
-    let snapshot = if req.freeze {
-        // Exclusive: requests in flight finish first, and no edit can land between the freeze and
-        // the snapshot, so nothing acknowledged is missing from the export. The imported copy
-        // arrives frozen and the import clears it.
-        let _exclusive = app.gate.write().await;
-        app.store.set_flag(crate::app::META_FROZEN, true)?;
-        take_snapshot(&app).await
-    } else {
-        // This route is exempt from the middleware's shared hold, so it takes its own.
-        let _shared = app.gate.read().await;
-        take_snapshot(&app).await
-    };
-    let unfreeze_on_failure = |app: &Shared| {
-        if req.freeze && !was_frozen {
-            let _ = app.store.set_flag(crate::app::META_FROZEN, false);
-        }
-    };
-    let (db, counts) = match snapshot {
-        Ok(v) => v,
-        Err(e) => {
-            unfreeze_on_failure(&app);
-            return Err(e);
-        }
-    };
-    let export = {
-        let app2 = app.clone();
-        let pass = req.passphrase.clone();
-        match tokio::task::spawn_blocking(move || migrate::package(&app2, &pass, &db, counts)).await {
-            Ok(Ok(e)) => e,
-            Ok(Err(e)) => {
-                unfreeze_on_failure(&app);
-                return Err(e.into());
-            }
-            Err(e) => {
-                unfreeze_on_failure(&app);
-                return Err(ApiError::internal(e));
-            }
-        }
-    };
-    app.store.audit(
-        &admin.username,
-        if req.freeze { "export.freeze" } else { "export" },
-        &export.file_name,
-    );
+    let export = export_supervised(&app, token, req.passphrase, req.freeze).await?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip".to_owned()),
@@ -710,11 +714,99 @@ async fn export(
         .into_response())
 }
 
-async fn take_snapshot(app: &Shared) -> ApiResult<(Vec<u8>, crate::store::Counts)> {
+pub async fn export_supervised(
+    app: &Shared,
+    token: Vec<u8>,
+    passphrase: String,
+    freeze: bool,
+) -> ApiResult<migrate::Export> {
     let app = app.clone();
-    Ok(tokio::task::spawn_blocking(move || migrate::snapshot(&app))
+    supervised(move |gone| export_task(app, token, passphrase, freeze, gone)).await
+}
+
+async fn export_task(
+    app: Shared,
+    token: Vec<u8>,
+    passphrase: String,
+    freeze: bool,
+    gone: Arc<AtomicBool>,
+) -> ApiResult<migrate::Export> {
+    // A wrong passphrase is turned away before anything waits on the gate. The check that counts
+    // is made on the snapshot itself.
+    {
+        let app = app.clone();
+        let pass = passphrase.clone();
+        tokio::task::spawn_blocking(move || Vault::verify_recovery(&app.store, &pass))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(migrate::MigrateError::from)?;
+    }
+    // One export at a time, so a failed export can only undo a freeze it set itself.
+    let _one = app.export_lock.lock().await;
+    let (admin, (db, counts), froze_at) = if freeze {
+        // Exclusive: requests in flight finish first, and no edit lands between the freeze and the
+        // snapshot, so nothing acknowledged is missing from the export. The imported copy arrives
+        // frozen and the import clears it.
+        let _exclusive = app.gate.write().await;
+        still_wanted(&gone)?;
+        let admin = revalidate_admin(&app, &token)?;
+        let froze = !app.frozen();
+        app.store.set_flag(META_FROZEN, true)?;
+        match snapshot_of(&app, &passphrase).await {
+            Ok(s) => (admin, s, froze.then(|| app.generation())),
+            Err(e) => {
+                if froze {
+                    let _ = app.store.set_flag(META_FROZEN, false);
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        let _shared = app.gate.read().await;
+        still_wanted(&gone)?;
+        (revalidate_admin(&app, &token)?, snapshot_of(&app, &passphrase).await?, None)
+    };
+    let packaged = {
+        let app = app.clone();
+        let pass = passphrase.clone();
+        tokio::task::spawn_blocking(move || migrate::package(&app, &pass, &db, counts))
+            .await
+            .map_err(ApiError::internal)
+            .and_then(|r| r.map_err(ApiError::from))
+    };
+    // An archive nobody receives leaves no freeze behind.
+    let delivered = packaged.and_then(|e| still_wanted(&gone).map(|()| e));
+    if delivered.is_err() {
+        if let Some(generation) = froze_at {
+            unfreeze_if_current(&app, generation).await;
+        }
+    }
+    let export = delivered?;
+    let _shared = app.gate.read().await;
+    app.store.audit(
+        &admin.username,
+        if freeze { "export.freeze" } else { "export" },
+        &export.file_name,
+    );
+    Ok(export)
+}
+
+async fn snapshot_of(app: &Shared, passphrase: &str) -> ApiResult<(Vec<u8>, crate::store::Counts)> {
+    let app = app.clone();
+    let pass = passphrase.to_owned();
+    Ok(tokio::task::spawn_blocking(move || migrate::snapshot_verified(&app, &pass))
         .await
         .map_err(ApiError::internal)??)
+}
+
+/// Undo an export's freeze, unless an import has replaced the database it was set in.
+async fn unfreeze_if_current(app: &Shared, generation: u64) {
+    let _exclusive = app.gate.write().await;
+    if app.generation() == generation {
+        if let Err(e) = app.store.set_flag(META_FROZEN, false) {
+            tracing::warn!(error = %e, "an export that was not delivered could not lift its freeze");
+        }
+    }
 }
 
 async fn unfreeze(State(app): State<Shared>, AdminUser(admin): AdminUser) -> ApiResult<StatusCode> {
@@ -725,12 +817,18 @@ async fn unfreeze(State(app): State<Shared>, AdminUser(admin): AdminUser) -> Api
 
 async fn upload_import(
     State(app): State<Shared>,
-    AdminUser(admin): AdminUser,
+    AdminToken(token): AdminToken,
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     // The body has arrived by now; only the staging runs under the gate.
     let _shared = app.gate.read().await;
-    let (upload_id, manifest) = migrate::stage(&app, &body)?;
+    let admin = revalidate_admin(&app, &token)?;
+    let (upload_id, manifest) = {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || migrate::stage(&app, &body))
+            .await
+            .map_err(ApiError::internal)??
+    };
     let current = app.store.counts()?;
     app.store.audit(
         &admin.username,
@@ -755,38 +853,49 @@ struct ConfirmForm {
 
 async fn confirm_import(
     State(app): State<Shared>,
-    AdminUser(admin): AdminUser,
+    AdminToken(token): AdminToken,
     Path(upload): Path<String>,
     Json(req): Json<ConfirmForm>,
 ) -> ApiResult<Json<Value>> {
-    let counts = import_exclusive(&app, upload, req.passphrase, req.confirm_host).await?;
-    // Written into the imported database, so the record travels with the data it describes.
-    app.store.audit(
-        &admin.username,
-        "import",
-        &format!(
-            "{} users, {} servers, {} assignments, {} saved credentials",
-            counts.users, counts.servers, counts.assignments, counts.credentials
-        ),
-    );
+    let counts = import_exclusive(&app, token, upload, req.passphrase, req.confirm_host).await?;
     Ok(Json(json!({ "counts": counts })))
 }
 
 /// The swap runs with the gate held exclusively: every request in flight finishes first, and none
-/// starts until the new database and its key are both in place.
+/// starts until the new database and its key are both in place. The task holding the gate runs to
+/// the end of the swap whatever becomes of the request.
 pub async fn import_exclusive(
     app: &Shared,
+    token: Vec<u8>,
     upload: String,
     passphrase: String,
     confirm_host: Option<String>,
 ) -> ApiResult<crate::store::Counts> {
-    let _exclusive = app.gate.write().await;
     let app = app.clone();
-    Ok(tokio::task::spawn_blocking(move || {
-        migrate::confirm(&app, &upload, &passphrase, confirm_host.as_deref())
+    supervised(move |gone| async move {
+        let _exclusive = app.gate.write().await;
+        still_wanted(&gone)?;
+        let admin = revalidate_admin(&app, &token)?;
+        let counts = {
+            let app = app.clone();
+            tokio::task::spawn_blocking(move || {
+                migrate::confirm(&app, &upload, &passphrase, confirm_host.as_deref())
+            })
+            .await
+            .map_err(ApiError::internal)??
+        };
+        // Written into the imported database, so the record travels with the data it describes.
+        app.store.audit(
+            &admin.username,
+            "import",
+            &format!(
+                "{} users, {} servers, {} assignments, {} saved credentials",
+                counts.users, counts.servers, counts.assignments, counts.credentials
+            ),
+        );
+        Ok(counts)
     })
     .await
-    .map_err(ApiError::internal)??)
 }
 
 #[derive(Deserialize)]
@@ -796,16 +905,22 @@ struct PasswordForm {
 
 async fn set_directory_password(
     State(app): State<Shared>,
-    AdminUser(admin): AdminUser,
+    AdminToken(token): AdminToken,
     Json(req): Json<PasswordForm>,
 ) -> ApiResult<Json<Value>> {
-    not_frozen(&app)?;
     let (Some(account), Some(directory)) = (app.cfg.service_account(), app.lookup_directory()) else {
         return Err(ApiError::bad_request("no service_account is configured in config.toml"));
     };
     if req.password.is_empty() {
         return Err(ApiError::bad_request("enter the service account's password"));
     }
+    // Self-gated: the directory is asked without the gate held.
+    let generation = {
+        let _shared = app.gate.read().await;
+        revalidate_admin(&app, &token)?;
+        not_frozen(&app)?;
+        app.generation()
+    };
     // Checked before it is kept: a wrong password would silently disable every lookup.
     let probe = normalize_username(account).unwrap_or_default();
     let verified = match directory.lookup_many(&req.password, &[probe]).await {
@@ -816,6 +931,10 @@ async fn set_directory_password(
             false
         }
     };
+    let _shared = app.gate.read().await;
+    same_generation(&app, generation)?;
+    let admin = revalidate_admin(&app, &token)?;
+    not_frozen(&app)?;
     app.set_directory_password(&req.password)?;
     app.store.audit(&admin.username, "directory.password", "");
     Ok(Json(json!({ "verified": verified })))
@@ -918,9 +1037,23 @@ mod tests {
         false
     }
 
-    /// An import must wait for requests in flight, so none straddles the database swap.
-    #[tokio::test]
-    async fn an_import_waits_for_requests_in_flight_and_ends_every_connection() {
+    fn token_of(cookie: &str) -> Vec<u8> {
+        crate::auth::token_hash(cookie.split_once('=').unwrap().1)
+    }
+
+    /// Polls every 5 ms for up to 30 s.
+    async fn until(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..6000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// A host holding an export of a host with `jdoe`, staged, and an administrator's session.
+    fn staged_import() -> (crate::web::Shared, String, Vec<u8>) {
         use crate::web::tests::test_app_keyed;
         let old = test_app_keyed([1; 32], "oldhost");
         let new = test_app_keyed([2; 32], "newhost");
@@ -928,11 +1061,20 @@ mod tests {
         old.store.user_create("jdoe", None).unwrap();
         let exported = migrate::export(&old, PASS).unwrap();
         let (upload, _) = migrate::stage(&new, &exported.bytes).unwrap();
-        let (_, mut connection) = new.live.register(1, b"s".to_vec());
+        let (_, cookie) = signed_in(&new, "boss");
+        (new, upload, token_of(&cookie))
+    }
+
+    /// An import must wait for requests in flight, so none straddles the database swap.
+    #[tokio::test]
+    async fn an_import_waits_for_requests_in_flight_and_ends_every_connection() {
+        let (new, upload, token) = staged_import();
+        let (_, mut connection) = new.live.register(1, b"s".to_vec(), 0);
+        let before = new.generation();
 
         let in_flight = new.gate.read().await;
         let new2 = new.clone();
-        let task = tokio::spawn(async move { import_exclusive(&new2, upload, PASS.into(), None).await });
+        let task = tokio::spawn(async move { import_exclusive(&new2, token, upload, PASS.into(), None).await });
         assert!(writer_queued(&new).await, "the import never waited on the gate");
         assert!(!task.is_finished(), "the import finished while a request was in flight");
         assert!(new.store.user_by_name("jdoe").unwrap().is_none(), "swapped under a request in flight");
@@ -940,6 +1082,119 @@ mod tests {
         task.await.unwrap().unwrap();
         assert!(new.store.user_by_name("jdoe").unwrap().is_some());
         assert!(connection.try_recv().is_ok(), "a connection outlived the import");
+        assert_ne!(new.generation(), before, "the import did not mark the database as replaced");
+    }
+
+    /// Once an import has the gate, its request ending (a deadline, a closed tab) neither stops
+    /// the swap nor lets the gate go before it is finished.
+    #[tokio::test]
+    async fn an_import_that_has_the_gate_finishes_after_its_request_ends() {
+        let (new, upload, token) = staged_import();
+        let new2 = new.clone();
+        let task = tokio::spawn(async move { import_exclusive(&new2, token, upload, PASS.into(), None).await });
+        until("the import holds the gate", || new.gate.try_read().is_err()).await;
+        task.abort();
+        let _ = task.await;
+        until("the import lets go of the gate", || new.gate.try_write().is_ok()).await;
+        assert!(
+            new.store.user_by_name("jdoe").unwrap().is_some(),
+            "the gate came free before the swap was finished"
+        );
+    }
+
+    /// A request that ends while its import is still waiting for the gate has abandoned it.
+    #[tokio::test]
+    async fn an_import_abandoned_before_it_has_the_gate_does_not_run() {
+        let (new, upload, token) = staged_import();
+        let in_flight = new.gate.read().await;
+        let new2 = new.clone();
+        let task = tokio::spawn(async move { import_exclusive(&new2, token, upload, PASS.into(), None).await });
+        assert!(writer_queued(&new).await, "the import never waited on the gate");
+        task.abort();
+        let _ = task.await;
+        drop(in_flight);
+        until("the abandoned import lets go of the gate", || new.gate.try_write().is_ok()).await;
+        assert!(new.store.user_by_name("jdoe").unwrap().is_none(), "an abandoned import ran");
+    }
+
+    /// The migration routes take the gate themselves, so they check the caller again once they
+    /// have it: a session that ended while the request waited, or that an import replaced, no
+    /// longer authorizes anything.
+    #[tokio::test]
+    async fn a_migration_request_is_authorized_again_once_it_has_the_gate() {
+        let app = test_app();
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        for (path, body) in [
+            ("/api/admin/migration/export", json!({"passphrase": PASS, "freeze": true})),
+            ("/api/admin/migration/import", json!({})),
+            ("/api/admin/migration/import/x", json!({"passphrase": PASS})),
+        ] {
+            let (_, cookie) = signed_in(&app, "boss");
+            let held = app.gate.write().await;
+            let app2 = app.clone();
+            let task = tokio::spawn(async move { call(&app2, "POST", path, Some(&cookie), Some(body)).await });
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            app.store.sessions_delete_user(app.store.user_by_name("boss").unwrap().unwrap().id).unwrap();
+            drop(held);
+            let (s, v) = task.await.unwrap();
+            assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}: {v}");
+        }
+        assert!(!app.frozen(), "an export ran on a session that had ended");
+    }
+
+    /// A freezing export whose archive is never delivered lifts the freeze it set.
+    #[tokio::test]
+    async fn an_export_nobody_receives_leaves_no_freeze() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        let app2 = app.clone();
+        let token = token_of(&cookie);
+        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the export froze the proxy", || app.frozen()).await;
+        task.abort();
+        let _ = task.await;
+        until("the export finished", || app.export_lock.try_lock().is_ok()).await;
+        assert!(!app.frozen(), "an undelivered export left the proxy frozen");
+    }
+
+    /// An export that fails lifts only a freeze it set itself.
+    #[tokio::test]
+    async fn an_export_undoes_only_a_freeze_it_set() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        app.store.set_flag(META_FROZEN, true).unwrap();
+        let app2 = app.clone();
+        let token = token_of(&cookie);
+        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the export holds the gate", || app.gate.try_read().is_err()).await;
+        task.abort();
+        let _ = task.await;
+        until("the export finished", || app.export_lock.try_lock().is_ok()).await;
+        assert!(app.frozen(), "a failed export lifted a freeze it did not set");
+    }
+
+    /// Exports run one at a time. Timed against an unobstructed export on the same host.
+    #[tokio::test]
+    async fn exports_run_one_at_a_time() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        let start = std::time::Instant::now();
+        export_supervised(&app, token_of(&cookie), PASS.into(), false).await.unwrap();
+        let unobstructed = start.elapsed();
+
+        let one = app.export_lock.lock().await;
+        let app2 = app.clone();
+        let token = token_of(&cookie);
+        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        tokio::time::sleep(unobstructed * 3).await;
+        assert!(!task.is_finished(), "an export ran while another held the export lock");
+        assert!(!app.frozen(), "an export froze the proxy while another held the export lock");
+        drop(one);
+        task.await.unwrap().unwrap();
+        assert!(app.frozen());
     }
 
     /// A freezing export takes the gate exclusively, so no edit lands between freeze and snapshot.
