@@ -129,6 +129,8 @@ pub struct User {
     pub last_login: Option<i64>,
     /// A local account: signs in against a hash in this database, not the directory.
     pub local: bool,
+    /// Set on insert; a row that reuses a deleted row's id has another.
+    pub incarnation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -257,10 +259,11 @@ fn user_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         created: r.get(6)?,
         last_login: r.get(7)?,
         local: r.get::<_, i64>(8)? != 0,
+        incarnation: r.get(9)?,
     })
 }
 
-const USER_COLS: &str = "u.id, u.username, u.display_name, u.sid, u.is_admin, u.sid_mismatch, u.created, u.last_login, u.local_hash IS NOT NULL";
+const USER_COLS: &str = "u.id, u.username, u.display_name, u.sid, u.is_admin, u.sid_mismatch, u.created, u.last_login, u.local_hash IS NOT NULL, u.incarnation";
 
 fn server_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Server> {
     Ok(Server {
@@ -372,8 +375,8 @@ impl Store {
             .query_map([], |r| {
                 Ok(UserRow {
                     user: user_from(r)?,
-                    server_count: r.get(9)?,
-                    saved_count: r.get(10)?,
+                    server_count: r.get(10)?,
+                    saved_count: r.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -397,15 +400,23 @@ impl Store {
     }
 
     /// Record a successful sign-in, binding the SID if this is the first.
-    pub fn user_record_login(&self, id: i64, sid: &str, display_name: Option<&str>) -> Result<()> {
-        self.c().execute(
+    /// Record a sign-in on the row the caller read, and only that row: false, and nothing
+    /// written, when the id now belongs to another incarnation.
+    pub fn user_record_login(
+        &self,
+        id: i64,
+        incarnation: i64,
+        sid: &str,
+        display_name: Option<&str>,
+    ) -> Result<bool> {
+        let n = self.c().execute(
             "UPDATE users SET sid = COALESCE(sid, ?2),
                               display_name = COALESCE(?3, display_name),
                               last_login = ?4
-             WHERE id = ?1",
-            params![id, sid, display_name, now()],
+             WHERE id = ?1 AND incarnation = ?5",
+            params![id, sid, display_name, now(), incarnation],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// Create a local account, or reset the password of an existing one. An existing directory
@@ -887,12 +898,21 @@ impl Store {
 
     // ---- sessions --------------------------------------------------------------------------
 
-    pub fn session_create(&self, token_hash: &[u8], user_id: i64, expires: i64) -> Result<()> {
-        self.c().execute(
-            "INSERT INTO sessions (token_hash, user_id, created, expires) VALUES (?1, ?2, ?3, ?4)",
-            params![token_hash, user_id, now(), expires],
+    /// Create a sign-in session for the row the caller authenticated, and only that row: false,
+    /// and nothing written, when the id now belongs to another incarnation.
+    pub fn session_create(
+        &self,
+        token_hash: &[u8],
+        user_id: i64,
+        incarnation: i64,
+        expires: i64,
+    ) -> Result<bool> {
+        let n = self.c().execute(
+            "INSERT INTO sessions (token_hash, user_id, created, expires)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2 AND incarnation = ?5)",
+            params![token_hash, user_id, now(), expires, incarnation],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// The user behind an unexpired session.
@@ -1183,13 +1203,35 @@ mod tests {
         assert_eq!(a.server.host, "a2.example");
     }
 
+    fn inc(s: &Store, id: i64) -> i64 {
+        s.user_by_id(id).unwrap().unwrap().incarnation
+    }
+
     #[test]
     fn a_session_is_refused_at_expiry() {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
-        s.session_create(b"hash", u, 1000).unwrap();
+        assert!(s.session_create(b"hash", u, inc(&s, u), 1000).unwrap());
         assert!(s.session_user(b"hash", 999).unwrap().is_some());
         assert!(s.session_user(b"hash", 1000).unwrap().is_none());
+    }
+
+    /// SQLite gives a new row a deleted row's id. A sign-in that authenticated the old row
+    /// neither records its login on the new one nor gets a session for it.
+    #[test]
+    fn a_sign_in_never_lands_on_a_row_that_reused_its_id() {
+        let s = store();
+        let alice = s.user_create("alice", None).unwrap();
+        let authenticated = inc(&s, alice);
+        s.user_delete(alice).unwrap();
+        let bob = s.user_create("bob", None).unwrap();
+        assert_eq!(bob, alice, "SQLite did not reuse the id, so this proves nothing");
+        assert!(!s.user_record_login(bob, authenticated, "S-1-5-21-9", None).unwrap());
+        assert!(s.user_by_id(bob).unwrap().unwrap().sid.is_none(), "the login landed on another row");
+        assert!(!s.session_create(b"alice's", bob, authenticated, now() + 100).unwrap());
+        assert!(s.session_user(b"alice's", now()).unwrap().is_none(), "the session went to another row");
+        assert!(s.user_record_login(bob, inc(&s, bob), "S-1-5-21-9", None).unwrap());
+        assert!(s.session_create(b"bob's", bob, inc(&s, bob), now() + 100).unwrap());
     }
 
     #[test]
@@ -1197,9 +1239,9 @@ mod tests {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
         let a = s.server_create("hist-01", "h", 3389, None).unwrap();
-        s.user_record_login(u, "S-1-5-21-1", None).unwrap();
+        s.user_record_login(u, inc(&s, u), "S-1-5-21-1", None).unwrap();
         s.credential_put(u, a, &StoredCredential { username: "x".into(), domain: None, nonce: vec![0; 12], secret: vec![1] }).unwrap();
-        s.session_create(b"h", u, now() + 100).unwrap();
+        s.session_create(b"h", u, inc(&s, u), now() + 100).unwrap();
         s.user_clear_sid(u).unwrap();
         let user = s.user_by_id(u).unwrap().unwrap();
         assert!(user.sid.is_none());
@@ -1211,8 +1253,8 @@ mod tests {
     fn a_first_login_binds_the_sid_and_later_ones_do_not_change_it() {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
-        s.user_record_login(u, "S-1-5-21-1", Some("J Doe")).unwrap();
-        s.user_record_login(u, "S-1-5-21-2", None).unwrap();
+        s.user_record_login(u, inc(&s, u), "S-1-5-21-1", Some("J Doe")).unwrap();
+        s.user_record_login(u, inc(&s, u), "S-1-5-21-2", None).unwrap();
         let user = s.user_by_id(u).unwrap().unwrap();
         assert_eq!(user.sid.as_deref(), Some("S-1-5-21-1"));
         assert_eq!(user.display_name.as_deref(), Some("J Doe"));
@@ -1251,8 +1293,8 @@ mod tests {
         let s = store();
         let local = s.local_account_set("devtest", "h", "local:1").unwrap();
         let dir = s.user_create("jdoe", None).unwrap();
-        s.session_create(b"a", local, now() + 100).unwrap();
-        s.session_create(b"b", dir, now() + 100).unwrap();
+        s.session_create(b"a", local, inc(&s, local), now() + 100).unwrap();
+        s.session_create(b"b", dir, inc(&s, dir), now() + 100).unwrap();
         let swept: Vec<i64> = s.directory_users_with_sessions(now()).unwrap().iter().map(|u| u.id).collect();
         assert_eq!(swept, vec![dir]);
     }
