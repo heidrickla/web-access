@@ -24,11 +24,13 @@ pub fn serve_blocking(
     config_path: &str,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let lock = ServingLock::acquire(config_path)?;
+    // Read once: the directory locked is the directory served, whatever happens to the file.
+    let cfg = Config::load(config_path)?;
+    let lock = ServingLock::acquire(&cfg)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let outcome = runtime.block_on(async {
         install_crypto_provider()?;
-        run(config_path, &lock, shutdown).await
+        run(config_path, cfg, &lock, shutdown).await
     });
     drop(runtime);
     drop(lock);
@@ -36,21 +38,33 @@ pub fn serve_blocking(
 }
 
 /// Proof that this process is the one serving a data directory.
-pub struct ServingLock(#[allow(dead_code)] std::fs::File);
+pub struct ServingLock {
+    _file: std::fs::File,
+    data_dir: std::path::PathBuf,
+}
 
 impl ServingLock {
-    pub fn acquire(config_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let cfg = Config::load(config_path)?;
-        Ok(Self(serving_lock(&cfg.data_dir())?))
+    pub fn acquire(cfg: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let data_dir = cfg.data_dir();
+        Ok(Self { _file: serving_lock(&data_dir)?, data_dir })
     }
 }
 
+/// Serve `cfg`, which must be the configuration `serving` was taken for.
 pub async fn run(
     config_path: &str,
-    _serving: &ServingLock,
+    cfg: Config,
+    serving: &ServingLock,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = Config::load(config_path)?;
+    if cfg.data_dir() != serving.data_dir {
+        return Err(format!(
+            "the serving lock is for {}, not {}",
+            serving.data_dir.display(),
+            cfg.data_dir().display()
+        )
+        .into());
+    }
     let listen = cfg.listen.clone();
     let acceptor = match &cfg.https {
         Some(h) => Some(TlsAcceptor::from(Arc::new(server_tls(h)?))),
@@ -459,10 +473,37 @@ mod tests {
         app.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
         app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
         drop(app);
-        let lock = ServingLock::acquire(&path).unwrap();
-        run(&path, &lock, async {}).await.unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let lock = ServingLock::acquire(&cfg).unwrap();
+        run(&path, cfg, &lock, async {}).await.unwrap();
         let app = App::new(Config::load(&path).unwrap()).unwrap();
         assert!(!app.frozen(), "the service started with a stranded freeze in place");
+    }
+
+    fn lock_for(path: &str) -> Result<ServingLock, Box<dyn std::error::Error>> {
+        ServingLock::acquire(&Config::load(path).unwrap())
+    }
+
+    /// The directory served is the directory locked, whatever happens to the config file once the
+    /// lock is taken, and a configuration the lock was not taken for is refused.
+    #[tokio::test]
+    async fn the_directory_served_is_the_directory_locked() {
+        let path = scratch_config();
+        let cfg = Config::load(&path).unwrap();
+        let lock = ServingLock::acquire(&cfg).unwrap();
+        // Another directory, with an export of its own in progress.
+        let other = scratch_config();
+        let b = App::new(Config::load(&other).unwrap()).unwrap();
+        b.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
+        b.store.set_flag(crate::app::META_FROZEN, true).unwrap();
+        assert!(
+            run(&other, Config::load(&other).unwrap(), &lock, async {}).await.is_err(),
+            "a directory was served under another directory's lock"
+        );
+        // The config file now names the other directory.
+        std::fs::copy(&other, &path).unwrap();
+        run(&path, cfg, &lock, async {}).await.unwrap();
+        assert!(b.frozen(), "a directory that was never locked was served");
     }
 
     /// A second serving process on the same data directory is refused before it changes anything:
@@ -474,7 +515,7 @@ mod tests {
         app.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
         app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
         // The first process, mid-export.
-        let first = ServingLock::acquire(&path).unwrap();
+        let first = lock_for(&path).unwrap();
         assert!(serve_blocking(&path, async {}).is_err(), "a second serving process started");
         assert!(app.frozen(), "a second serving process lifted a freeze in progress");
         assert!(app.store.flag(crate::app::META_FREEZE_PENDING).unwrap());
@@ -493,7 +534,7 @@ mod tests {
         serve_blocking(&path, async move {
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(Duration::from_millis(300));
-                *seen2.lock().unwrap() = Some(ServingLock::acquire(&path2).is_err());
+                *seen2.lock().unwrap() = Some(lock_for(&path2).is_err());
             });
         })
         .unwrap();
@@ -502,7 +543,7 @@ mod tests {
             Some(true),
             "another process could start while the last one's blocking work was still running"
         );
-        assert!(ServingLock::acquire(&path).is_ok(), "the lock outlived the process's work");
+        assert!(lock_for(&path).is_ok(), "the lock outlived the process's work");
     }
 
     async fn closed(addr: SocketAddr, wait: Duration) -> bool {

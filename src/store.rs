@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// v2: local accounts. A user row with a password hash signs in against it, never the directory.
 const SCHEMA_V2: &str = "ALTER TABLE users ADD COLUMN local_hash TEXT;";
 
-/// v3: a random incarnation per user and server row, set on insert. SQLite reuses a deleted row's
-/// id, so work that outlives a row checks the incarnation before writing against its id.
+/// v3: a random incarnation per user and server row, set on insert. Work that outlives a row checks
+/// the incarnation before writing against its id; v4 then stops ids being reused at all.
 const SCHEMA_V3: &str = "
 ALTER TABLE users ADD COLUMN incarnation INTEGER;
 ALTER TABLE servers ADD COLUMN incarnation INTEGER;
@@ -23,6 +23,44 @@ UPDATE users SET incarnation = random();
 UPDATE servers SET incarnation = random();
 CREATE TRIGGER users_incarnation AFTER INSERT ON users WHEN NEW.incarnation IS NULL
 BEGIN UPDATE users SET incarnation = random() WHERE id = NEW.id; END;
+CREATE TRIGGER servers_incarnation AFTER INSERT ON servers WHEN NEW.incarnation IS NULL
+BEGIN UPDATE servers SET incarnation = random() WHERE id = NEW.id; END;
+";
+
+/// v4: user and server ids are never reused, so an id kept anywhere names that row or nothing.
+/// SQLite adds AUTOINCREMENT only by rebuilding the table: create, copy, drop, rename, then the
+/// triggers again. Run with foreign keys off, and checked before it commits.
+const SCHEMA_V4: &str = "
+CREATE TABLE users_v4 (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    username     TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    sid          TEXT,
+    is_admin     INTEGER NOT NULL DEFAULT 0,
+    sid_mismatch INTEGER NOT NULL DEFAULT 0,
+    created      INTEGER NOT NULL,
+    last_login   INTEGER,
+    local_hash   TEXT,
+    incarnation  INTEGER
+);
+INSERT INTO users_v4 (id, username, display_name, sid, is_admin, sid_mismatch, created, last_login, local_hash, incarnation)
+    SELECT id, username, display_name, sid, is_admin, sid_mismatch, created, last_login, local_hash, incarnation FROM users;
+DROP TABLE users;
+ALTER TABLE users_v4 RENAME TO users;
+CREATE TRIGGER users_incarnation AFTER INSERT ON users WHEN NEW.incarnation IS NULL
+BEGIN UPDATE users SET incarnation = random() WHERE id = NEW.id; END;
+CREATE TABLE servers_v4 (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    host        TEXT NOT NULL,
+    port        INTEGER NOT NULL DEFAULT 3389,
+    group_id    INTEGER REFERENCES server_groups(id) ON DELETE SET NULL,
+    incarnation INTEGER
+);
+INSERT INTO servers_v4 (id, name, host, port, group_id, incarnation)
+    SELECT id, name, host, port, group_id, incarnation FROM servers;
+DROP TABLE servers;
+ALTER TABLE servers_v4 RENAME TO servers;
 CREATE TRIGGER servers_incarnation AFTER INSERT ON servers WHEN NEW.incarnation IS NULL
 BEGIN UPDATE servers SET incarnation = random() WHERE id = NEW.id; END;
 ";
@@ -227,6 +265,30 @@ pub fn schema_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
+/// A migration that rebuilds tables other tables refer to. Foreign keys go off outside the
+/// transaction, as SQLite requires, and every reference is checked before it commits; any failure
+/// rolls back and leaves the database as it was.
+fn rebuild_with_foreign_keys_off(conn: &Connection, sql: &str, version: i64) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migrated = (|| -> Result<()> {
+        conn.execute_batch("BEGIN;")?;
+        conn.execute_batch(sql)?;
+        let broken: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+        if broken > 0 {
+            return Err(StoreError::Invalid(format!(
+                "migrating to schema {version} would break {broken} reference(s); nothing was changed"
+            )));
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {version}; COMMIT;"))?;
+        Ok(())
+    })();
+    if migrated.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    migrated
+}
+
 /// Forward-only. A database from a newer build is refused rather than guessed at.
 pub fn migrate(conn: &Connection) -> Result<()> {
     let found = schema_version(conn)?;
@@ -244,6 +306,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if found < 3 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"))?;
+    }
+    if found < 4 {
+        rebuild_with_foreign_keys_off(conn, SCHEMA_V4, 4)?;
     }
     Ok(())
 }
@@ -384,6 +449,12 @@ impl Store {
     }
 
     pub fn user_create(&self, username: &str, display_name: Option<&str>) -> Result<i64> {
+        Ok(self.user_create_returning(username, display_name)?.id)
+    }
+
+    /// Create a user and return its row as stored, incarnation included, under one hold of the
+    /// connection, so nothing comes between the insert and the read.
+    pub fn user_create_returning(&self, username: &str, display_name: Option<&str>) -> Result<User> {
         let c = self.c();
         let exists: bool = c
             .query_row("SELECT 1 FROM users WHERE username = ?1", [username], |_| Ok(()))
@@ -396,7 +467,28 @@ impl Store {
             "INSERT INTO users (username, display_name, created) VALUES (?1, ?2, ?3)",
             params![username, display_name, now()],
         )?;
-        Ok(c.last_insert_rowid())
+        let id = c.last_insert_rowid();
+        Ok(c.query_row(&format!("SELECT {USER_COLS} FROM users u WHERE u.id = ?1"), [id], user_from)?)
+    }
+
+    /// A row on an id used before, which ids that are never reused cannot produce: for testing the
+    /// incarnation checks that stand behind them.
+    #[cfg(test)]
+    pub fn user_create_at(&self, id: i64, username: &str) -> Result<i64> {
+        self.c().execute(
+            "INSERT INTO users (id, username, created) VALUES (?1, ?2, ?3)",
+            params![id, username, now()],
+        )?;
+        Ok(id)
+    }
+
+    #[cfg(test)]
+    pub fn server_create_at(&self, id: i64, name: &str, host: &str) -> Result<i64> {
+        self.c().execute(
+            "INSERT INTO servers (id, name, host) VALUES (?1, ?2, ?3)",
+            params![id, name, host],
+        )?;
+        Ok(id)
     }
 
     /// Record a successful sign-in, binding the SID if this is the first.
@@ -1216,16 +1308,99 @@ mod tests {
         assert!(s.session_user(b"hash", 1000).unwrap().is_none());
     }
 
-    /// SQLite gives a new row a deleted row's id. A sign-in that authenticated the old row
-    /// neither records its login on the new one nor gets a session for it.
+    /// A deleted user's or server's id is never given to a new row, so an id kept anywhere names
+    /// that row or nothing.
+    #[test]
+    fn a_deleted_rows_id_is_never_given_to_a_new_row() {
+        let s = store();
+        let alice = s.user_create("alice", None).unwrap();
+        s.user_delete(alice).unwrap();
+        let bob = s.user_create("bob", None).unwrap();
+        assert!(bob > alice, "user id {alice} was given to a new row");
+        let a = s.server_create("hist-01", "h", 3389, None).unwrap();
+        s.server_delete(a).unwrap();
+        let b = s.server_create("eng-01", "e", 3389, None).unwrap();
+        assert!(b > a, "server id {a} was given to a new row");
+        let created = s.user_create_returning("carol", None).unwrap();
+        assert_eq!(Some(created.clone()), s.user_by_id(created.id).unwrap());
+    }
+
+    /// A version 3 database keeps every row and every reference through the rebuild, its cascades
+    /// still work, and from then on ids are not reused.
+    #[test]
+    fn a_version_3_database_migrates_to_ids_that_are_never_reused() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(&format!("{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users (id, username, created) VALUES (1, 'alice', 1), (2, 'bob', 1);
+             INSERT INTO server_groups (id, name) VALUES (1, 'G');
+             INSERT INTO servers (id, name, host, group_id) VALUES (1, 'hist-01', 'h', 1), (2, 'eng-01', 'e', NULL);
+             INSERT INTO assignments VALUES (1, 1), (2, 2);
+             INSERT INTO credentials VALUES (2, 2, 'ops', NULL, x'00', x'01', 1);
+             INSERT INTO sessions VALUES (x'aa', 2, 1, 99);
+             INSERT INTO session_log VALUES (2, 2, 5);",
+        )
+        .unwrap();
+        let before: i64 = conn.query_row("SELECT incarnation FROM users WHERE id = 2", [], |r| r.get(0)).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 4);
+        let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(one("SELECT COUNT(*) FROM users"), 2);
+        assert_eq!(one("SELECT COUNT(*) FROM servers"), 2);
+        assert_eq!(one("SELECT group_id FROM servers WHERE id = 1"), 1);
+        assert_eq!(one("SELECT incarnation FROM users WHERE id = 2"), before, "an incarnation changed");
+        assert_eq!(one("SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+        assert_eq!(one("PRAGMA foreign_keys"), 1, "foreign keys were left off");
+
+        // References survived: deleting bob cascades to everything of his.
+        conn.execute("DELETE FROM users WHERE id = 2", []).unwrap();
+        for table in ["assignments", "credentials", "sessions", "session_log"] {
+            assert_eq!(one(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = 2")), 0, "{table} kept bob's rows");
+        }
+        conn.execute("DELETE FROM servers WHERE id = 1", []).unwrap();
+        assert_eq!(one("SELECT COUNT(*) FROM assignments WHERE server_id = 1"), 0);
+
+        conn.execute("INSERT INTO users (username, created) VALUES ('carol', 1)", []).unwrap();
+        assert_eq!(one("SELECT id FROM users WHERE username = 'carol'"), 3, "bob's id was given to a new row");
+        assert_ne!(one("SELECT incarnation IS NOT NULL FROM users WHERE username = 'carol'"), 0);
+        conn.execute("INSERT INTO servers (name, host) VALUES ('new-01', 'n')", []).unwrap();
+        assert_eq!(one("SELECT id FROM servers WHERE name = 'new-01'"), 3);
+    }
+
+    /// A rebuild that would leave a broken reference is refused and changes nothing: the version,
+    /// the tables and foreign-key enforcement are as they were.
+    #[test]
+    fn a_migration_that_would_break_references_changes_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(&format!("{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;")).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO sessions VALUES (x'bb', 99, 1, 99);
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        assert!(migrate(&conn).is_err(), "a migration with a broken reference went through");
+        assert_eq!(schema_version(&conn).unwrap(), 3);
+        let rebuilt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE sql LIKE '%AUTOINCREMENT%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rebuilt, 0, "the refused migration left rebuilt tables behind");
+        let on: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(on, 1, "foreign keys were left off");
+    }
+
+    /// Behind ids that are never reused: were a row ever to arrive on a deleted row's id, a sign-in
+    /// that authenticated the old row would neither record its login on it nor get a session.
     #[test]
     fn a_sign_in_never_lands_on_a_row_that_reused_its_id() {
         let s = store();
         let alice = s.user_create("alice", None).unwrap();
         let authenticated = inc(&s, alice);
         s.user_delete(alice).unwrap();
-        let bob = s.user_create("bob", None).unwrap();
-        assert_eq!(bob, alice, "SQLite did not reuse the id, so this proves nothing");
+        let bob = s.user_create_at(alice, "bob").unwrap();
         assert!(!s.user_record_login(bob, authenticated, "S-1-5-21-9", None).unwrap());
         assert!(s.user_by_id(bob).unwrap().unwrap().sid.is_none(), "the login landed on another row");
         assert!(!s.session_create(b"alice's", bob, authenticated, now() + 100).unwrap());

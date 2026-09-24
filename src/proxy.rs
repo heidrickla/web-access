@@ -576,8 +576,8 @@ mod tests {
         assert_eq!(app.store.recent_ends(uid, 0).unwrap().len(), 1);
     }
 
-    /// SQLite gives a new row the id of a deleted one. A session's end recorded after its user or
-    /// its server was deleted and another created in its place lands on neither.
+    /// Behind ids that are never reused: were a row ever to arrive on a deleted row's id, a
+    /// session's end recorded late would land on neither it nor its server.
     #[tokio::test]
     async fn a_late_session_end_never_lands_on_a_row_that_reused_its_id() {
         let app = test_app();
@@ -591,15 +591,13 @@ mod tests {
             incarnations: app.store.incarnations(uid, s).unwrap(),
         };
         app.store.user_delete(uid).unwrap();
-        let other = app.store.user_create("asmith", None).unwrap();
-        assert_eq!(other, uid, "SQLite did not reuse the id, so this proves nothing");
+        let other = app.store.user_create_at(uid, "asmith").unwrap();
         record_end(&app, &ended).await;
         assert!(app.store.recent_ends(other, 0).unwrap().is_empty(), "a late end landed on another user");
 
         let ended = crate::live::Ended { incarnations: app.store.incarnations(other, s).unwrap(), user_id: other, ..ended };
         app.store.server_delete(s).unwrap();
-        let replacement = app.store.server_create("eng-01", "e", 3389, None).unwrap();
-        assert_eq!(replacement, s, "SQLite did not reuse the id, so this proves nothing");
+        let replacement = app.store.server_create_at(s, "eng-01", "e").unwrap();
         record_end(&app, &ended).await;
         assert!(app.store.recent_ends(other, 0).unwrap().is_empty(), "a late end landed on another server");
 
