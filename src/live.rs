@@ -18,6 +18,8 @@ struct Live {
     established: bool,
     /// The database generation the connection's identities came from.
     generation: u64,
+    /// The user and server rows' incarnations, known once admitted.
+    incarnations: Option<(i64, i64)>,
     cancel: Option<oneshot::Sender<()>>,
 }
 
@@ -28,6 +30,7 @@ pub struct Ended {
     pub server_id: Option<i64>,
     pub established: bool,
     pub generation: u64,
+    pub incarnations: Option<(i64, i64)>,
 }
 
 #[derive(Default)]
@@ -58,6 +61,7 @@ impl LiveSessions {
                 server_id: None,
                 established: false,
                 generation,
+                incarnations: None,
                 cancel: Some(tx),
             },
         );
@@ -74,6 +78,12 @@ impl LiveSessions {
         }
     }
 
+    pub fn set_incarnations(&self, id: u64, rows: (i64, i64)) {
+        if let Some(l) = self.lock().get_mut(&id) {
+            l.incarnations = Some(rows);
+        }
+    }
+
     pub fn set_established(&self, id: u64) {
         if let Some(l) = self.lock().get_mut(&id) {
             l.established = true;
@@ -86,6 +96,7 @@ impl LiveSessions {
             server_id: l.server_id,
             established: l.established,
             generation: l.generation,
+            incarnations: l.incarnations,
         })
     }
 
@@ -236,7 +247,7 @@ mod tests {
         assert_eq!(live.servers_for(1), HashSet::from([10]));
         assert_eq!(
             live.remove(a),
-            Some(Ended { user_id: 1, server_id: Some(10), established: true, generation: 0 })
+            Some(Ended { user_id: 1, server_id: Some(10), established: true, generation: 0, incarnations: None })
         );
         assert_eq!(live.count(), 0);
     }

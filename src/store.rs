@@ -9,10 +9,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// v2: local accounts. A user row with a password hash signs in against it, never the directory.
 const SCHEMA_V2: &str = "ALTER TABLE users ADD COLUMN local_hash TEXT;";
+
+/// v3: a random incarnation per user and server row, set on insert. SQLite reuses a deleted row's
+/// id, so work that outlives a row checks the incarnation before writing against its id.
+const SCHEMA_V3: &str = "
+ALTER TABLE users ADD COLUMN incarnation INTEGER;
+ALTER TABLE servers ADD COLUMN incarnation INTEGER;
+UPDATE users SET incarnation = random();
+UPDATE servers SET incarnation = random();
+CREATE TRIGGER users_incarnation AFTER INSERT ON users WHEN NEW.incarnation IS NULL
+BEGIN UPDATE users SET incarnation = random() WHERE id = NEW.id; END;
+CREATE TRIGGER servers_incarnation AFTER INSERT ON servers WHEN NEW.incarnation IS NULL
+BEGIN UPDATE servers SET incarnation = random() WHERE id = NEW.id; END;
+";
 
 const SCHEMA_V1: &str = "
 CREATE TABLE meta (
@@ -226,6 +239,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if found < 2 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"))?;
+    }
+    if found < 3 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"))?;
     }
     Ok(())
 }
@@ -914,13 +930,37 @@ impl Store {
 
     // ---- session log -----------------------------------------------------------------------
 
-    pub fn session_ended(&self, user_id: i64, server_id: i64, at: i64) -> Result<()> {
-        self.c().execute(
-            "INSERT INTO session_log (user_id, server_id, ended) VALUES (?1, ?2, ?3)
+    /// The incarnations of a user row and a server row, as `(user, server)`.
+    pub fn incarnations(&self, user_id: i64, server_id: i64) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .c()
+            .query_row(
+                "SELECT u.incarnation, s.incarnation FROM users u, servers s WHERE u.id = ?1 AND s.id = ?2",
+                params![user_id, server_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Record a session's end, only against the user and server rows it was opened with: a row
+    /// that has reused a deleted row's id has another incarnation. Returns whether it was recorded.
+    pub fn session_ended(
+        &self,
+        user_id: i64,
+        user_incarnation: i64,
+        server_id: i64,
+        server_incarnation: i64,
+        at: i64,
+    ) -> Result<bool> {
+        let n = self.c().execute(
+            "INSERT INTO session_log (user_id, server_id, ended)
+             SELECT ?1, ?3, ?5
+              WHERE EXISTS (SELECT 1 FROM users WHERE id = ?1 AND incarnation = ?2)
+                AND EXISTS (SELECT 1 FROM servers WHERE id = ?3 AND incarnation = ?4)
              ON CONFLICT(user_id, server_id) DO UPDATE SET ended = excluded.ended",
-            params![user_id, server_id, at],
+            params![user_id, user_incarnation, server_id, server_incarnation, at],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// Server id -> when this user's last session to it ended, for ends after `since`.
