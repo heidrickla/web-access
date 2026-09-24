@@ -57,16 +57,17 @@ writing this one.
 
 ## What is written here
 
-A WebSocket-to-TCP proxy:
+A gateway with a relay at its centre:
 
-1. Terminate the WebSocket and authenticate the user.
-2. Decide which target that identity may reach.
-3. Read the RDCleanPath request, open TCP to the target, perform the TLS handshake on the client's
-   behalf, return the server's response.
-4. Pipe bytes until the session ends.
+1. Sign the user in against Active Directory and keep that sign-in for a shift.
+2. Show the user the servers assigned to them.
+3. On a click, mint a single-use ticket for that user and that server, and hand the user's saved
+   credential, if any, to their browser.
+4. Take the WebSocket, check the cookie and the ticket, read the RDCleanPath request, open TCP to the
+   server, perform the TLS handshake on the client's behalf, return the server's response.
+5. Pipe bytes until the session ends.
 
-The proxy never decodes RDP. It is the enforcement point for identity and target selection, and
-nothing else, which is what keeps it small enough to review.
+The proxy never decodes RDP. It decides who may reach which server, and relays.
 
 ## Decisions
 
@@ -75,13 +76,16 @@ nothing else, which is what keeps it small enough to review.
 | Client-side WASM rather than server-side rendering | settled |
 | RDCleanPath, accepting that the proxy can read the stream | settled: internal network, not a concern (Lewis, 2026-09-23) |
 | DIRECT REACH: the proxy opens TCP to the target, no agents anywhere | settled (Lewis, 2026-09-23) |
-| PASS-THROUGH: the user's own Windows credentials go to the target; the proxy stores none | settled (Lewis, 2026-09-23) |
-| Identity provider for authenticating the USER to the proxy | OPEN |
-| WHERE SAVED CREDENTIALS LIVE | OPEN, and the answer changes the architecture. See below |
-| Target list source | OPEN; static config is enough to start |
+| PASS-THROUGH, unless the user saves: the user's own credentials go to the server; a user may save them on the proxy, per server | settled (Lewis, 2026-09-23). Saving reverses pass-through for that user and server only |
+| SIGN-IN: Active Directory over LDAPS, a simple bind as the user; the proxy host is not domain-joined | settled (Lewis, 2026-09-23) |
+| Sign in as the logged-on Windows user | roadmap: Kerberos via an SPN and keytab, accepted with `sspi` |
+| WHERE SAVED CREDENTIALS LIVE: a proxy-side encrypted store, per user and per server | settled (Lewis, 2026-09-23). See below |
+| SERVER LISTS: maintained by hand on the proxy, per user; IT revokes access by disabling the account | settled (Lewis, 2026-09-23) |
+| Sign-in lasts 24 hours and survives a browser restart | settled: shifts run 9 to 18 hours (Lewis, 2026-09-23) |
+| MIGRATION: saved credentials move with the database, by export and import in the admin pages | settled: around 3000 users and 4 administrators, so re-entry is not an option (Lewis, 2026-09-23) |
 | THE CLIENT SENDS A TARGET ID, NEVER AN ADDRESS | settled by design. Cloudflare's `/rdp/<vnet>/<ip>/<port>` lets the browser name the destination, so the allowlist is all that stands between a crafted request and an unlisted host. An opaque id makes "reach an arbitrary host" inexpressible rather than merely forbidden |
 | RESOLVE BY NAME, not by address | settled (Lewis, 2026-09-23) |
-| Verify the target's certificate against an internal CA | OPEN, and coupled to the row above |
+| Verify the target's certificate against an internal CA | per deployment: `tls.verify`, which has no default, and is coupled to the row above |
 | Session recording | OPEN, and it conflicts with client-side RDP: a proxy that cannot decode the stream cannot record it. If recording is required, it has to come from the target or from a decoding gateway, and that reopens the architecture |
 
 ### Resolving by name puts DNS in the trust chain
@@ -103,46 +107,76 @@ Agent identity is no longer a decision. Direct reach means there are no agents t
 ### What direct reach makes load-bearing
 
 With no agents, nothing outside the proxy constrains which hosts it can open a socket to except
-network policy. SO THE TARGET ALLOWLIST IN THE PROXY IS A SECURITY CONTROL, not a convenience
-feature: default-deny, explicit, and reviewable. A bug that lets an identity reach an unlisted target
-is a boundary failure, and it should be tested as one.
+network policy. SO A USER'S ASSIGNMENTS ARE A SECURITY CONTROL, not a convenience feature:
+default-deny, explicit, and reviewable. `policy::resolve` and `policy::permitted` share one predicate,
+an assignment row, so the list a user sees and the connections they can open cannot disagree.
+
+### Sign-in and sessions
+
+- A password sign-in is an LDAPS simple bind as the user. AD refuses the bind for a disabled,
+  expired or locked account, so disabling the account stops sign-in with no logic of our own. An
+  empty password is refused before the bind: LDAP treats it as an anonymous bind.
+- The account's SID is bound to the user row at first sign-in. A later sign-in with a different SID
+  is refused and flagged to administrators, so a reused username inherits nothing.
+- The sign-in session is a random token in an `HttpOnly; SameSite=Strict` cookie, persistent for 24
+  hours. The database keeps its SHA-256, so sessions survive a service restart and move with an
+  export.
+- With a service account configured, signed-in accounts are re-checked periodically. An account that
+  is disabled, expired, gone or re-created loses its sessions and its live RDP connections.
+- A click mints a connect ticket: 60 seconds, single use, bound to the user and the server. The
+  WebSocket must also carry the session cookie of the same user and a same-origin `Origin`.
 
 ### Where saved credentials live
 
 | | Where | Scope |
 |---|---|---|
-| Browser `localStorage` | the browser profile | per browser; no server work |
+| Browser `localStorage` | the browser profile | per browser |
 | Browser credential manager | the Credential Management API | per browser; requires a secure origin |
-| PROXY-SIDE ENCRYPTED STORE | a database the proxy owns, the Guacamole model | per user or per connection, any machine |
+| PROXY-SIDE ENCRYPTED STORE | the proxy's database, the Guacamole model | per user and per server, any machine. CHOSEN |
 
-The third is the direction this grows into, because it is what makes a multi-user gateway possible:
+The proxy store is what makes a multi-user gateway possible: credentials follow the user, not the
+browser, and there is one place to audit and revoke them. Storage is per user and per server, so the
+proxy log and the Windows event log still name the same person.
 
-- Credentials follow the USER, not the browser.
-- An administrator can attach credentials to a CONNECTION rather than a person, so an operator clicks
-  a system and is in without knowing the Windows password, and a credential rotates without telling
-  anyone.
-- One place to audit, revoke and rotate.
+The RDP client performs NLA in the browser, so a saved password goes to its owner's browser for the
+connection it was requested for, and is saved only after the server has accepted it.
 
-Design consequences:
+KEY MANAGEMENT:
 
-- The proxy then holds credentials, which reverses pass-through rather than extending it.
-- Per-user storage keeps the proxy log and the Windows event log naming the same person;
-  per-connection storage makes the event log name the connection's account instead.
-- Key management decides the design. Candidates, strongest first:
-  1. Derived from the authenticated user's own session, so a row decrypts only while that user is
-     signed in. Requires the identity provider.
-  2. Windows DPAPI under the service account, binding the store to the machine.
-  3. A key in the config file. Rejected.
+| Layer | What |
+|---|---|
+| Record | AES-256-GCM, fresh nonce per write, associated data binding the record to the user's SID and the server id |
+| Master key | 256 random bits, one per database |
+| Local wrap | DPAPI, machine scope, so the service starts unattended |
+| Recovery wrap | Argon2id (64 MiB, 3 passes) of an administrator's passphrase, so the key can move to a new host |
 
-It follows the identity provider, because option 1 needs identities to key against.
+A key derived from the user's own sign-in was the stronger candidate in the abstract and was not
+chosen: sign-in as the logged-on user (roadmap) supplies no password to derive from, and a key that
+only a signed-in user can open could not move with an export. A key in the config file was rejected.
 
-### What pass-through makes true
+A database whose local wrap does not open on the host it finds itself on starts locked; the recovery
+passphrase unlocks it and re-wraps the key for that host.
 
-- The proxy holds no secrets.
+### Migration
+
+An export is a zip holding `manifest.json` (format, schema, source host, time, counts, SHA-256 of the
+data) and `data.db.enc`, a `VACUUM INTO` snapshot encrypted under the recovery passphrase. The export
+refuses a passphrase that does not open the database's recovery wrap, so an export can always be
+imported by whoever holds that passphrase.
+
+Import checks the manifest and checksum, decrypts, opens the result (migrating an older schema
+forward, refusing a newer one), runs SQLite's integrity check, re-wraps the master key for this host,
+backs up the current database, and swaps the file in while running. A host holding data needs its
+own name typed to confirm.
+
+"Export and freeze" leaves the old host carrying sign-ins and sessions while refusing saves and admin
+edits, so nothing made after the export is lost at cutover.
+
+### What pass-through makes true, for credentials that are not saved
+
+- The proxy holds nothing for them.
 - The Windows event log names the actual person, so the proxy's log and the target's log correlate.
-  That correlation is the audit story.
-- CredSSP has to work from a browser-hosted client. This is the historically awkward part of
-  client-side RDP, and it is known to work: Cloudflare's implementation is pass-through and states
+- CredSSP works from a browser-hosted client: Cloudflare's implementation is pass-through and states
   that it manages no credentials on the Windows server.
 
 ## The capability note
