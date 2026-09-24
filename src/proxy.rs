@@ -161,13 +161,22 @@ impl Session<'_> {
             Ok(_) => return Err(Refusal::SignInEnded),
             Err(_) => return Err(Refusal::Store),
         }
-        match resolve(&self.app.store, self.user.id, target_id) {
-            Ok(t) if t.id == ticket.server_id => Ok(t),
-            Ok(_) => Err(Refusal::WrongServer),
-            Err(PolicyError::Denied(Denied::NoSuchTarget)) => Err(Refusal::NoSuchServer),
-            Err(PolicyError::Denied(Denied::NotPermitted)) => Err(Refusal::NotAssigned),
-            Err(PolicyError::Store(_)) => Err(Refusal::Store),
-        }
+        let target = match resolve(&self.app.store, self.user.id, target_id) {
+            Ok(t) if t.id == ticket.server_id => t,
+            Ok(_) => return Err(Refusal::WrongServer),
+            Err(PolicyError::Denied(Denied::NoSuchTarget)) => return Err(Refusal::NoSuchServer),
+            Err(PolicyError::Denied(Denied::NotPermitted)) => return Err(Refusal::NotAssigned),
+            Err(PolicyError::Store(_)) => return Err(Refusal::Store),
+        };
+        // The rows the session's end is recorded against, told apart from later rows that reuse
+        // their ids.
+        let rows = match self.app.store.incarnations(self.user.id, target.id) {
+            Ok(Some(rows)) => rows,
+            Ok(None) => return Err(Refusal::NoSuchServer),
+            Err(_) => return Err(Refusal::Store),
+        };
+        self.app.live.set_incarnations(self.live_id, rows);
+        Ok(target)
     }
 
     async fn serve<S>(&self, mut ws: WebSocketStream<S>) -> Result<(), SessionError>
@@ -324,14 +333,15 @@ impl Session<'_> {
 /// connection is a DISCONNECT to Windows, not a sign-out: the desktop stays. Skipped when an import
 /// has replaced the database since the connection opened: its ids now name other rows.
 pub async fn record_end(app: &App, e: &crate::live::Ended) {
-    let (true, Some(server_id)) = (e.established, e.server_id) else {
+    let (true, Some(server_id), Some((user_row, server_row))) = (e.established, e.server_id, e.incarnations)
+    else {
         return;
     };
     let _shared = app.gate.read().await;
     if e.generation != app.generation() {
         return;
     }
-    if let Err(err) = app.store.session_ended(e.user_id, server_id, now()) {
+    if let Err(err) = app.store.session_ended(e.user_id, user_row, server_id, server_row, now()) {
         warn!(error = %err, "could not record the session end");
     }
 }
@@ -556,13 +566,46 @@ mod tests {
         let app = test_app();
         let (uid, _) = signed_in(&app, "jdoe");
         let s = app.store.server_create("hist-01", "h", 3389, None).unwrap();
-        let ended = crate::live::Ended { user_id: uid, server_id: Some(s), established: true, generation: app.generation() };
+        let incarnations = app.store.incarnations(uid, s).unwrap();
+        let ended = crate::live::Ended { user_id: uid, server_id: Some(s), established: true, generation: app.generation(), incarnations };
         app.bump_generation();
         record_end(&app, &ended).await;
         assert!(app.store.recent_ends(uid, 0).unwrap().is_empty());
         let current = crate::live::Ended { generation: app.generation(), ..ended };
         record_end(&app, &current).await;
         assert_eq!(app.store.recent_ends(uid, 0).unwrap().len(), 1);
+    }
+
+    /// SQLite gives a new row the id of a deleted one. A session's end recorded after its user or
+    /// its server was deleted and another created in its place lands on neither.
+    #[tokio::test]
+    async fn a_late_session_end_never_lands_on_a_row_that_reused_its_id() {
+        let app = test_app();
+        let uid = app.store.user_create("jdoe", None).unwrap();
+        let s = app.store.server_create("hist-01", "h", 3389, None).unwrap();
+        let ended = crate::live::Ended {
+            user_id: uid,
+            server_id: Some(s),
+            established: true,
+            generation: app.generation(),
+            incarnations: app.store.incarnations(uid, s).unwrap(),
+        };
+        app.store.user_delete(uid).unwrap();
+        let other = app.store.user_create("asmith", None).unwrap();
+        assert_eq!(other, uid, "SQLite did not reuse the id, so this proves nothing");
+        record_end(&app, &ended).await;
+        assert!(app.store.recent_ends(other, 0).unwrap().is_empty(), "a late end landed on another user");
+
+        let ended = crate::live::Ended { incarnations: app.store.incarnations(other, s).unwrap(), user_id: other, ..ended };
+        app.store.server_delete(s).unwrap();
+        let replacement = app.store.server_create("eng-01", "e", 3389, None).unwrap();
+        assert_eq!(replacement, s, "SQLite did not reuse the id, so this proves nothing");
+        record_end(&app, &ended).await;
+        assert!(app.store.recent_ends(other, 0).unwrap().is_empty(), "a late end landed on another server");
+
+        let current = crate::live::Ended { incarnations: app.store.incarnations(other, replacement).unwrap(), ..ended };
+        record_end(&app, &current).await;
+        assert_eq!(app.store.recent_ends(other, 0).unwrap().len(), 1, "the current rows' end was not recorded");
     }
 
     /// A session whose database an import replaced after admission records no opening in the new one.

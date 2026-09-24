@@ -90,5 +90,9 @@ mutate "the freeze stops being pending before the handover" src/admin.rs 's/^   
 mutate "start keeps a stranded freeze" src/app.rs 's/        app.lift_stranded_freeze()?;//' a_stranded_freeze_is_lifted_when_the_service_starts_and_only_then
 mutate "a command-line tool lifts a freeze in progress" src/app.rs 's/        app.seed_from_config()?;/        app.seed_from_config()?; app.lift_stranded_freeze()?;/' a_stranded_freeze_is_lifted_when_the_service_starts_and_only_then
 mutate "the service start keeps a stranded freeze" src/server.rs 's/    let app = Arc::new(App::for_serving(cfg)?);/    let app = Arc::new(App::new(cfg)?);/' the_service_start_lifts_a_stranded_freeze
+mutate "a second serving process starts" src/server.rs 's/    let _serving = serving_lock(&cfg.data_dir())?;//' a_second_serving_process_changes_nothing
+mutate "a session end lands on a row that reused its id" src/store.rs 's/              WHERE EXISTS (SELECT 1 FROM users WHERE id = ?1 AND incarnation = ?2)/              WHERE EXISTS (SELECT 1 FROM users WHERE id = ?1 AND ?2 = ?2)/' a_late_session_end_never_lands_on_a_row_that_reused_its_id
+mutate "a session end lands on a server that reused its id" src/store.rs 's/                AND EXISTS (SELECT 1 FROM servers WHERE id = ?3 AND incarnation = ?4)/                AND EXISTS (SELECT 1 FROM servers WHERE id = ?3 AND ?4 = ?4)/' a_late_session_end_never_lands_on_a_row_that_reused_its_id
+mutate "a new row keeps no incarnation" src/store.rs 's/^BEGIN UPDATE users SET incarnation = random() WHERE id = NEW.id; END;$/BEGIN SELECT 1; END;/' a_late_session_end_never_lands_on_a_row_that_reused_its_id
 
 if [ "$bad" -eq 0 ]; then echo "all mutations caught"; else echo "$bad mutation(s) not caught"; exit 1; fi

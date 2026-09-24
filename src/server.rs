@@ -30,6 +30,8 @@ pub async fn run(
             None
         }
     };
+    // Before anything reads or changes the database, and held until this process ends.
+    let _serving = serving_lock(&cfg.data_dir())?;
     let app = Arc::new(App::for_serving(cfg)?);
     let counts = app.store.counts()?;
     info!(
@@ -52,6 +54,24 @@ pub async fn run(
     info!(%listen, https = acceptor.is_some(), max_connections = limits.max_connections, "listening");
     accept_loop(listener, acceptor, router, limits, shutdown).await;
     Ok(())
+}
+
+/// One serving process per data directory. A second is refused before it touches the database, so
+/// it cannot mistake the first one's export in progress for one that never finished.
+fn serving_lock(data_dir: &std::path::Path) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data_dir.join("serving.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(format!("another web-access proxy is already serving {}", data_dir.display()).into())
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// A client that has not finished its TLS handshake by now is dropped.
@@ -409,6 +429,36 @@ mod tests {
         run(&path, async {}).await.unwrap();
         let app = App::new(Config::load(&path).unwrap()).unwrap();
         assert!(!app.frozen(), "the service started with a stranded freeze in place");
+    }
+
+    /// A second serving process on the same data directory is refused before it changes anything:
+    /// the first one's export in progress keeps its freeze.
+    #[tokio::test]
+    async fn a_second_serving_process_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("web-access-test-{}", &crate::auth::random_token()[..12]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nadmins = [\"boss\"]\nallow_local_accounts = true\n[tls]\nverify = \"insecure\"\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let app = App::new(Config::load(&path).unwrap()).unwrap();
+        app.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
+        app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
+        // The first process, mid-export.
+        let first = serving_lock(&dir).unwrap();
+        let second = run(&path, async {}).await;
+        assert!(second.is_err(), "a second serving process started");
+        assert!(app.frozen(), "a second serving process lifted a freeze in progress");
+        assert!(app.store.flag(crate::app::META_FREEZE_PENDING).unwrap());
+        drop(first);
+        run(&path, async {}).await.unwrap();
+        assert!(!app.frozen(), "with the first process gone, the stranded freeze stayed");
     }
 
     async fn closed(addr: SocketAddr, wait: Duration) -> bool {
