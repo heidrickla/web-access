@@ -1,0 +1,2437 @@
+dn: dc=example,dc=org
+objectClass: locality
+objectClass: dcObject
+dc: example
+
+dn: dc=subtree,dc=example,dc=org
+objectClass: referral
+objectClass: extensibleObject
+dc: subtree
+ref: ldaps://ldap.example.org/dc=subtree,dc=example,dc=org
+
+dn: ou=People,dc=example,dc=org
+objectClass: organizationalUnit
+ou: People
+
+dn: cn=proxy,dc=example,dc=org
+objectClass: organizationalRole
+objectClass: simpleSecurityObject
+cn: proxy
+authzTo: {0}dn:cn=proxieduser,dc=example,dc=org
+userPassword: topsecret
+
+dn: uid=inejge,ou=People,dc=example,dc=org
+objectClass: account
+objectClass: simpleSecurityObject
+uid: inejge
+userPassword: doublesecret
+
+dn: uid=test,ou=People,dc=example,dc=org
+objectClass: account
+objectClass: simpleSecurityObject
+uid: test
+userPassword: triplesecret
+
+dn: ou=Places,dc=example,dc=org
+objectClass: organizationalUnit
+ou: Places
+
+dn: l=standouts,ou=Places,dc=example,dc=org
+objectClass: locality
+l: standouts
+
+dn: l=haggles,ou=Places,dc=example,dc=org
+objectClass: locality
+l: haggles
+
+dn: l=servings,ou=Places,dc=example,dc=org
+objectClass: locality
+l: servings
+
+dn: l=signposts,ou=Places,dc=example,dc=org
+objectClass: locality
+l: signposts
+
+dn: l=transitting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: transitting
+
+dn: l=cranking,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cranking
+
+dn: l=flashguns,ou=Places,dc=example,dc=org
+objectClass: locality
+l: flashguns
+
+dn: l=schoolbooks,ou=Places,dc=example,dc=org
+objectClass: locality
+l: schoolbooks
+
+dn: l=eclipsing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: eclipsing
+
+dn: l=modicums,ou=Places,dc=example,dc=org
+objectClass: locality
+l: modicums
+
+dn: l=jounced,ou=Places,dc=example,dc=org
+objectClass: locality
+l: jounced
+
+dn: l=pencils,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pencils
+
+dn: l=garotte,ou=Places,dc=example,dc=org
+objectClass: locality
+l: garotte
+
+dn: l=lost,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lost
+
+dn: l=utopias,ou=Places,dc=example,dc=org
+objectClass: locality
+l: utopias
+
+dn: l=trickiest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: trickiest
+
+dn: l=perverse,ou=Places,dc=example,dc=org
+objectClass: locality
+l: perverse
+
+dn: l=refiners,ou=Places,dc=example,dc=org
+objectClass: locality
+l: refiners
+
+dn: l=chickening,ou=Places,dc=example,dc=org
+objectClass: locality
+l: chickening
+
+dn: l=overhear,ou=Places,dc=example,dc=org
+objectClass: locality
+l: overhear
+
+dn: l=afghan,ou=Places,dc=example,dc=org
+objectClass: locality
+l: afghan
+
+dn: l=dilution,ou=Places,dc=example,dc=org
+objectClass: locality
+l: dilution
+
+dn: l=chaps,ou=Places,dc=example,dc=org
+objectClass: locality
+l: chaps
+
+dn: l=skulked,ou=Places,dc=example,dc=org
+objectClass: locality
+l: skulked
+
+dn: l=coaching,ou=Places,dc=example,dc=org
+objectClass: locality
+l: coaching
+
+dn: l=harshly,ou=Places,dc=example,dc=org
+objectClass: locality
+l: harshly
+
+dn: l=categorizing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: categorizing
+
+dn: l=bully,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bully
+
+dn: l=zincing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: zincing
+
+dn: l=decanters,ou=Places,dc=example,dc=org
+objectClass: locality
+l: decanters
+
+dn: l=lopping,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lopping
+
+dn: l=staled,ou=Places,dc=example,dc=org
+objectClass: locality
+l: staled
+
+dn: l=pageantry,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pageantry
+
+dn: l=entrepreneur,ou=Places,dc=example,dc=org
+objectClass: locality
+l: entrepreneur
+
+dn: l=pharmaceuticals,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pharmaceuticals
+
+dn: l=maniacs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: maniacs
+
+dn: l=laugh,ou=Places,dc=example,dc=org
+objectClass: locality
+l: laugh
+
+dn: l=watching,ou=Places,dc=example,dc=org
+objectClass: locality
+l: watching
+
+dn: l=enigma,ou=Places,dc=example,dc=org
+objectClass: locality
+l: enigma
+
+dn: l=screamed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: screamed
+
+dn: l=mariachi,ou=Places,dc=example,dc=org
+objectClass: locality
+l: mariachi
+
+dn: l=scorecard,ou=Places,dc=example,dc=org
+objectClass: locality
+l: scorecard
+
+dn: l=harmonically,ou=Places,dc=example,dc=org
+objectClass: locality
+l: harmonically
+
+dn: l=theoretician,ou=Places,dc=example,dc=org
+objectClass: locality
+l: theoretician
+
+dn: l=eliding,ou=Places,dc=example,dc=org
+objectClass: locality
+l: eliding
+
+dn: l=freckles,ou=Places,dc=example,dc=org
+objectClass: locality
+l: freckles
+
+dn: l=slew,ou=Places,dc=example,dc=org
+objectClass: locality
+l: slew
+
+dn: l=troubleshoot,ou=Places,dc=example,dc=org
+objectClass: locality
+l: troubleshoot
+
+dn: l=beck,ou=Places,dc=example,dc=org
+objectClass: locality
+l: beck
+
+dn: l=upholding,ou=Places,dc=example,dc=org
+objectClass: locality
+l: upholding
+
+dn: l=manège,ou=Places,dc=example,dc=org
+objectClass: locality
+l: manège
+
+dn: l=blindsided,ou=Places,dc=example,dc=org
+objectClass: locality
+l: blindsided
+
+dn: l=couched,ou=Places,dc=example,dc=org
+objectClass: locality
+l: couched
+
+dn: l=powerboat,ou=Places,dc=example,dc=org
+objectClass: locality
+l: powerboat
+
+dn: l=tetrahedra,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tetrahedra
+
+dn: l=forswore,ou=Places,dc=example,dc=org
+objectClass: locality
+l: forswore
+
+dn: l=baring,ou=Places,dc=example,dc=org
+objectClass: locality
+l: baring
+
+dn: l=airspace,ou=Places,dc=example,dc=org
+objectClass: locality
+l: airspace
+
+dn: l=instigators,ou=Places,dc=example,dc=org
+objectClass: locality
+l: instigators
+
+dn: l=baptistry,ou=Places,dc=example,dc=org
+objectClass: locality
+l: baptistry
+
+dn: l=devising,ou=Places,dc=example,dc=org
+objectClass: locality
+l: devising
+
+dn: l=wards,ou=Places,dc=example,dc=org
+objectClass: locality
+l: wards
+
+dn: l=together,ou=Places,dc=example,dc=org
+objectClass: locality
+l: together
+
+dn: l=stratospheres,ou=Places,dc=example,dc=org
+objectClass: locality
+l: stratospheres
+
+dn: l=draftee,ou=Places,dc=example,dc=org
+objectClass: locality
+l: draftee
+
+dn: l=metastases,ou=Places,dc=example,dc=org
+objectClass: locality
+l: metastases
+
+dn: l=glittering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: glittering
+
+dn: l=sanctity,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sanctity
+
+dn: l=loopy,ou=Places,dc=example,dc=org
+objectClass: locality
+l: loopy
+
+dn: l=preheating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: preheating
+
+dn: l=matures,ou=Places,dc=example,dc=org
+objectClass: locality
+l: matures
+
+dn: l=aqua,ou=Places,dc=example,dc=org
+objectClass: locality
+l: aqua
+
+dn: l=import,ou=Places,dc=example,dc=org
+objectClass: locality
+l: import
+
+dn: l=uncouples,ou=Places,dc=example,dc=org
+objectClass: locality
+l: uncouples
+
+dn: l=unclothed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: unclothed
+
+dn: l=rehabilitating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rehabilitating
+
+dn: l=elusiveness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: elusiveness
+
+dn: l=retrievals,ou=Places,dc=example,dc=org
+objectClass: locality
+l: retrievals
+
+dn: l=photographs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: photographs
+
+dn: l=fretful,ou=Places,dc=example,dc=org
+objectClass: locality
+l: fretful
+
+dn: l=pummelling,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pummelling
+
+dn: l=commissioners,ou=Places,dc=example,dc=org
+objectClass: locality
+l: commissioners
+
+dn: l=inaccuracy,ou=Places,dc=example,dc=org
+objectClass: locality
+l: inaccuracy
+
+dn: l=tapered,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tapered
+
+dn: l=spiciest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: spiciest
+
+dn: l=finger,ou=Places,dc=example,dc=org
+objectClass: locality
+l: finger
+
+dn: l=denigration,ou=Places,dc=example,dc=org
+objectClass: locality
+l: denigration
+
+dn: l=thirsted,ou=Places,dc=example,dc=org
+objectClass: locality
+l: thirsted
+
+dn: l=foursomes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: foursomes
+
+dn: l=puffed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: puffed
+
+dn: l=vehement,ou=Places,dc=example,dc=org
+objectClass: locality
+l: vehement
+
+dn: l=obliqueness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: obliqueness
+
+dn: l=poncho,ou=Places,dc=example,dc=org
+objectClass: locality
+l: poncho
+
+dn: l=subsoil,ou=Places,dc=example,dc=org
+objectClass: locality
+l: subsoil
+
+dn: l=impudence,ou=Places,dc=example,dc=org
+objectClass: locality
+l: impudence
+
+dn: l=tussle,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tussle
+
+dn: l=hangs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hangs
+
+dn: l=sneeze,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sneeze
+
+dn: l=provisos,ou=Places,dc=example,dc=org
+objectClass: locality
+l: provisos
+
+dn: l=transform,ou=Places,dc=example,dc=org
+objectClass: locality
+l: transform
+
+dn: l=kickback,ou=Places,dc=example,dc=org
+objectClass: locality
+l: kickback
+
+dn: l=deadbolt,ou=Places,dc=example,dc=org
+objectClass: locality
+l: deadbolt
+
+dn: l=upstaged,ou=Places,dc=example,dc=org
+objectClass: locality
+l: upstaged
+
+dn: l=truffles,ou=Places,dc=example,dc=org
+objectClass: locality
+l: truffles
+
+dn: l=ciphered,ou=Places,dc=example,dc=org
+objectClass: locality
+l: ciphered
+
+dn: l=tarriest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tarriest
+
+dn: l=pickaxe,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pickaxe
+
+dn: l=illegitimacy,ou=Places,dc=example,dc=org
+objectClass: locality
+l: illegitimacy
+
+dn: l=parleying,ou=Places,dc=example,dc=org
+objectClass: locality
+l: parleying
+
+dn: l=ejaculation,ou=Places,dc=example,dc=org
+objectClass: locality
+l: ejaculation
+
+dn: l=shaming,ou=Places,dc=example,dc=org
+objectClass: locality
+l: shaming
+
+dn: l=exculpating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: exculpating
+
+dn: l=indorse,ou=Places,dc=example,dc=org
+objectClass: locality
+l: indorse
+
+dn: l=delinquencies,ou=Places,dc=example,dc=org
+objectClass: locality
+l: delinquencies
+
+dn: l=copulating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: copulating
+
+dn: l=earsplitting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: earsplitting
+
+dn: l=monitoring,ou=Places,dc=example,dc=org
+objectClass: locality
+l: monitoring
+
+dn: l=homeroom,ou=Places,dc=example,dc=org
+objectClass: locality
+l: homeroom
+
+dn: l=composite,ou=Places,dc=example,dc=org
+objectClass: locality
+l: composite
+
+dn: l=tough,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tough
+
+dn: l=broaches,ou=Places,dc=example,dc=org
+objectClass: locality
+l: broaches
+
+dn: l=carriageway,ou=Places,dc=example,dc=org
+objectClass: locality
+l: carriageway
+
+dn: l=leader,ou=Places,dc=example,dc=org
+objectClass: locality
+l: leader
+
+dn: l=sandbanks,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sandbanks
+
+dn: l=wincing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: wincing
+
+dn: l=understudied,ou=Places,dc=example,dc=org
+objectClass: locality
+l: understudied
+
+dn: l=prowler,ou=Places,dc=example,dc=org
+objectClass: locality
+l: prowler
+
+dn: l=grapples,ou=Places,dc=example,dc=org
+objectClass: locality
+l: grapples
+
+dn: l=rooming,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rooming
+
+dn: l=geniuses,ou=Places,dc=example,dc=org
+objectClass: locality
+l: geniuses
+
+dn: l=enslaved,ou=Places,dc=example,dc=org
+objectClass: locality
+l: enslaved
+
+dn: l=deputizes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: deputizes
+
+dn: l=noughts,ou=Places,dc=example,dc=org
+objectClass: locality
+l: noughts
+
+dn: l=dippers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: dippers
+
+dn: l=cleft,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cleft
+
+dn: l=rescheduled,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rescheduled
+
+dn: l=caroused,ou=Places,dc=example,dc=org
+objectClass: locality
+l: caroused
+
+dn: l=showed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: showed
+
+dn: l=comedown,ou=Places,dc=example,dc=org
+objectClass: locality
+l: comedown
+
+dn: l=rigorous,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rigorous
+
+dn: l=benediction,ou=Places,dc=example,dc=org
+objectClass: locality
+l: benediction
+
+dn: l=upscale,ou=Places,dc=example,dc=org
+objectClass: locality
+l: upscale
+
+dn: l=auricle,ou=Places,dc=example,dc=org
+objectClass: locality
+l: auricle
+
+dn: l=maker,ou=Places,dc=example,dc=org
+objectClass: locality
+l: maker
+
+dn: l=conglomerated,ou=Places,dc=example,dc=org
+objectClass: locality
+l: conglomerated
+
+dn: l=diatoms,ou=Places,dc=example,dc=org
+objectClass: locality
+l: diatoms
+
+dn: l=sightseer,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sightseer
+
+dn: l=resentful,ou=Places,dc=example,dc=org
+objectClass: locality
+l: resentful
+
+dn: l=polymer,ou=Places,dc=example,dc=org
+objectClass: locality
+l: polymer
+
+dn: l=wackiest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: wackiest
+
+dn: l=phonographs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: phonographs
+
+dn: l=samba,ou=Places,dc=example,dc=org
+objectClass: locality
+l: samba
+
+dn: l=bookkeeping,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bookkeeping
+
+dn: l=chaffinches,ou=Places,dc=example,dc=org
+objectClass: locality
+l: chaffinches
+
+dn: l=maharanee,ou=Places,dc=example,dc=org
+objectClass: locality
+l: maharanee
+
+dn: l=bicepses,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bicepses
+
+dn: l=becomingly,ou=Places,dc=example,dc=org
+objectClass: locality
+l: becomingly
+
+dn: l=crumbliest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: crumbliest
+
+dn: l=interjecting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: interjecting
+
+dn: l=soldiered,ou=Places,dc=example,dc=org
+objectClass: locality
+l: soldiered
+
+dn: l=nectarines,ou=Places,dc=example,dc=org
+objectClass: locality
+l: nectarines
+
+dn: l=rusting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rusting
+
+dn: l=auditorium,ou=Places,dc=example,dc=org
+objectClass: locality
+l: auditorium
+
+dn: l=coccyges,ou=Places,dc=example,dc=org
+objectClass: locality
+l: coccyges
+
+dn: l=études,ou=Places,dc=example,dc=org
+objectClass: locality
+l: études
+
+dn: l=cruelties,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cruelties
+
+dn: l=testify,ou=Places,dc=example,dc=org
+objectClass: locality
+l: testify
+
+dn: l=yucca,ou=Places,dc=example,dc=org
+objectClass: locality
+l: yucca
+
+dn: l=avalanche,ou=Places,dc=example,dc=org
+objectClass: locality
+l: avalanche
+
+dn: l=swashbuckler,ou=Places,dc=example,dc=org
+objectClass: locality
+l: swashbuckler
+
+dn: l=begun,ou=Places,dc=example,dc=org
+objectClass: locality
+l: begun
+
+dn: l=abuser,ou=Places,dc=example,dc=org
+objectClass: locality
+l: abuser
+
+dn: l=turfs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: turfs
+
+dn: l=omega,ou=Places,dc=example,dc=org
+objectClass: locality
+l: omega
+
+dn: l=constrict,ou=Places,dc=example,dc=org
+objectClass: locality
+l: constrict
+
+dn: l=colored,ou=Places,dc=example,dc=org
+objectClass: locality
+l: colored
+
+dn: l=gunnysack,ou=Places,dc=example,dc=org
+objectClass: locality
+l: gunnysack
+
+dn: l=transvestites,ou=Places,dc=example,dc=org
+objectClass: locality
+l: transvestites
+
+dn: l=soldiering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: soldiering
+
+dn: l=fur,ou=Places,dc=example,dc=org
+objectClass: locality
+l: fur
+
+dn: l=mitigating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: mitigating
+
+dn: l=nobler,ou=Places,dc=example,dc=org
+objectClass: locality
+l: nobler
+
+dn: l=inheres,ou=Places,dc=example,dc=org
+objectClass: locality
+l: inheres
+
+dn: l=pulping,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pulping
+
+dn: l=brazened,ou=Places,dc=example,dc=org
+objectClass: locality
+l: brazened
+
+dn: l=math,ou=Places,dc=example,dc=org
+objectClass: locality
+l: math
+
+dn: l=safest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: safest
+
+dn: l=eves,ou=Places,dc=example,dc=org
+objectClass: locality
+l: eves
+
+dn: l=worthwhile,ou=Places,dc=example,dc=org
+objectClass: locality
+l: worthwhile
+
+dn: l=nibble,ou=Places,dc=example,dc=org
+objectClass: locality
+l: nibble
+
+dn: l=tailgating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tailgating
+
+dn: l=robes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: robes
+
+dn: l=pendants,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pendants
+
+dn: l=aphelia,ou=Places,dc=example,dc=org
+objectClass: locality
+l: aphelia
+
+dn: l=sportier,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sportier
+
+dn: l=twirl,ou=Places,dc=example,dc=org
+objectClass: locality
+l: twirl
+
+dn: l=swoon,ou=Places,dc=example,dc=org
+objectClass: locality
+l: swoon
+
+dn: l=splashed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: splashed
+
+dn: l=wherefore,ou=Places,dc=example,dc=org
+objectClass: locality
+l: wherefore
+
+dn: l=rid,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rid
+
+dn: l=tonal,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tonal
+
+dn: l=wigwam,ou=Places,dc=example,dc=org
+objectClass: locality
+l: wigwam
+
+dn: l=preemptive,ou=Places,dc=example,dc=org
+objectClass: locality
+l: preemptive
+
+dn: l=leeriest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: leeriest
+
+dn: l=comeback,ou=Places,dc=example,dc=org
+objectClass: locality
+l: comeback
+
+dn: l=spinier,ou=Places,dc=example,dc=org
+objectClass: locality
+l: spinier
+
+dn: l=tern,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tern
+
+dn: l=betrayer,ou=Places,dc=example,dc=org
+objectClass: locality
+l: betrayer
+
+dn: l=playfulness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: playfulness
+
+dn: l=disconnectedly,ou=Places,dc=example,dc=org
+objectClass: locality
+l: disconnectedly
+
+dn: l=penlight,ou=Places,dc=example,dc=org
+objectClass: locality
+l: penlight
+
+dn: l=denominations,ou=Places,dc=example,dc=org
+objectClass: locality
+l: denominations
+
+dn: l=rampage,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rampage
+
+dn: l=facilitate,ou=Places,dc=example,dc=org
+objectClass: locality
+l: facilitate
+
+dn: l=filibustering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: filibustering
+
+dn: l=deprave,ou=Places,dc=example,dc=org
+objectClass: locality
+l: deprave
+
+dn: l=belts,ou=Places,dc=example,dc=org
+objectClass: locality
+l: belts
+
+dn: l=perking,ou=Places,dc=example,dc=org
+objectClass: locality
+l: perking
+
+dn: l=defoliant,ou=Places,dc=example,dc=org
+objectClass: locality
+l: defoliant
+
+dn: l=plights,ou=Places,dc=example,dc=org
+objectClass: locality
+l: plights
+
+dn: l=loganberries,ou=Places,dc=example,dc=org
+objectClass: locality
+l: loganberries
+
+dn: l=warred,ou=Places,dc=example,dc=org
+objectClass: locality
+l: warred
+
+dn: l=effusively,ou=Places,dc=example,dc=org
+objectClass: locality
+l: effusively
+
+dn: l=miniskirt,ou=Places,dc=example,dc=org
+objectClass: locality
+l: miniskirt
+
+dn: l=regain,ou=Places,dc=example,dc=org
+objectClass: locality
+l: regain
+
+dn: l=buttock,ou=Places,dc=example,dc=org
+objectClass: locality
+l: buttock
+
+dn: l=jabbering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: jabbering
+
+dn: l=officials,ou=Places,dc=example,dc=org
+objectClass: locality
+l: officials
+
+dn: l=unreserved,ou=Places,dc=example,dc=org
+objectClass: locality
+l: unreserved
+
+dn: l=influencing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: influencing
+
+dn: l=flays,ou=Places,dc=example,dc=org
+objectClass: locality
+l: flays
+
+dn: l=stolid,ou=Places,dc=example,dc=org
+objectClass: locality
+l: stolid
+
+dn: l=immunizing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: immunizing
+
+dn: l=absenting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: absenting
+
+dn: l=forbids,ou=Places,dc=example,dc=org
+objectClass: locality
+l: forbids
+
+dn: l=organized,ou=Places,dc=example,dc=org
+objectClass: locality
+l: organized
+
+dn: l=desegregating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: desegregating
+
+dn: l=processioning,ou=Places,dc=example,dc=org
+objectClass: locality
+l: processioning
+
+dn: l=kidnaping,ou=Places,dc=example,dc=org
+objectClass: locality
+l: kidnaping
+
+dn: l=keyboarding,ou=Places,dc=example,dc=org
+objectClass: locality
+l: keyboarding
+
+dn: l=evolves,ou=Places,dc=example,dc=org
+objectClass: locality
+l: evolves
+
+dn: l=recording,ou=Places,dc=example,dc=org
+objectClass: locality
+l: recording
+
+dn: l=continuations,ou=Places,dc=example,dc=org
+objectClass: locality
+l: continuations
+
+dn: l=passageway,ou=Places,dc=example,dc=org
+objectClass: locality
+l: passageway
+
+dn: l=architecturally,ou=Places,dc=example,dc=org
+objectClass: locality
+l: architecturally
+
+dn: l=hoarse,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hoarse
+
+dn: l=quince,ou=Places,dc=example,dc=org
+objectClass: locality
+l: quince
+
+dn: l=prioritizing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: prioritizing
+
+dn: l=pharmacology,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pharmacology
+
+dn: l=forethought,ou=Places,dc=example,dc=org
+objectClass: locality
+l: forethought
+
+dn: l=conveniently,ou=Places,dc=example,dc=org
+objectClass: locality
+l: conveniently
+
+dn: l=oversight,ou=Places,dc=example,dc=org
+objectClass: locality
+l: oversight
+
+dn: l=pederasty,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pederasty
+
+dn: l=reprograming,ou=Places,dc=example,dc=org
+objectClass: locality
+l: reprograming
+
+dn: l=figure,ou=Places,dc=example,dc=org
+objectClass: locality
+l: figure
+
+dn: l=reverends,ou=Places,dc=example,dc=org
+objectClass: locality
+l: reverends
+
+dn: l=croissants,ou=Places,dc=example,dc=org
+objectClass: locality
+l: croissants
+
+dn: l=trustworthiness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: trustworthiness
+
+dn: l=prunes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: prunes
+
+dn: l=pneumonia,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pneumonia
+
+dn: l=distilling,ou=Places,dc=example,dc=org
+objectClass: locality
+l: distilling
+
+dn: l=maxing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: maxing
+
+dn: l=bloodthirstiest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bloodthirstiest
+
+dn: l=doctorate,ou=Places,dc=example,dc=org
+objectClass: locality
+l: doctorate
+
+dn: l=tads,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tads
+
+dn: l=publicizes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: publicizes
+
+dn: l=bookshop,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bookshop
+
+dn: l=burped,ou=Places,dc=example,dc=org
+objectClass: locality
+l: burped
+
+dn: l=gainful,ou=Places,dc=example,dc=org
+objectClass: locality
+l: gainful
+
+dn: l=newsreel,ou=Places,dc=example,dc=org
+objectClass: locality
+l: newsreel
+
+dn: l=oilfield,ou=Places,dc=example,dc=org
+objectClass: locality
+l: oilfield
+
+dn: l=predispose,ou=Places,dc=example,dc=org
+objectClass: locality
+l: predispose
+
+dn: l=encamp,ou=Places,dc=example,dc=org
+objectClass: locality
+l: encamp
+
+dn: l=seclusion,ou=Places,dc=example,dc=org
+objectClass: locality
+l: seclusion
+
+dn: l=emulsify,ou=Places,dc=example,dc=org
+objectClass: locality
+l: emulsify
+
+dn: l=finagler,ou=Places,dc=example,dc=org
+objectClass: locality
+l: finagler
+
+dn: l=correctly,ou=Places,dc=example,dc=org
+objectClass: locality
+l: correctly
+
+dn: l=willowy,ou=Places,dc=example,dc=org
+objectClass: locality
+l: willowy
+
+dn: l=absorption,ou=Places,dc=example,dc=org
+objectClass: locality
+l: absorption
+
+dn: l=specify,ou=Places,dc=example,dc=org
+objectClass: locality
+l: specify
+
+dn: l=fireplugs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: fireplugs
+
+dn: l=coriander,ou=Places,dc=example,dc=org
+objectClass: locality
+l: coriander
+
+dn: l=impertinently,ou=Places,dc=example,dc=org
+objectClass: locality
+l: impertinently
+
+dn: l=verminous,ou=Places,dc=example,dc=org
+objectClass: locality
+l: verminous
+
+dn: l=troubadours,ou=Places,dc=example,dc=org
+objectClass: locality
+l: troubadours
+
+dn: l=scad,ou=Places,dc=example,dc=org
+objectClass: locality
+l: scad
+
+dn: l=raggeder,ou=Places,dc=example,dc=org
+objectClass: locality
+l: raggeder
+
+dn: l=cantering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cantering
+
+dn: l=psychs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: psychs
+
+dn: l=gravel,ou=Places,dc=example,dc=org
+objectClass: locality
+l: gravel
+
+dn: l=seabeds,ou=Places,dc=example,dc=org
+objectClass: locality
+l: seabeds
+
+dn: l=unplumbed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: unplumbed
+
+dn: l=trickles,ou=Places,dc=example,dc=org
+objectClass: locality
+l: trickles
+
+dn: l=suicide,ou=Places,dc=example,dc=org
+objectClass: locality
+l: suicide
+
+dn: l=crowbar,ou=Places,dc=example,dc=org
+objectClass: locality
+l: crowbar
+
+dn: l=showing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: showing
+
+dn: l=miscarries,ou=Places,dc=example,dc=org
+objectClass: locality
+l: miscarries
+
+dn: l=epicenters,ou=Places,dc=example,dc=org
+objectClass: locality
+l: epicenters
+
+dn: l=topside,ou=Places,dc=example,dc=org
+objectClass: locality
+l: topside
+
+dn: l=tramped,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tramped
+
+dn: l=syllogisms,ou=Places,dc=example,dc=org
+objectClass: locality
+l: syllogisms
+
+dn: l=leggins,ou=Places,dc=example,dc=org
+objectClass: locality
+l: leggins
+
+dn: l=newel,ou=Places,dc=example,dc=org
+objectClass: locality
+l: newel
+
+dn: l=colonial,ou=Places,dc=example,dc=org
+objectClass: locality
+l: colonial
+
+dn: l=dusk,ou=Places,dc=example,dc=org
+objectClass: locality
+l: dusk
+
+dn: l=super,ou=Places,dc=example,dc=org
+objectClass: locality
+l: super
+
+dn: l=laser,ou=Places,dc=example,dc=org
+objectClass: locality
+l: laser
+
+dn: l=interruption,ou=Places,dc=example,dc=org
+objectClass: locality
+l: interruption
+
+dn: l=storm,ou=Places,dc=example,dc=org
+objectClass: locality
+l: storm
+
+dn: l=leaned,ou=Places,dc=example,dc=org
+objectClass: locality
+l: leaned
+
+dn: l=endurable,ou=Places,dc=example,dc=org
+objectClass: locality
+l: endurable
+
+dn: l=constriction,ou=Places,dc=example,dc=org
+objectClass: locality
+l: constriction
+
+dn: l=proviso,ou=Places,dc=example,dc=org
+objectClass: locality
+l: proviso
+
+dn: l=reopens,ou=Places,dc=example,dc=org
+objectClass: locality
+l: reopens
+
+dn: l=chauffeur,ou=Places,dc=example,dc=org
+objectClass: locality
+l: chauffeur
+
+dn: l=outrank,ou=Places,dc=example,dc=org
+objectClass: locality
+l: outrank
+
+dn: l=lasers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lasers
+
+dn: l=stacks,ou=Places,dc=example,dc=org
+objectClass: locality
+l: stacks
+
+dn: l=reliving,ou=Places,dc=example,dc=org
+objectClass: locality
+l: reliving
+
+dn: l=consciousnesses,ou=Places,dc=example,dc=org
+objectClass: locality
+l: consciousnesses
+
+dn: l=defaces,ou=Places,dc=example,dc=org
+objectClass: locality
+l: defaces
+
+dn: l=legitimates,ou=Places,dc=example,dc=org
+objectClass: locality
+l: legitimates
+
+dn: l=cantilevers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cantilevers
+
+dn: l=charting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: charting
+
+dn: l=futures,ou=Places,dc=example,dc=org
+objectClass: locality
+l: futures
+
+dn: l=femoral,ou=Places,dc=example,dc=org
+objectClass: locality
+l: femoral
+
+dn: l=uncovered,ou=Places,dc=example,dc=org
+objectClass: locality
+l: uncovered
+
+dn: l=trade,ou=Places,dc=example,dc=org
+objectClass: locality
+l: trade
+
+dn: l=passionless,ou=Places,dc=example,dc=org
+objectClass: locality
+l: passionless
+
+dn: l=squeamishness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: squeamishness
+
+dn: l=soccer,ou=Places,dc=example,dc=org
+objectClass: locality
+l: soccer
+
+dn: l=leans,ou=Places,dc=example,dc=org
+objectClass: locality
+l: leans
+
+dn: l=flaps,ou=Places,dc=example,dc=org
+objectClass: locality
+l: flaps
+
+dn: l=haggle,ou=Places,dc=example,dc=org
+objectClass: locality
+l: haggle
+
+dn: l=porcupine,ou=Places,dc=example,dc=org
+objectClass: locality
+l: porcupine
+
+dn: l=overselling,ou=Places,dc=example,dc=org
+objectClass: locality
+l: overselling
+
+dn: l=diverging,ou=Places,dc=example,dc=org
+objectClass: locality
+l: diverging
+
+dn: l=classiness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: classiness
+
+dn: l=behemoth,ou=Places,dc=example,dc=org
+objectClass: locality
+l: behemoth
+
+dn: l=bulimics,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bulimics
+
+dn: l=place,ou=Places,dc=example,dc=org
+objectClass: locality
+l: place
+
+dn: l=gangsters,ou=Places,dc=example,dc=org
+objectClass: locality
+l: gangsters
+
+dn: l=emulation,ou=Places,dc=example,dc=org
+objectClass: locality
+l: emulation
+
+dn: l=firehouses,ou=Places,dc=example,dc=org
+objectClass: locality
+l: firehouses
+
+dn: l=bogged,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bogged
+
+dn: l=hydroelectric,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hydroelectric
+
+dn: l=undershirts,ou=Places,dc=example,dc=org
+objectClass: locality
+l: undershirts
+
+dn: l=nostril,ou=Places,dc=example,dc=org
+objectClass: locality
+l: nostril
+
+dn: l=downed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: downed
+
+dn: l=populous,ou=Places,dc=example,dc=org
+objectClass: locality
+l: populous
+
+dn: l=sarcasm,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sarcasm
+
+dn: l=lab,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lab
+
+dn: l=coastlines,ou=Places,dc=example,dc=org
+objectClass: locality
+l: coastlines
+
+dn: l=teal,ou=Places,dc=example,dc=org
+objectClass: locality
+l: teal
+
+dn: l=peaceably,ou=Places,dc=example,dc=org
+objectClass: locality
+l: peaceably
+
+dn: l=lynchings,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lynchings
+
+dn: l=curacy,ou=Places,dc=example,dc=org
+objectClass: locality
+l: curacy
+
+dn: l=monsignori,ou=Places,dc=example,dc=org
+objectClass: locality
+l: monsignori
+
+dn: l=hurt,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hurt
+
+dn: l=spine,ou=Places,dc=example,dc=org
+objectClass: locality
+l: spine
+
+dn: l=diplomatically,ou=Places,dc=example,dc=org
+objectClass: locality
+l: diplomatically
+
+dn: l=fests,ou=Places,dc=example,dc=org
+objectClass: locality
+l: fests
+
+dn: l=replies,ou=Places,dc=example,dc=org
+objectClass: locality
+l: replies
+
+dn: l=philosophizes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: philosophizes
+
+dn: l=windbreakers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: windbreakers
+
+dn: l=floatation,ou=Places,dc=example,dc=org
+objectClass: locality
+l: floatation
+
+dn: l=tidiest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tidiest
+
+dn: l=championing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: championing
+
+dn: l=hiccuping,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hiccuping
+
+dn: l=accidents,ou=Places,dc=example,dc=org
+objectClass: locality
+l: accidents
+
+dn: l=setback,ou=Places,dc=example,dc=org
+objectClass: locality
+l: setback
+
+dn: l=seafarer,ou=Places,dc=example,dc=org
+objectClass: locality
+l: seafarer
+
+dn: l=enriched,ou=Places,dc=example,dc=org
+objectClass: locality
+l: enriched
+
+dn: l=cablegram,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cablegram
+
+dn: l=supernovas,ou=Places,dc=example,dc=org
+objectClass: locality
+l: supernovas
+
+dn: l=rehashed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rehashed
+
+dn: l=asymptotic,ou=Places,dc=example,dc=org
+objectClass: locality
+l: asymptotic
+
+dn: l=infantile,ou=Places,dc=example,dc=org
+objectClass: locality
+l: infantile
+
+dn: l=wipe,ou=Places,dc=example,dc=org
+objectClass: locality
+l: wipe
+
+dn: l=rebinds,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rebinds
+
+dn: l=cycling,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cycling
+
+dn: l=jelling,ou=Places,dc=example,dc=org
+objectClass: locality
+l: jelling
+
+dn: l=superintend,ou=Places,dc=example,dc=org
+objectClass: locality
+l: superintend
+
+dn: l=boomerangs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: boomerangs
+
+dn: l=bray,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bray
+
+dn: l=grapes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: grapes
+
+dn: l=esthetic,ou=Places,dc=example,dc=org
+objectClass: locality
+l: esthetic
+
+dn: l=pomp,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pomp
+
+dn: l=slivered,ou=Places,dc=example,dc=org
+objectClass: locality
+l: slivered
+
+dn: l=cavilled,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cavilled
+
+dn: l=auctioneers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: auctioneers
+
+dn: l=autoimmune,ou=Places,dc=example,dc=org
+objectClass: locality
+l: autoimmune
+
+dn: l=instil,ou=Places,dc=example,dc=org
+objectClass: locality
+l: instil
+
+dn: l=sentimentalize,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sentimentalize
+
+dn: l=q,ou=Places,dc=example,dc=org
+objectClass: locality
+l: q
+
+dn: l=incognito,ou=Places,dc=example,dc=org
+objectClass: locality
+l: incognito
+
+dn: l=camshaft,ou=Places,dc=example,dc=org
+objectClass: locality
+l: camshaft
+
+dn: l=obsessive,ou=Places,dc=example,dc=org
+objectClass: locality
+l: obsessive
+
+dn: l=ninetieths,ou=Places,dc=example,dc=org
+objectClass: locality
+l: ninetieths
+
+dn: l=masterworks,ou=Places,dc=example,dc=org
+objectClass: locality
+l: masterworks
+
+dn: l=opalescent,ou=Places,dc=example,dc=org
+objectClass: locality
+l: opalescent
+
+dn: l=gales,ou=Places,dc=example,dc=org
+objectClass: locality
+l: gales
+
+dn: l=everywhere,ou=Places,dc=example,dc=org
+objectClass: locality
+l: everywhere
+
+dn: l=termination,ou=Places,dc=example,dc=org
+objectClass: locality
+l: termination
+
+dn: l=johns,ou=Places,dc=example,dc=org
+objectClass: locality
+l: johns
+
+dn: l=compounded,ou=Places,dc=example,dc=org
+objectClass: locality
+l: compounded
+
+dn: l=oversteps,ou=Places,dc=example,dc=org
+objectClass: locality
+l: oversteps
+
+dn: l=manufactured,ou=Places,dc=example,dc=org
+objectClass: locality
+l: manufactured
+
+dn: l=parentage,ou=Places,dc=example,dc=org
+objectClass: locality
+l: parentage
+
+dn: l=opposition,ou=Places,dc=example,dc=org
+objectClass: locality
+l: opposition
+
+dn: l=descriptions,ou=Places,dc=example,dc=org
+objectClass: locality
+l: descriptions
+
+dn: l=spinals,ou=Places,dc=example,dc=org
+objectClass: locality
+l: spinals
+
+dn: l=bedeck,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bedeck
+
+dn: l=brandishing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: brandishing
+
+dn: l=turquoises,ou=Places,dc=example,dc=org
+objectClass: locality
+l: turquoises
+
+dn: l=compositions,ou=Places,dc=example,dc=org
+objectClass: locality
+l: compositions
+
+dn: l=kestrels,ou=Places,dc=example,dc=org
+objectClass: locality
+l: kestrels
+
+dn: l=deletes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: deletes
+
+dn: l=speaking,ou=Places,dc=example,dc=org
+objectClass: locality
+l: speaking
+
+dn: l=endorsers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: endorsers
+
+dn: l=fucks,ou=Places,dc=example,dc=org
+objectClass: locality
+l: fucks
+
+dn: l=talk,ou=Places,dc=example,dc=org
+objectClass: locality
+l: talk
+
+dn: l=footnotes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: footnotes
+
+dn: l=snider,ou=Places,dc=example,dc=org
+objectClass: locality
+l: snider
+
+dn: l=porridge,ou=Places,dc=example,dc=org
+objectClass: locality
+l: porridge
+
+dn: l=appals,ou=Places,dc=example,dc=org
+objectClass: locality
+l: appals
+
+dn: l=distinguishable,ou=Places,dc=example,dc=org
+objectClass: locality
+l: distinguishable
+
+dn: l=seismographs,ou=Places,dc=example,dc=org
+objectClass: locality
+l: seismographs
+
+dn: l=peaked,ou=Places,dc=example,dc=org
+objectClass: locality
+l: peaked
+
+dn: l=squandering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: squandering
+
+dn: l=exempting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: exempting
+
+dn: l=decrescendo,ou=Places,dc=example,dc=org
+objectClass: locality
+l: decrescendo
+
+dn: l=cratering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cratering
+
+dn: l=padlocking,ou=Places,dc=example,dc=org
+objectClass: locality
+l: padlocking
+
+dn: l=bunions,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bunions
+
+dn: l=privy,ou=Places,dc=example,dc=org
+objectClass: locality
+l: privy
+
+dn: l=serf,ou=Places,dc=example,dc=org
+objectClass: locality
+l: serf
+
+dn: l=regarded,ou=Places,dc=example,dc=org
+objectClass: locality
+l: regarded
+
+dn: l=cretinous,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cretinous
+
+dn: l=hashing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hashing
+
+dn: l=exultant,ou=Places,dc=example,dc=org
+objectClass: locality
+l: exultant
+
+dn: l=immoderate,ou=Places,dc=example,dc=org
+objectClass: locality
+l: immoderate
+
+dn: l=depopulated,ou=Places,dc=example,dc=org
+objectClass: locality
+l: depopulated
+
+dn: l=grieves,ou=Places,dc=example,dc=org
+objectClass: locality
+l: grieves
+
+dn: l=mead,ou=Places,dc=example,dc=org
+objectClass: locality
+l: mead
+
+dn: l=clops,ou=Places,dc=example,dc=org
+objectClass: locality
+l: clops
+
+dn: l=mollycoddle,ou=Places,dc=example,dc=org
+objectClass: locality
+l: mollycoddle
+
+dn: l=advisor,ou=Places,dc=example,dc=org
+objectClass: locality
+l: advisor
+
+dn: l=gossipped,ou=Places,dc=example,dc=org
+objectClass: locality
+l: gossipped
+
+dn: l=grandfathered,ou=Places,dc=example,dc=org
+objectClass: locality
+l: grandfathered
+
+dn: l=exalt,ou=Places,dc=example,dc=org
+objectClass: locality
+l: exalt
+
+dn: l=rethinking,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rethinking
+
+dn: l=dockyards,ou=Places,dc=example,dc=org
+objectClass: locality
+l: dockyards
+
+dn: l=players,ou=Places,dc=example,dc=org
+objectClass: locality
+l: players
+
+dn: l=misusing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: misusing
+
+dn: l=troys,ou=Places,dc=example,dc=org
+objectClass: locality
+l: troys
+
+dn: l=publican,ou=Places,dc=example,dc=org
+objectClass: locality
+l: publican
+
+dn: l=slouch,ou=Places,dc=example,dc=org
+objectClass: locality
+l: slouch
+
+dn: l=racking,ou=Places,dc=example,dc=org
+objectClass: locality
+l: racking
+
+dn: l=exploiting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: exploiting
+
+dn: l=pissed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pissed
+
+dn: l=accomplishing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: accomplishing
+
+dn: l=meagerness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: meagerness
+
+dn: l=stenography,ou=Places,dc=example,dc=org
+objectClass: locality
+l: stenography
+
+dn: l=parasites,ou=Places,dc=example,dc=org
+objectClass: locality
+l: parasites
+
+dn: l=pigskin,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pigskin
+
+dn: l=mackinaw,ou=Places,dc=example,dc=org
+objectClass: locality
+l: mackinaw
+
+dn: l=harpsichords,ou=Places,dc=example,dc=org
+objectClass: locality
+l: harpsichords
+
+dn: l=galling,ou=Places,dc=example,dc=org
+objectClass: locality
+l: galling
+
+dn: l=refunded,ou=Places,dc=example,dc=org
+objectClass: locality
+l: refunded
+
+dn: l=situations,ou=Places,dc=example,dc=org
+objectClass: locality
+l: situations
+
+dn: l=programmable,ou=Places,dc=example,dc=org
+objectClass: locality
+l: programmable
+
+dn: l=clew,ou=Places,dc=example,dc=org
+objectClass: locality
+l: clew
+
+dn: l=anteroom,ou=Places,dc=example,dc=org
+objectClass: locality
+l: anteroom
+
+dn: l=barbered,ou=Places,dc=example,dc=org
+objectClass: locality
+l: barbered
+
+dn: l=psychotherapists,ou=Places,dc=example,dc=org
+objectClass: locality
+l: psychotherapists
+
+dn: l=copycatted,ou=Places,dc=example,dc=org
+objectClass: locality
+l: copycatted
+
+dn: l=parented,ou=Places,dc=example,dc=org
+objectClass: locality
+l: parented
+
+dn: l=rally,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rally
+
+dn: l=mustiness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: mustiness
+
+dn: l=abetter,ou=Places,dc=example,dc=org
+objectClass: locality
+l: abetter
+
+dn: l=accommodated,ou=Places,dc=example,dc=org
+objectClass: locality
+l: accommodated
+
+dn: l=exactitude,ou=Places,dc=example,dc=org
+objectClass: locality
+l: exactitude
+
+dn: l=doghouses,ou=Places,dc=example,dc=org
+objectClass: locality
+l: doghouses
+
+dn: l=politest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: politest
+
+dn: l=submersing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: submersing
+
+dn: l=consummates,ou=Places,dc=example,dc=org
+objectClass: locality
+l: consummates
+
+dn: l=flutter,ou=Places,dc=example,dc=org
+objectClass: locality
+l: flutter
+
+dn: l=prefer,ou=Places,dc=example,dc=org
+objectClass: locality
+l: prefer
+
+dn: l=tampers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: tampers
+
+dn: l=pocketbooks,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pocketbooks
+
+dn: l=expurgates,ou=Places,dc=example,dc=org
+objectClass: locality
+l: expurgates
+
+dn: l=telecommuters,ou=Places,dc=example,dc=org
+objectClass: locality
+l: telecommuters
+
+dn: l=cool,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cool
+
+dn: l=coarsest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: coarsest
+
+dn: l=lightheaded,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lightheaded
+
+dn: l=sphere,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sphere
+
+dn: l=proclivity,ou=Places,dc=example,dc=org
+objectClass: locality
+l: proclivity
+
+dn: l=toothbrush,ou=Places,dc=example,dc=org
+objectClass: locality
+l: toothbrush
+
+dn: l=cosmetically,ou=Places,dc=example,dc=org
+objectClass: locality
+l: cosmetically
+
+dn: l=hailstone,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hailstone
+
+dn: l=realm,ou=Places,dc=example,dc=org
+objectClass: locality
+l: realm
+
+dn: l=survival,ou=Places,dc=example,dc=org
+objectClass: locality
+l: survival
+
+dn: l=misanthropes,ou=Places,dc=example,dc=org
+objectClass: locality
+l: misanthropes
+
+dn: l=retrospect,ou=Places,dc=example,dc=org
+objectClass: locality
+l: retrospect
+
+dn: l=underachieved,ou=Places,dc=example,dc=org
+objectClass: locality
+l: underachieved
+
+dn: l=derringer,ou=Places,dc=example,dc=org
+objectClass: locality
+l: derringer
+
+dn: l=typographers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: typographers
+
+dn: l=misstate,ou=Places,dc=example,dc=org
+objectClass: locality
+l: misstate
+
+dn: l=undergarment,ou=Places,dc=example,dc=org
+objectClass: locality
+l: undergarment
+
+dn: l=lawgivers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lawgivers
+
+dn: l=mittens,ou=Places,dc=example,dc=org
+objectClass: locality
+l: mittens
+
+dn: l=unhorsed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: unhorsed
+
+dn: l=simpleness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: simpleness
+
+dn: l=snapped,ou=Places,dc=example,dc=org
+objectClass: locality
+l: snapped
+
+dn: l=ongoing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: ongoing
+
+dn: l=pompon,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pompon
+
+dn: l=yapped,ou=Places,dc=example,dc=org
+objectClass: locality
+l: yapped
+
+dn: l=undisguised,ou=Places,dc=example,dc=org
+objectClass: locality
+l: undisguised
+
+dn: l=felonies,ou=Places,dc=example,dc=org
+objectClass: locality
+l: felonies
+
+dn: l=symmetricly,ou=Places,dc=example,dc=org
+objectClass: locality
+l: symmetricly
+
+dn: l=obscurities,ou=Places,dc=example,dc=org
+objectClass: locality
+l: obscurities
+
+dn: l=pharynx,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pharynx
+
+dn: l=saltshakers,ou=Places,dc=example,dc=org
+objectClass: locality
+l: saltshakers
+
+dn: l=seats,ou=Places,dc=example,dc=org
+objectClass: locality
+l: seats
+
+dn: l=shrubby,ou=Places,dc=example,dc=org
+objectClass: locality
+l: shrubby
+
+dn: l=domination,ou=Places,dc=example,dc=org
+objectClass: locality
+l: domination
+
+dn: l=outwears,ou=Places,dc=example,dc=org
+objectClass: locality
+l: outwears
+
+dn: l=issue,ou=Places,dc=example,dc=org
+objectClass: locality
+l: issue
+
+dn: l=commutative,ou=Places,dc=example,dc=org
+objectClass: locality
+l: commutative
+
+dn: l=shunts,ou=Places,dc=example,dc=org
+objectClass: locality
+l: shunts
+
+dn: l=superhighways,ou=Places,dc=example,dc=org
+objectClass: locality
+l: superhighways
+
+dn: l=switchbacks,ou=Places,dc=example,dc=org
+objectClass: locality
+l: switchbacks
+
+dn: l=prawned,ou=Places,dc=example,dc=org
+objectClass: locality
+l: prawned
+
+dn: l=hinder,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hinder
+
+dn: l=pack,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pack
+
+dn: l=optometry,ou=Places,dc=example,dc=org
+objectClass: locality
+l: optometry
+
+dn: l=piqued,ou=Places,dc=example,dc=org
+objectClass: locality
+l: piqued
+
+dn: l=merriment,ou=Places,dc=example,dc=org
+objectClass: locality
+l: merriment
+
+dn: l=circumlocutions,ou=Places,dc=example,dc=org
+objectClass: locality
+l: circumlocutions
+
+dn: l=nitpicked,ou=Places,dc=example,dc=org
+objectClass: locality
+l: nitpicked
+
+dn: l=anthems,ou=Places,dc=example,dc=org
+objectClass: locality
+l: anthems
+
+dn: l=rancher,ou=Places,dc=example,dc=org
+objectClass: locality
+l: rancher
+
+dn: l=macerated,ou=Places,dc=example,dc=org
+objectClass: locality
+l: macerated
+
+dn: l=spontaneously,ou=Places,dc=example,dc=org
+objectClass: locality
+l: spontaneously
+
+dn: l=lubricate,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lubricate
+
+dn: l=busyness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: busyness
+
+dn: l=lamentation,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lamentation
+
+dn: l=lodestar,ou=Places,dc=example,dc=org
+objectClass: locality
+l: lodestar
+
+dn: l=astonishingly,ou=Places,dc=example,dc=org
+objectClass: locality
+l: astonishingly
+
+dn: l=snaring,ou=Places,dc=example,dc=org
+objectClass: locality
+l: snaring
+
+dn: l=greatness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: greatness
+
+dn: l=pharmacopeia,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pharmacopeia
+
+dn: l=ingredients,ou=Places,dc=example,dc=org
+objectClass: locality
+l: ingredients
+
+dn: l=chives,ou=Places,dc=example,dc=org
+objectClass: locality
+l: chives
+
+dn: l=hirelings,ou=Places,dc=example,dc=org
+objectClass: locality
+l: hirelings
+
+dn: l=discerns,ou=Places,dc=example,dc=org
+objectClass: locality
+l: discerns
+
+dn: l=heights,ou=Places,dc=example,dc=org
+objectClass: locality
+l: heights
+
+dn: l=agglutinated,ou=Places,dc=example,dc=org
+objectClass: locality
+l: agglutinated
+
+dn: l=reflectors,ou=Places,dc=example,dc=org
+objectClass: locality
+l: reflectors
+
+dn: l=negation,ou=Places,dc=example,dc=org
+objectClass: locality
+l: negation
+
+dn: l=smooches,ou=Places,dc=example,dc=org
+objectClass: locality
+l: smooches
+
+dn: l=norm,ou=Places,dc=example,dc=org
+objectClass: locality
+l: norm
+
+dn: l=individualizing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: individualizing
+
+dn: l=joules,ou=Places,dc=example,dc=org
+objectClass: locality
+l: joules
+
+dn: l=yammering,ou=Places,dc=example,dc=org
+objectClass: locality
+l: yammering
+
+dn: l=bacterias,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bacterias
+
+dn: l=bemoaning,ou=Places,dc=example,dc=org
+objectClass: locality
+l: bemoaning
+
+dn: l=pianists,ou=Places,dc=example,dc=org
+objectClass: locality
+l: pianists
+
+dn: l=orating,ou=Places,dc=example,dc=org
+objectClass: locality
+l: orating
+
+dn: l=defender,ou=Places,dc=example,dc=org
+objectClass: locality
+l: defender
+
+dn: l=declassified,ou=Places,dc=example,dc=org
+objectClass: locality
+l: declassified
+
+dn: l=people,ou=Places,dc=example,dc=org
+objectClass: locality
+l: people
+
+dn: l=turnouts,ou=Places,dc=example,dc=org
+objectClass: locality
+l: turnouts
+
+dn: l=retraced,ou=Places,dc=example,dc=org
+objectClass: locality
+l: retraced
+
+dn: l=interoffice,ou=Places,dc=example,dc=org
+objectClass: locality
+l: interoffice
+
+dn: l=impregnably,ou=Places,dc=example,dc=org
+objectClass: locality
+l: impregnably
+
+dn: l=strap,ou=Places,dc=example,dc=org
+objectClass: locality
+l: strap
+
+dn: l=vacationing,ou=Places,dc=example,dc=org
+objectClass: locality
+l: vacationing
+
+dn: l=upchucked,ou=Places,dc=example,dc=org
+objectClass: locality
+l: upchucked
+
+dn: l=timings,ou=Places,dc=example,dc=org
+objectClass: locality
+l: timings
+
+dn: l=scavenging,ou=Places,dc=example,dc=org
+objectClass: locality
+l: scavenging
+
+dn: l=flabbiest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: flabbiest
+
+dn: l=menagerie,ou=Places,dc=example,dc=org
+objectClass: locality
+l: menagerie
+
+dn: l=decidedly,ou=Places,dc=example,dc=org
+objectClass: locality
+l: decidedly
+
+dn: l=journey,ou=Places,dc=example,dc=org
+objectClass: locality
+l: journey
+
+dn: l=uppity,ou=Places,dc=example,dc=org
+objectClass: locality
+l: uppity
+
+dn: l=invade,ou=Places,dc=example,dc=org
+objectClass: locality
+l: invade
+
+dn: l=teemed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: teemed
+
+dn: l=vulture,ou=Places,dc=example,dc=org
+objectClass: locality
+l: vulture
+
+dn: l=contributors,ou=Places,dc=example,dc=org
+objectClass: locality
+l: contributors
+
+dn: l=instruct,ou=Places,dc=example,dc=org
+objectClass: locality
+l: instruct
+
+dn: l=senselessness,ou=Places,dc=example,dc=org
+objectClass: locality
+l: senselessness
+
+dn: l=scarfed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: scarfed
+
+dn: l=topped,ou=Places,dc=example,dc=org
+objectClass: locality
+l: topped
+
+dn: l=distorting,ou=Places,dc=example,dc=org
+objectClass: locality
+l: distorting
+
+dn: l=sappiest,ou=Places,dc=example,dc=org
+objectClass: locality
+l: sappiest
+
+dn: l=viscus,ou=Places,dc=example,dc=org
+objectClass: locality
+l: viscus
+
+dn: l=firmed,ou=Places,dc=example,dc=org
+objectClass: locality
+l: firmed
+
+dn: l=haven't,ou=Places,dc=example,dc=org
+objectClass: locality
+l: haven't

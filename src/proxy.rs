@@ -4,15 +4,17 @@
 //! client's behalf, hands back the server's certificate chain so the CLIENT can judge who it
 //! reached, and then moves bytes until one side stops.
 
-use crate::auth::Sessions;
+use crate::app::App;
 use crate::config::{Tls, VerifyMode};
-use crate::policy::{Catalogue, Denied};
+use crate::policy::{resolve, Denied, PolicyError};
 use crate::resolve::resolve_one;
+use crate::store::User;
 
 use futures_util::{SinkExt, StreamExt};
 use ironrdp_rdcleanpath::{RDCleanPath, RDCleanPathPdu};
+use std::future::Future;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
@@ -38,9 +40,12 @@ pub enum SessionError {
     Tls(String),
 }
 
-pub struct Session {
-    pub catalogue: Arc<Catalogue>,
-    pub tls: Arc<TlsSetup>,
+/// One RDP session for a signed-in user. The WebSocket carrying it was already authenticated by the
+/// user's sign-in cookie; the connect ticket inside the RDCleanPath request names the server.
+pub struct Session<'a> {
+    pub app: &'a App,
+    pub user: &'a User,
+    pub peer: std::net::SocketAddr,
 }
 
 pub struct TlsSetup {
@@ -48,12 +53,18 @@ pub struct TlsSetup {
     pub mode: VerifyMode,
 }
 
-impl Session {
-    pub async fn run(
+impl Session<'_> {
+    /// Run until either side stops or `cancel` fires, which is how a revoked user's session ends.
+    pub async fn run<S>(
         &self,
-        mut ws: WebSocketStream<TcpStream>,
-        peer: std::net::SocketAddr,
-    ) -> Result<(), SessionError> {
+        mut ws: WebSocketStream<S>,
+        cancel: impl Future<Output = ()>,
+    ) -> Result<(), SessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let peer = self.peer;
+        let subject = self.user.username.as_str();
         // 1. The client's RDCleanPath request.
         let first = loop {
             match ws.next().await {
@@ -87,27 +98,38 @@ impl Session {
             | RDCleanPath::NegotiationErr { .. } => return Err(SessionError::NotARequest),
         };
 
-        // THE DESTINATION FIELD CARRIES A TARGET ID, NOT AN ADDRESS. RDCleanPath was designed for a
-        // client that names a host; here the field is an opaque key into the allowlist, so "reach an
-        // arbitrary host" is not a request this protocol can express.
-        let identity = match Sessions::global().authenticate(&proxy_auth) {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(%peer, error = %e, "proxy authentication refused");
+        // THE DESTINATION FIELD CARRIES A SERVER ID, NOT AN ADDRESS, so "reach an arbitrary host" is
+        // not a request this protocol can express. The ticket must have been minted for this user
+        // and this server, and is spent here whatever happens next.
+        let ticket = match self.app.tickets.redeem(&proxy_auth) {
+            Some(t) if t.user_id == self.user.id => t,
+            Some(_) => {
+                warn!(%peer, %subject, "connect ticket belongs to another user");
+                return self.refuse(ws).await;
+            }
+            None => {
+                warn!(%peer, %subject, "connect ticket unknown, spent or expired");
                 return self.refuse(ws).await;
             }
         };
 
-        let target = match self.catalogue.resolve(&identity, &target_id) {
-            Ok(t) => t,
-            Err(reason) => {
-                // The log distinguishes these. The client does not: telling an unauthenticated
-                // caller "no such target" builds them an enumeration oracle.
+        let target = match resolve(&self.app.store, self.user.id, &target_id) {
+            Ok(t) if t.id == ticket.server_id => t,
+            Ok(t) => {
+                warn!(%peer, %subject, requested = %t.id, ticketed = %ticket.server_id, "ticket was minted for a different server");
+                return self.refuse(ws).await;
+            }
+            Err(PolicyError::Denied(reason)) => {
+                // The log distinguishes these. The client does not.
                 let detail = match reason {
-                    Denied::NoSuchTarget => "no such target",
-                    Denied::NotPermitted => "not permitted for this identity",
+                    Denied::NoSuchTarget => "no such server",
+                    Denied::NotPermitted => "not assigned to this user",
                 };
-                warn!(%peer, subject = %identity.subject, target = %target_id, %detail, "refused");
+                warn!(%peer, %subject, target = %target_id, %detail, "refused");
+                return self.refuse(ws).await;
+            }
+            Err(PolicyError::Store(e)) => {
+                warn!(%peer, %subject, error = %e, "store error while resolving");
                 return self.refuse(ws).await;
             }
         };
@@ -115,16 +137,21 @@ impl Session {
         let addr = match resolve_one(&target.host, target.port).await {
             Ok(a) => a,
             Err(e) => {
-                warn!(%peer, subject = %identity.subject, target = %target.id, error = %e, "resolution failed, failing closed");
+                warn!(%peer, %subject, target = %target.name, error = %e, "resolution failed, failing closed");
                 return self.refuse(ws).await;
             }
         };
 
         // Name AND address, together, because they are the two halves of "which machine was this".
         info!(
-            %peer, subject = %identity.subject, target = %target.id,
-            host = %target.host, %addr, verify = ?self.tls.mode,
+            %peer, %subject, target = %target.name,
+            host = %target.host, %addr, verify = ?self.app.target_tls.mode,
             "opening session"
+        );
+        self.app.store.audit(
+            subject,
+            "session.open",
+            &format!("{} ({} -> {addr})", target.name, target.host),
         );
 
         // 2. X.224, in the clear, exactly as the client sent it.
@@ -137,7 +164,8 @@ impl Session {
         let server_name = rustls_pki_types::ServerName::try_from(target.host.clone())
             .map_err(|e| SessionError::Tls(e.to_string()))?;
         let tls = self
-            .tls
+            .app
+            .target_tls
             .connector
             .connect(server_name, tcp)
             .await
@@ -186,17 +214,38 @@ impl Session {
             Ok::<_, SessionError>(())
         };
 
+        // Registered only once the session is really up, so the list's "connected" marker and the
+        // revocation sweep see real sessions.
+        let (live_id, revoked) = self.app.live.register(self.user.id, target.id);
         let outcome = tokio::select! {
             r = to_server => r,
             r = to_client => r,
+            _ = revoked => {
+                info!(%peer, %subject, target = %target.name, "session ended by revocation");
+                Ok(())
+            }
+            _ = cancel => Ok(()),
         };
+        self.app.live.unregister(live_id);
 
-        info!(%peer, subject = %identity.subject, target = %target.id, "session closed");
+        // Closing the TCP connection is a DISCONNECT to Windows, not a sign-out: the desktop stays,
+        // and the same account reconnecting to this server picks it up again.
+        if let Err(e) = self
+            .app
+            .store
+            .session_ended(self.user.id, target.id, crate::store::now())
+        {
+            warn!(error = %e, "could not record the session end");
+        }
+        info!(%peer, %subject, target = %target.name, "session closed");
         outcome
     }
 
     /// One refusal shape for every denial, so the client learns nothing from which one it hit.
-    async fn refuse(&self, mut ws: WebSocketStream<TcpStream>) -> Result<(), SessionError> {
+    async fn refuse<S>(&self, mut ws: WebSocketStream<S>) -> Result<(), SessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let err = RDCleanPathPdu::new_general_error();
         if let Ok(der) = err.to_der() {
             let _ = ws.send(Message::Binary(der)).await;

@@ -1,0 +1,25 @@
+dn: olcDatabase={1}mdb,cn=config
+objectClass: olcMdbConfig
+objectClass: olcDatabaseConfig
+olcDatabase: {1}mdb
+olcDbDirectory: db/main
+olcSuffix: dc=example,dc=org
+olcRootDN: cn=Manager,dc=example,dc=org
+olcRootPw: secret
+olcDbIndex: objectClass eq
+olcDbMaxSize: 10485760
+olcLimits: {0}anonymous size.prtotal=unlimited
+olcAccess: {0}to attrs=userPassword
+  by self write
+  by anonymous auth
+  by * none
+olcAccess: {1}to * by * read
+
+dn: olcDatabase={2}monitor,cn=config
+objectClass: olcMonitorConfig
+objectClass: olcDatabaseConfig
+olcDatabase: {2}monitor
+olcAccess: {0}to *
+  by dn.exact="cn=Manager,dc=example,dc=org" write
+  by * none
+

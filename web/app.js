@@ -1,7 +1,4 @@
-// Served as a file, not inlined. The proxy's Content-Security-Policy allows `script-src 'self'`,
-// which permits this and forbids an inline <script>. An inline module block is dropped without a
-// console error visible on the page, so the only symptom is a status that never leaves "loading".
-// Measured 2026-09-23.
+// Served as a file, not inlined: the proxy's Content-Security-Policy allows `script-src 'self'`.
 
 import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction, ClipboardData, Extension }
   from './ironrdp_web.js';
@@ -13,70 +10,264 @@ const say = (text, bad = false) => {
   $('status').classList.toggle('bad', bad);
 };
 
-// Same origin as the page that was served, so there is nothing to configure and no way to point the
-// client at a different proxy.
+// Same origin as the page, so there is nothing to configure and no way to point the client elsewhere.
 const proxyAddress = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
 
-let token = '';
 let session = null;
+let servers = new Map();   // id -> server, from the last list load
 
-try {
-  say('loading the client');
+// The RDP client loads in the background while the user signs in and picks a server.
+const clientReady = (async () => {
   await init();
   setup('info');
-} catch (err) {
-  say('the RDP client failed to load: ' + describe(err), true);
-  throw err;
+})();
+clientReady.catch(err => say('the RDP client failed to load: ' + describe(err), true));
+
+/* ---- API ---------------------------------------------------------------------------------- */
+
+class SignedOut extends Error {}
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    cache: 'no-store',
+    headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (res.status === 401 && path !== '/api/login') throw new SignedOut();
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+  return data;
 }
 
-// The launcher's contents come from the proxy's own allowlist, filtered by the same predicate the
-// connection will use. Nothing is typed in: the systems are listed because the config lists them,
-// and the proxy token arrives with them.
-try {
-  const res = await fetch('/api/targets', { cache: 'no-store' });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  const data = await res.json();
-  token = data.token;
-  render(data.targets || []);
-} catch (err) {
-  say('could not load the system list: ' + describe(err), true);
-}
+/* ---- views -------------------------------------------------------------------------------- */
 
-function render(targets) {
-  const tiles = $('tiles');
-  tiles.innerHTML = '';
-  if (!targets.length) {
-    const p = document.createElement('p');
-    p.className = 'empty';
-    p.textContent = "No systems. The proxy's allowlist is empty, or no policy grants this identity a tag that any target carries. Both are edited in config.toml.";
-    tiles.append(p);
-    say('no systems available');
-    return;
+function show(view) {
+  $('login').hidden = view !== 'login';
+  $('list').hidden = view !== 'list';
+  const signedIn = view === 'list';
+  $('signout').hidden = !signedIn;
+  if (!signedIn) {
+    $('admin-link').hidden = true;
+    $('who').textContent = '';
   }
-  for (const t of targets) {
-    const b = document.createElement('button');
-    b.className = 'tile';
-    const name = document.createElement('div');
-    name.className = 'name';
-    name.textContent = t.id;
-    const tags = document.createElement('div');
-    tags.className = 'tags';
-    for (const tag of t.tags || []) {
-      const chip = document.createElement('span');
-      chip.className = 'tag';
-      chip.textContent = tag;   // textContent, never innerHTML: these come from a config file
-      tags.append(chip);
+}
+
+function showLogin(message) {
+  show('login');
+  say('sign in');
+  const err = $('login-error');
+  err.hidden = !message;
+  err.textContent = message || '';
+  $('lp').value = '';
+  ($('lu').value ? $('lp') : $('lu')).focus();
+}
+
+async function showList() {
+  let me;
+  try {
+    me = await api('GET', '/api/me');
+  } catch (err) {
+    if (err instanceof SignedOut) return showLogin();
+    return say('could not reach the proxy: ' + describe(err), true);
+  }
+  $('who').textContent = me.display_name || me.username;
+  $('admin-link').hidden = !me.is_admin;
+  show('list');
+  await loadServers();
+}
+
+$('login-form').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const go = $('login-go');
+  go.disabled = true;
+  $('login-error').hidden = true;
+  say('signing in');
+  try {
+    await api('POST', '/api/login', { username: $('lu').value, password: $('lp').value });
+    $('lp').value = '';
+    await showList();
+  } catch (err) {
+    showLogin(err.message);
+  } finally {
+    go.disabled = false;
+  }
+});
+
+$('signout').addEventListener('click', async () => {
+  try { await api('POST', '/api/logout'); } catch { /* signed out either way */ }
+  showLogin();
+});
+
+/* ---- the server list ---------------------------------------------------------------------- */
+
+// Which groups are collapsed, remembered per browser. Storage can be unavailable; the list works
+// the same without it.
+const COLLAPSED_KEY = 'wa:collapsed';
+function loadCollapsed() {
+  try { return new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) || '[]')); } catch { return new Set(); }
+}
+function saveCollapsed(set) {
+  try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set])); } catch { /* not persisted */ }
+}
+let collapsed = loadCollapsed();
+
+const SAVED_ICON = 'M7 14a5 5 0 1 1 4.9-6h9.1v3h-2v3h-3v-3h-4.1A5 5 0 0 1 7 14zm0-3a2 2 0 1 0 0-4 2 2 0 0 0 0 4z';
+
+function icon(path, title) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('aria-hidden', 'true');
+  const p = document.createElementNS(ns, 'path');
+  p.setAttribute('d', path);
+  p.setAttribute('fill', 'currentColor');
+  svg.append(p);
+  const span = document.createElement('span');
+  span.className = 'mark saved';
+  span.title = title;
+  span.append(svg);
+  return span;
+}
+
+async function loadServers() {
+  let data;
+  try {
+    data = await api('GET', '/api/me/servers');
+  } catch (err) {
+    if (err instanceof SignedOut) return showLogin();
+    return say('could not load your servers: ' + describe(err), true);
+  }
+  renderServers(data.groups || []);
+}
+
+function renderServers(groups) {
+  const root = $('groups');
+  root.innerHTML = '';
+  servers = new Map();
+  let total = 0;
+  for (const g of groups) {
+    const key = g.name || '';
+    const details = document.createElement('details');
+    details.className = 'group';
+    details.dataset.key = key;
+    details.open = !collapsed.has(key);
+
+    const summary = document.createElement('summary');
+    // Recorded on the click itself, not on `toggle`: that event is queued, fires for programmatic
+    // changes too, and can be lost to a navigation that follows the click.
+    summary.addEventListener('click', () => {
+      if ($('filter').value) return;   // filtering opens groups; that is not the user's choice
+      if (details.open) collapsed.add(key); else collapsed.delete(key);   // state before the toggle
+      saveCollapsed(collapsed);
+    });
+    const name = document.createElement('span');
+    name.className = 'gname';
+    name.textContent = g.name || 'Ungrouped';
+    const count = document.createElement('span');
+    count.className = 'gcount';
+    count.textContent = g.servers.length;
+    summary.append(name, count);
+
+    const ul = document.createElement('ul');
+    ul.className = 'rows';
+    for (const s of g.servers) {
+      servers.set(s.id, s);
+      total++;
+      const li = document.createElement('li');
+      li.className = 'row';
+      li.dataset.search = (s.name + ' ' + s.host).toLowerCase();
+
+      const open = document.createElement('button');
+      open.className = 'srv';
+      open.textContent = s.name;   // textContent, never innerHTML: names come from administrators
+      open.addEventListener('click', () => openServer(s.id));
+
+      const host = document.createElement('span');
+      host.className = 'host';
+      host.textContent = s.host;
+
+      const marks = document.createElement('span');
+      marks.className = 'marks';
+      if (s.connected) {
+        const m = document.createElement('span');
+        m.className = 'mark live';
+        m.textContent = 'Connected';
+        marks.append(m);
+      } else if (s.reconnect) {
+        const m = document.createElement('span');
+        m.className = 'mark reconnect';
+        m.textContent = 'Reconnect';
+        m.title = 'Your desktop on this server is still running';
+        marks.append(m);
+      }
+      if (s.saved) marks.append(icon(SAVED_ICON, 'Credentials saved'));
+
+      li.append(open, host, marks);
+      if (s.saved) {
+        const forget = document.createElement('button');
+        forget.className = 'forget ghost';
+        forget.textContent = 'Forget';
+        forget.title = 'Forget the saved credentials for ' + s.name;
+        forget.addEventListener('click', () => forgetCredential(s.id));
+        li.append(forget);
+      }
+      ul.append(li);
     }
-    b.append(name, tags);
-    b.addEventListener('click', () => connect(t.id));
-    tiles.append(b);
+    details.append(summary, ul);
+    root.append(details);
   }
-  say(targets.length + (targets.length === 1 ? ' system' : ' systems'));
+  $('empty').hidden = total > 0;
+  $('list').querySelector('.toolbar').hidden = total === 0;
+  applyFilter();
+  say(total === 1 ? '1 server' : total + ' servers');
+}
+
+function applyFilter() {
+  const q = $('filter').value.trim().toLowerCase();
+  for (const details of $('groups').querySelectorAll('details.group')) {
+    let visible = 0;
+    for (const li of details.querySelectorAll('li.row')) {
+      const hit = !q || li.dataset.search.includes(q);
+      li.hidden = !hit;
+      if (hit) visible++;
+    }
+    details.hidden = visible === 0;
+    // A filter opens every group holding a match; clearing it restores the user's own choice.
+    details.open = q ? visible > 0 : !collapsed.has(details.dataset.key);
+  }
+}
+
+$('filter').addEventListener('input', applyFilter);
+$('expand-all').addEventListener('click', () => {
+  collapsed.clear();
+  saveCollapsed(collapsed);
+  applyFilter();
+});
+$('collapse-all').addEventListener('click', () => {
+  collapsed = new Set([...$('groups').querySelectorAll('details.group')].map(d => d.dataset.key));
+  saveCollapsed(collapsed);
+  applyFilter();
+});
+
+async function forgetCredential(id) {
+  const s = servers.get(id);
+  try {
+    await api('DELETE', '/api/credentials/' + id);
+    say('forgot the saved credentials for ' + (s ? s.name : 'that server'));
+  } catch (err) {
+    if (err instanceof SignedOut) return showLogin();
+    say('could not forget them: ' + err.message, true);
+  }
+  loadServers();
 }
 
 // IronError exposes backtrace(), kind() and rdcleanpathDetails() as METHODS. Reading `err.backtrace`
-// without calling it is truthy — it is a function — so stringifying it printed the function's own
-// source code instead of the failure. Measured 2026-09-23, and the reason a real error was invisible.
+// without calling it is truthy, so stringifying it printed the function's source instead of the
+// failure.
 function describe(err) {
   if (!err) return 'unknown error';
   const parts = [];
@@ -94,8 +285,11 @@ function describe(err) {
       if (d) parts.push('rdcleanpath: ' + JSON.stringify(d, Object.keys(d)));
     } catch { /* optional detail */ }
   }
+  if (!parts.length && err.message) return err.message;
   return parts.length ? parts.join(' — ') : String(err);
 }
+
+/* ---- input -------------------------------------------------------------------------------- */
 
 const send = event => {
   if (!session) return;
@@ -104,9 +298,8 @@ const send = event => {
   session.applyInputs(tx);
 };
 
-// Printable keys go through unicode, which avoids a full PS/2 set-1 table. The rest need scancodes,
-// so the essential ones are mapped; anything outside both is dropped rather than guessed at, which
-// shows up as a dead key rather than as a wrong character.
+// Printable keys go through unicode; the rest need scancodes. Anything outside both is dropped
+// rather than guessed at.
 const SCANCODE = {
   Escape:0x01, Backspace:0x0E, Tab:0x0F, Enter:0x1C, ControlLeft:0x1D, ShiftLeft:0x2A,
   ShiftRight:0x36, AltLeft:0x38, Space:0x39, CapsLock:0x3A, F1:0x3B, F2:0x3C, F3:0x3D, F4:0x3E,
@@ -116,8 +309,7 @@ const SCANCODE = {
   ControlRight:0xE01D, AltRight:0xE038, MetaLeft:0xE05B, MetaRight:0xE05C,
 };
 
-// Invoked by the client as (kind, data, hotspotX, hotspotY), where kind is "default", "hidden" or
-// "url" and data is a data-URL for the cursor image. Read from ironrdp-web's session.rs.
+// Invoked by the client as (kind, data, hotspotX, hotspotY); kind is "default", "hidden" or "url".
 function setCursorStyle(kind, data, hotspotX, hotspotY) {
   switch (kind) {
     case 'hidden':
@@ -133,8 +325,7 @@ function setCursorStyle(kind, data, hotspotX, hotspotY) {
   }
 }
 
-// The remote is asked for a desktop the size of the browser viewport, so every pixel is 1:1 and
-// nothing is scaled. Scaling is what makes remote text fuzzy; resizing the desktop does not.
+// The remote is asked for a desktop the size of the viewport, so every pixel is 1:1.
 function viewportSize() {
   return new DesktopSize(
     Math.max(640, Math.floor(window.innerWidth)),
@@ -165,8 +356,7 @@ function sendClipboard() {
   }
 }
 
-// Ctrl+Alt+Del cannot arrive as a keystroke: the browser never delivers it. Pressing and releasing
-// the three scancodes in one transaction is the only way to send it.
+// Ctrl+Alt+Del never reaches a page as a keystroke; the three scancodes go in one transaction.
 function sendCtrlAltDel() {
   if (!session) return;
   const tx = new InputTransaction();
@@ -195,19 +385,45 @@ $('fullscreen').addEventListener('click', () => {
 $('panel-disconnect').addEventListener('click', () => endSession());
 window.addEventListener('resize', followWindowSize);
 
-/* ---- file transfer over the clipboard channel (RDPECLIP) ------------------
+// Attached once. Every handler is a no-op without a session.
+(function attachInput() {
+  const at = e => {
+    const r = canvas.getBoundingClientRect();
+    return [
+      Math.round((e.clientX - r.left) * (canvas.width / r.width)),
+      Math.round((e.clientY - r.top) * (canvas.height / r.height)),
+    ];
+  };
+  canvas.addEventListener('mousemove', e => { const [x, y] = at(e); send(DeviceEvent.mouseMove(x, y)); });
+  canvas.addEventListener('mousedown', e => { e.preventDefault(); canvas.focus(); send(DeviceEvent.mouseButtonPressed(e.button)); });
+  canvas.addEventListener('mouseup', e => { e.preventDefault(); send(DeviceEvent.mouseButtonReleased(e.button)); });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('keydown', e => {
+    if (!session) return;
+    e.preventDefault();
+    const c = SCANCODE[e.code];
+    if (c !== undefined) send(DeviceEvent.keyPressed(c));
+    else if (e.key.length === 1) send(DeviceEvent.unicodePressed(e.key));
+  });
+  canvas.addEventListener('keyup', e => {
+    if (!session) return;
+    e.preventDefault();
+    const c = SCANCODE[e.code];
+    if (c !== undefined) send(DeviceEvent.keyReleased(c));
+    else if (e.key.length === 1) send(DeviceEvent.unicodeReleased(e.key));
+  });
+  canvas.addEventListener('blur', () => { if (session) session.releaseAllInputs(); });
+})();
+
+/* ---- file transfer over the clipboard channel (RDPECLIP) ----------------------------------
  *
- * Two directions, both routed through invokeExtension because the surface is protocol-specific:
+ *   browser -> remote   initiate_file_copy([{name,size}]) announces the files; the remote asks for
+ *                       bytes via file_contents_request_callback, answered with submit_file_contents.
+ *   remote -> browser   files_available_callback(files) says what the remote copied; each is pulled
+ *                       with request_file_contents and collected from file_contents_response_callback.
  *
- *   browser -> remote   initiate_file_copy([{name,size}])  announces the files. The remote then asks
- *                       for bytes via file_contents_request_callback, answered with
- *                       submit_file_contents.
- *   remote -> browser   files_available_callback(files) says what the remote copied. We pull each
- *                       one with request_file_contents and collect file_contents_response_callback.
- *
- * NOTE THE CASE ASYMMETRY, which is easy to get wrong: callbacks DELIVER camelCase (streamId,
- * isError, dataId, index) and invocations TAKE snake_case (stream_id, file_index, is_error,
- * clip_data_id). Read from ironrdp-web's clipboard.rs and session.rs.
+ * Callbacks DELIVER camelCase (streamId, isError, dataId, index); invocations TAKE snake_case
+ * (stream_id, file_index, is_error, clip_data_id).
  */
 const FLAG_SIZE = 0x1;    // the response carries the file's length, not its contents
 const FLAG_RANGE = 0x2;   // the response carries the requested byte range
@@ -231,19 +447,12 @@ function humanSize(n) {
   return v.toFixed(v < 10 ? 1 : 0) + ' ' + units[i];
 }
 
-/// Ask the remote for one slice, resolving when its response arrives.
 function askRemote(fileIndex, flags, position, size) {
   const streamId = nextStream++;
   return new Promise((resolve, reject) => {
     pending.set(streamId, { resolve, reject });
     try {
-      ext('request_file_contents', {
-        stream_id: streamId,
-        file_index: fileIndex,
-        flags,
-        position,
-        size,
-      });
+      ext('request_file_contents', { stream_id: streamId, file_index: fileIndex, flags, position, size });
     } catch (err) {
       pending.delete(streamId);
       reject(err);
@@ -264,22 +473,18 @@ async function downloadRemoteFile(index, li) {
   bar.max = 1; bar.value = 0;
   li.append(bar);
   try {
-    // The size the clipboard advertised is not always present, so ask for it explicitly first.
     let total = Number(meta.size) || 0;
     if (!total) {
       const sized = await askRemote(index, FLAG_SIZE, 0, 8);
-      // The SIZE response carries a little-endian 64-bit length.
       const view = new DataView(sized.buffer, sized.byteOffset, sized.byteLength);
       total = Number(view.getBigUint64(0, true));
     }
-
     const parts = [];
     for (let at = 0; at < total; at += CHUNK) {
       const want = Math.min(CHUNK, total - at);
       parts.push(await askRemote(index, FLAG_RANGE, at, want));
       bar.value = Math.min(1, (at + want) / total);
     }
-
     const url = URL.createObjectURL(new Blob(parts));
     const a = document.createElement('a');
     a.href = url;
@@ -294,22 +499,28 @@ async function downloadRemoteFile(index, li) {
   }
 }
 
+function fileRow(name, size) {
+  const li = document.createElement('li');
+  const n = document.createElement('span');
+  n.className = 'fname';
+  n.textContent = name;
+  const s = document.createElement('span');
+  s.className = 'fsize';
+  s.textContent = humanSize(size);
+  li.append(n, s);
+  return li;
+}
+
 function renderIncoming() {
   const list = $('incoming');
   list.innerHTML = '';
   $('incoming-head').hidden = remoteFiles.length === 0;
   remoteFiles.forEach((f, i) => {
-    const li = document.createElement('li');
-    const name = document.createElement('span');
-    name.className = 'fname';
-    name.textContent = f.name;
-    const size = document.createElement('span');
-    size.className = 'fsize';
-    size.textContent = humanSize(Number(f.size) || 0);
+    const li = fileRow(f.name, Number(f.size) || 0);
     const get = document.createElement('button');
     get.textContent = 'Download';
     get.addEventListener('click', () => downloadRemoteFile(i, li));
-    li.append(name, size, get);
+    li.append(get);
     list.append(li);
   });
 }
@@ -317,17 +528,7 @@ function renderIncoming() {
 function renderOutgoing() {
   const list = $('outgoing');
   list.innerHTML = '';
-  outgoing.forEach(f => {
-    const li = document.createElement('li');
-    const name = document.createElement('span');
-    name.className = 'fname';
-    name.textContent = f.name;
-    const size = document.createElement('span');
-    size.className = 'fsize';
-    size.textContent = humanSize(f.size);
-    li.append(name, size);
-    list.append(li);
-  });
+  outgoing.forEach(f => list.append(fileRow(f.name, f.size)));
 }
 
 function offerFiles(files) {
@@ -354,110 +555,100 @@ $('picker').addEventListener('change', ev => offerFiles(ev.target.files));
 $('files-note').textContent =
   'Files ride the RDP clipboard channel, so they appear as a paste on the remote rather than as a drive.';
 
-function attachInput() {
-  const at = e => {
-    const r = canvas.getBoundingClientRect();
-    return [
-      Math.round((e.clientX - r.left) * (canvas.width / r.width)),
-      Math.round((e.clientY - r.top) * (canvas.height / r.height)),
-    ];
-  };
-  canvas.addEventListener('mousemove', e => { const [x, y] = at(e); send(DeviceEvent.mouseMove(x, y)); });
-  canvas.addEventListener('mousedown', e => { e.preventDefault(); canvas.focus(); send(DeviceEvent.mouseButtonPressed(e.button)); });
-  canvas.addEventListener('mouseup', e => { e.preventDefault(); send(DeviceEvent.mouseButtonReleased(e.button)); });
-  canvas.addEventListener('contextmenu', e => e.preventDefault());
-  canvas.addEventListener('keydown', e => {
-    e.preventDefault();
-    const c = SCANCODE[e.code];
-    if (c !== undefined) send(DeviceEvent.keyPressed(c));
-    else if (e.key.length === 1) send(DeviceEvent.unicodePressed(e.key));
-  });
-  canvas.addEventListener('keyup', e => {
-    e.preventDefault();
-    const c = SCANCODE[e.code];
-    if (c !== undefined) send(DeviceEvent.keyReleased(c));
-    else if (e.key.length === 1) send(DeviceEvent.unicodeReleased(e.key));
-  });
-  canvas.addEventListener('blur', () => { if (session) session.releaseAllInputs(); });
-}
+/* ---- opening a server --------------------------------------------------------------------- */
 
-/// Ask for Windows credentials, after a system has been chosen.
-///
-/// IronRDP requires a username: connecting without one fails with "username missing", so there is no
-/// variant of this where the target's own login screen appears instead. The username is remembered
-/// per target because retyping it every time is the annoyance; THE PASSWORD IS NEVER STORED.
-function askCredentials(targetId) {
+/// Ask for the server's credentials. `prefill` carries a username and domain to start from, and a
+/// note when a saved credential was just refused.
+function askCredentials(server, prefill = {}) {
   return new Promise(resolve => {
     const dialog = $('signin');
-    $('signin-title').textContent = 'Sign in to ' + targetId;
-
-    const savedPassword = localStorage.getItem('pw:' + targetId);
-    $('u').value = localStorage.getItem('user:' + targetId) || '';
-    $('p').value = savedPassword || '';
-    $('d').value = localStorage.getItem('domain:' + targetId) || '';
-    $('save').checked = savedPassword !== null;
-
-    // Saving a password puts it in localStorage in the clear: readable by any script served from
-    // this origin and left on disk until cleared. Said once, here, where the choice is made.
-    const note = $('save-note');
-    note.textContent = '';
-    note.hidden = savedPassword === null;
-    if (savedPassword !== null) {
-      note.append('Stored unencrypted in this browser. ');
-      const forget = document.createElement('button');
-      forget.type = 'button';
-      forget.textContent = 'Forget it';
-      forget.addEventListener('click', () => {
-        localStorage.removeItem('pw:' + targetId);
-        $('p').value = '';
-        $('save').checked = false;
-        note.hidden = true;
-        $('p').focus();
-      });
-      note.append(forget);
-    }
+    $('signin-title').textContent = 'Sign in to ' + server.name;
+    const note = $('signin-note');
+    note.hidden = !prefill.note;
+    note.textContent = prefill.note || '';
+    $('u').value = prefill.username || '';
+    $('p').value = '';
+    $('d').value = prefill.domain || '';
+    $('save').checked = !!prefill.save;
 
     const done = () => {
       dialog.removeEventListener('close', done);
       if (dialog.returnValue !== 'go' || !$('u').value) return resolve(null);
-      const creds = { username: $('u').value, password: $('p').value, domain: $('d').value.trim() };
-
-      localStorage.setItem('user:' + targetId, creds.username);
-      if (creds.domain) localStorage.setItem('domain:' + targetId, creds.domain);
-      else localStorage.removeItem('domain:' + targetId);
-      if ($('save').checked) localStorage.setItem('pw:' + targetId, creds.password);
-      else localStorage.removeItem('pw:' + targetId);
-
+      const creds = {
+        username: $('u').value.trim(),
+        password: $('p').value,
+        domain: $('d').value.trim(),
+        save: $('save').checked,
+      };
       $('p').value = '';   // never leave it sitting in the DOM
       resolve(creds);
     };
 
+    dialog.returnValue = '';
     dialog.addEventListener('close', done);
     dialog.showModal();
-    // Focus whatever still needs doing: an empty field, or the Connect button when nothing does.
     if (!$('u').value) $('u').focus();
-    else if (!$('p').value) $('p').focus();
-    else $('signin-go').focus();
+    else $('p').focus();
   });
 }
 
-async function connect(targetId) {
-  const creds = await askCredentials(targetId);
-  if (!creds) { say('cancelled'); return; }
+async function openServer(id) {
+  const server = servers.get(id);
+  if (!server || session) return;
+  let prefill = {};
+  // Two rounds at most: a saved credential, then one typed after the saved one was refused.
+  for (let round = 0; round < 2; round++) {
+    let grant;
+    try {
+      grant = await api('POST', '/api/connect', { server: id });
+    } catch (err) {
+      if (err instanceof SignedOut) return showLogin('Your sign-in has expired. Sign in again.');
+      return say('could not open ' + server.name + ': ' + err.message, true);
+    }
 
-  say('connecting to ' + targetId);
+    const fromSaved = !!grant.credential && round === 0;
+    let creds = fromSaved
+      ? { username: grant.credential.username, password: grant.credential.password, domain: grant.credential.domain || '', save: false }
+      : await askCredentials(server, prefill);
+    grant.credential = null;
+    if (!creds) { say('cancelled'); return; }
+
+    const outcome = await runSession(server, grant.ticket, creds);
+    if (outcome.connected) {
+      // The proxy records the end once it sees the socket close, a moment after the client does,
+      // so the list is loaded again shortly to pick up the Reconnect marker.
+      loadServers();
+      setTimeout(loadServers, 1500);
+      return;
+    }
+    // Refused before a desktop appeared. With a saved credential, ask once for a new one.
+    if (fromSaved) {
+      prefill = {
+        username: creds.username,
+        domain: creds.domain,
+        save: true,
+        note: 'The saved credentials did not work. Enter them again; saving replaces the old ones.',
+      };
+      continue;
+    }
+    return;
+  }
+}
+
+/// Connect, run until the session ends, and report whether a desktop was ever reached.
+async function runSession(server, ticket, creds) {
+  const outcome = { connected: false };
+  say('connecting to ' + server.name);
   try {
-    // Pass-through: these go to the target inside the RDP stream, which the proxy does not decode.
-    // The proxy neither sees nor stores them.
+    await clientReady;
     const builder = new SessionBuilder()
       .proxyAddress(proxyAddress)
-      .destination(targetId)   // a TARGET ID, never an address
-      .authToken(token)        // minted by the proxy when it served this page
+      .destination(String(server.id))   // a server ID, never an address
+      .authToken(ticket)                // single use, minted for this user and this server
       .username(creds.username)
       .password(creds.password)
       .desktopSize(viewportSize())
       .renderCanvas(canvas)
-      // Text clipboard, both directions. Files go through invokeExtension and are not wired yet.
       .remoteClipboardChangedCallback(data => {
         try {
           for (const item of data.items()) {
@@ -469,20 +660,17 @@ async function connect(targetId) {
         } catch { /* a clipboard update must never take the session down */ }
       })
       .forceClipboardUpdateCallback(() => sendClipboard())
-      // File transfer callbacks are registered through extension(), not as builder methods.
       .extension(new Extension('files_available_callback', files => {
         remoteFiles = Array.from(files || []);
         renderIncoming();
         if (remoteFiles.length) say(remoteFiles.length + ' file(s) copied on the remote — open the panel to download');
       }))
       .extension(new Extension('file_contents_request_callback', async req => {
-        // The remote is pasting our files and wants bytes.
         const file = outgoing[req.index];
         try {
           if (!file) throw new Error('no file at index ' + req.index);
           let data;
           if (req.flags & FLAG_SIZE) {
-            // The SIZE reply is the length as a little-endian 64-bit value, not file content.
             data = new Uint8Array(8);
             new DataView(data.buffer).setBigUint64(0, BigInt(file.size), true);
           } else {
@@ -503,54 +691,52 @@ async function connect(targetId) {
         if (resp.isError) waiting.reject(new Error('the remote reported an error for this file'));
         else waiting.resolve(new Uint8Array(resp.data || []));
       }))
-      // REQUIRED, both of them. ironrdp-web refuses to connect without every one of username,
-      // password, destination, proxyAddress, authToken, renderCanvas, setCursorStyleCallback and
-      // setCursorStyleCallbackContext. Read off session.rs rather than discovered one failure at a
-      // time, which is how the first two were found.
+      // Both required: ironrdp-web refuses to connect without every one of username, password,
+      // destination, proxyAddress, authToken, renderCanvas, setCursorStyleCallback and
+      // setCursorStyleCallbackContext.
       .setCursorStyleCallback(setCursorStyle)
       .setCursorStyleCallbackContext(window)
-      // Optional and worth having: the remote decides the desktop size, so follow it rather than
-      // leaving the canvas at whatever it was created with.
       .canvasResizedCallback(() => {
         if (!session) return;
         const size = session.desktopSize();
         if (!size) return;
         canvas.width = size.width;
         canvas.height = size.height;
-        $('panel-info').textContent = targetId + ' — ' + size.width + '×' + size.height;
+        $('panel-info').textContent = server.name + ' — ' + size.width + '×' + size.height;
       });
     if (creds.domain) builder.serverDomain(creds.domain);
 
     session = await builder.connect();
+    outcome.connected = true;
+
+    // Saved only once the server has accepted them, so a mistyped password is never kept.
+    if (creds.save) {
+      api('PUT', '/api/credentials/' + server.id, {
+        username: creds.username, domain: creds.domain || null, password: creds.password,
+      }).then(() => say('credentials saved for ' + server.name))
+        .catch(err => say('credentials not saved: ' + err.message, true));
+    }
+    creds.password = '';
 
     document.body.classList.add('connected');
-    $('back').hidden = false;
     $('rail').hidden = false;
-    $('panel-target').textContent = targetId;
-    $('panel-info').textContent = targetId + ' — ' + canvas.width + '×' + canvas.height;
-    attachInput();
+    $('panel-target').textContent = server.name;
+    $('panel-info').textContent = server.name + ' — ' + canvas.width + '×' + canvas.height;
     canvas.focus();
-    say('connected to ' + targetId);
+    say('connected to ' + server.name);
 
     await session.run();
-    say('session ended');
+    say('disconnected from ' + server.name);
   } catch (err) {
     const text = describe(err);
-    // A target with NLA enabled refuses before any screen is drawn, because CredSSP wants the
-    // credentials up front. Say so plainly rather than showing a bare protocol error.
-    if (/credssp|logon|authentic|password|credential/i.test(text)) {
-      say('sign-in refused by ' + targetId + ': ' + text, true);
-    } else {
-      say('failed: ' + text, true);
-    }
+    say((outcome.connected ? 'session ended: ' : 'could not connect to ' + server.name + ': ') + text, true);
   } finally {
+    creds.password = '';
     document.body.classList.remove('connected');
-    $('back').hidden = true;
     $('rail').hidden = true;
     openRail(false);
     session = null;
-    // Transfer state belongs to the session. Leaving it would show the last session's files and let
-    // a stale streamId resolve against a new one.
+    // Transfer state belongs to the session.
     outgoing = [];
     remoteFiles = [];
     for (const { reject } of pending.values()) reject(new Error('session ended'));
@@ -558,13 +744,11 @@ async function connect(targetId) {
     renderOutgoing();
     renderIncoming();
   }
+  return outcome;
 }
 
 function endSession() {
   if (session) session.shutdown();
 }
 
-$('back').addEventListener('click', () => {
-  endSession();
-  say('disconnecting');
-});
+showList();

@@ -1,8 +1,7 @@
 <!DOCTYPE html>
 <!--
-  No inline <style> or <script>. The proxy serves a strict Content-Security-Policy, and
-  `default-src 'self'` with `script-src 'self'` forbids both. Inlining them produced an unstyled page
-  stuck on "loading", with the failure visible only in the console. Measured 2026-09-23.
+  No inline <style>, <script>, style attributes or event handlers: the proxy's Content-Security-Policy
+  forbids all four, and a test asserts this page carries none.
 -->
 <html lang="en">
 <head>
@@ -14,15 +13,37 @@
 <body>
 <header>
   <h1>web-access</h1>
-  <button id="back" hidden>Disconnect</button>
+  <span id="who"></span>
+  <a id="admin-link" class="navlink" href="./admin" hidden>Admin</a>
+  <button id="signout" class="ghost" hidden>Sign out</button>
   <span id="status">loading</span>
 </header>
 <main>
-  <div id="tiles"></div>
+  <section id="login" hidden>
+    <form id="login-form" class="card signin-card">
+      <h2>Sign in</h2>
+      <p class="hint">Use your network account.</p>
+      <label>Username<input id="lu" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+      <label>Password<input id="lp" type="password" autocomplete="current-password" required></label>
+      <p id="login-error" class="error" hidden></p>
+      <button type="submit" id="login-go" class="primary">Sign in</button>
+    </form>
+  </section>
+
+  <section id="list" hidden>
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="Filter by name or host" autocomplete="off" spellcheck="false">
+      <button id="expand-all" class="ghost">Expand all</button>
+      <button id="collapse-all" class="ghost">Collapse all</button>
+    </div>
+    <div id="groups"></div>
+    <p id="empty" class="empty" hidden>No servers are assigned to you yet. An administrator assigns them on the proxy.</p>
+  </section>
+
   <canvas id="screen" width="1280" height="800" tabindex="0"></canvas>
 </main>
 
-<!-- Session controls. Dim rail at the left edge while a session is up; click to expand. -->
+<!-- Session controls: a dim rail at the left edge while a session is up. -->
 <aside id="rail" hidden>
   <button id="rail-toggle" class="rail-btn" title="Session options" aria-label="Session options" aria-expanded="false">
     <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.8 7.8 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1L14.9 3h-3.8l-.4 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.8 7.8 0 0 0 0 2l-2 1.6 2 3.4 2.4-1c.5.4 1.1.7 1.7 1l.4 2.6h3.8l.4-2.6c.6-.3 1.2-.6 1.7-1l2.4 1 2-3.4zM13 15.2A3.2 3.2 0 1 1 13 8.8a3.2 3.2 0 0 1 0 6.4z"/></svg>
@@ -67,23 +88,24 @@
       <h3>Session</h3>
       <p class="note" id="panel-info"></p>
       <button id="panel-disconnect" class="danger">Disconnect</button>
+      <p class="note">Disconnecting leaves the desktop running on the server. Open the server again to return to it.</p>
     </section>
   </div>
 </aside>
 
 <!--
-  Credentials are asked for AFTER a system is chosen, not before. IronRDP requires a username to
-  connect at all — omitting it fails with "username missing" — so there is no path where the target's
-  own login screen appears instead. Cloudflare's browser RDP prompts for the same reason.
+  Credentials for the server are asked for after it is chosen. The RDP client needs them up front:
+  it performs the server's sign-in (NLA) itself.
 -->
 <dialog id="signin">
   <form method="dialog" id="signin-form">
     <h2 id="signin-title">Sign in</h2>
-    <label>Username<input id="u" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
-    <label>Password<input id="p" type="password" autocomplete="current-password"></label>
+    <p class="note" id="signin-note" hidden></p>
+    <label>Username<input id="u" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+    <label>Password<input id="p" type="password" autocomplete="off"></label>
     <label>Domain <span class="hint">optional</span><input id="d" autocapitalize="none" spellcheck="false"></label>
-    <label class="check"><input id="save" type="checkbox"><span>Save password in this browser</span></label>
-    <p class="note" id="save-note" hidden></p>
+    <label class="check"><input id="save" type="checkbox"><span>Save credentials</span></label>
+    <p class="note">Saved credentials are kept encrypted on this proxy and used the next time you open this server.</p>
     <div class="actions">
       <!-- formnovalidate, or `required` on the username blocks Cancel from closing the dialog. -->
       <button value="cancel" type="submit" class="ghost" formnovalidate>Cancel</button>

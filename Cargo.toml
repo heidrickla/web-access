@@ -1,9 +1,9 @@
 [package]
 name = "web-access-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "WebSocket-to-TCP RDP proxy that speaks RDCleanPath and never decodes the session"
+description = "Browser-based RDP gateway: directory sign-in, per-user server lists, RDCleanPath relay"
 repository = "https://github.com/heidrickla/web-access"
 
 [dependencies]
@@ -25,11 +25,29 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 ring = "0.17"
+serde_json = "1"
+# HTTP: axum routes on hyper, driven from our own accept loop so TLS and the WebSocket upgrade stay
+# under our control. The WebSocket itself remains tokio-tungstenite, which proxy.rs is written against.
+axum = { version = "0.8", default-features = false, features = ["json", "query", "http1", "tokio"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
+rustls-native-certs = "0.8"
+# SQLite compiled from source, so the store needs no system library on either target.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+# LDAPS to the domain controllers, on the same rustls and ring as everything else.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
+# Recovery passphrase to key.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+# Export archives. Entries are stored, not compressed: the payload is ciphertext.
+zip = { version = "8", default-features = false }
 
 # Only the Windows build needs the Service Control Manager integration. On Linux the binary is a
 # plain daemon and this is not compiled at all.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+# DPAPI for the local wrap of the master key, and console echo control for passphrase prompts.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Console"] }
 
 [profile.release]
 strip = true

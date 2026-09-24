@@ -1,89 +1,28 @@
-//! Authenticating the caller to the PROXY. Nothing here touches Windows credentials.
+//! Sign-in sessions and connect tickets.
 //!
-//! Pass-through is settled: the user's own Windows account authenticates to the target, carried
-//! inside the RDP stream the proxy does not decode. So this module establishes only who is asking.
+//! | Credential   | Carried by          | Lifetime | Stored                          |
+//! |--------------|---------------------|----------|---------------------------------|
+//! | session      | `wa_session` cookie | 24 h     | SHA-256 of the token, database  |
+//! | connect ticket | the RDP client's `authToken` | 60 s, one use | memory          |
 //!
-//! THE USER NEVER TYPES A PROXY TOKEN. One is minted when the page is served and handed to it with
-//! the target list; the browser sends it back on the WebSocket. It is a machine concern and it stays
-//! one.
-//!
-//! The identity provider is an OPEN decision, which is why `identify` is the single function that
-//! changes when it lands. Until then everyone who can reach the proxy is treated as permitted to
-//! everything the config grants, which is a NETWORK-enforced boundary and not an identity one. That
-//! is stated loudly at startup rather than hidden behind a token box that only looked like security.
+//! Sessions last a full shift (9 to 18 hours) and survive a browser restart and a service restart.
+//! A connect ticket is minted when a user clicks a server, is bound to that user and that server,
+//! and is spent by the WebSocket that carries the session.
 
-use crate::policy::Identity;
+use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// How long a minted token stays usable. Long enough to open a session from a page that has been
-/// sitting on a second monitor, short enough that a leaked one is not a standing key.
-const TOKEN_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+/// Sign-in session lifetime. Work shifts run 9 to 18 hours.
+pub const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a connect ticket may wait for its WebSocket.
+pub const TICKET_TTL: Duration = Duration::from_secs(60);
+pub const COOKIE: &str = "wa_session";
 
-#[derive(Debug, thiserror::Error)]
-pub enum AuthError {
-    #[error("no credential presented")]
-    Missing,
-    #[error("credential not recognised")]
-    Rejected,
-    #[error("credential expired")]
-    Expired,
-}
-
-struct Issued {
-    identity: Identity,
-    minted: Instant,
-}
-
-#[derive(Default)]
-pub struct Sessions {
-    issued: Mutex<HashMap<String, Issued>>,
-}
-
-impl Sessions {
-    pub fn global() -> &'static Sessions {
-        static SESSIONS: OnceLock<Sessions> = OnceLock::new();
-        SESSIONS.get_or_init(Sessions::default)
-    }
-
-    /// Mint a token for a caller the proxy has just served a page to.
-    pub fn mint(&self, identity: Identity) -> String {
-        let token = random_token();
-        let mut issued = self.issued.lock().expect("sessions poisoned");
-        issued.retain(|_, v| v.minted.elapsed() < TOKEN_TTL);
-        issued.insert(
-            token.clone(),
-            Issued {
-                identity,
-                minted: Instant::now(),
-            },
-        );
-        token
-    }
-
-    pub fn authenticate(&self, token: &str) -> Result<Identity, AuthError> {
-        if token.is_empty() {
-            return Err(AuthError::Missing);
-        }
-        let issued = self.issued.lock().expect("sessions poisoned");
-        match issued.get(token) {
-            None => Err(AuthError::Rejected),
-            Some(entry) if entry.minted.elapsed() >= TOKEN_TTL => Err(AuthError::Expired),
-            Some(entry) => Ok(entry.identity.clone()),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn count(&self) -> usize {
-        self.issued.lock().expect("sessions poisoned").len()
-    }
-}
-
-/// 256 bits from the OS, hex encoded. `ring` is already in the tree as rustls' crypto backend, so
-/// this adds no dependency and does not invent its own randomness.
-fn random_token() -> String {
+/// 256 bits from the OS, hex encoded.
+pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     SystemRandom::new()
         .fill(&mut bytes)
@@ -91,12 +30,82 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// THE POINT WHERE AN IDENTITY PROVIDER WILL PLUG IN. Everything else in this codebase is written
-/// against `Identity` and does not care where it came from.
-pub fn identify(all_groups: &[String]) -> Identity {
-    Identity {
-        subject: "anonymous".to_owned(),
-        groups: all_groups.to_vec(),
+/// What the database keeps instead of the token.
+pub fn token_hash(token: &str) -> Vec<u8> {
+    digest(&SHA256, token.as_bytes()).as_ref().to_vec()
+}
+
+/// A persistent cookie, so closing the browser does not sign the user out.
+pub fn session_cookie(token: &str, secure: bool) -> String {
+    format!(
+        "{COOKIE}={token}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict{}",
+        SESSION_TTL.as_secs(),
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+pub fn clear_cookie(secure: bool) -> String {
+    format!(
+        "{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+/// The value of one cookie from a `Cookie` header.
+pub fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header.split(';').find_map(|pair| {
+        let (k, v) = pair.trim().split_once('=')?;
+        (k == name && !v.is_empty()).then_some(v)
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ticket {
+    pub user_id: i64,
+    pub server_id: i64,
+}
+
+struct Issued {
+    ticket: Ticket,
+    minted: Instant,
+}
+
+#[derive(Default)]
+pub struct Tickets {
+    issued: Mutex<HashMap<String, Issued>>,
+}
+
+impl Tickets {
+    pub fn issue(&self, user_id: i64, server_id: i64) -> String {
+        let token = random_token();
+        let mut issued = self.issued.lock().unwrap_or_else(|p| p.into_inner());
+        issued.retain(|_, v| v.minted.elapsed() < TICKET_TTL);
+        issued.insert(
+            token.clone(),
+            Issued {
+                ticket: Ticket { user_id, server_id },
+                minted: Instant::now(),
+            },
+        );
+        token
+    }
+
+    /// Spend a ticket. It is removed whether or not it is still valid, so it can never be tried twice.
+    pub fn redeem(&self, token: &str) -> Option<Ticket> {
+        self.redeem_at(token, Instant::now())
+    }
+
+    fn redeem_at(&self, token: &str, at: Instant) -> Option<Ticket> {
+        let entry = self
+            .issued
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(token)?;
+        (at.saturating_duration_since(entry.minted) < TICKET_TTL).then_some(entry.ticket)
+    }
+
+    pub fn clear(&self) {
+        self.issued.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 }
 
@@ -104,40 +113,54 @@ pub fn identify(all_groups: &[String]) -> Identity {
 mod tests {
     use super::*;
 
-    fn identity() -> Identity {
-        Identity {
-            subject: "lewis".into(),
-            groups: vec!["OT-Historian-Admins".into()],
-        }
+    #[test]
+    fn a_ticket_is_spent_by_its_first_use() {
+        let t = Tickets::default();
+        let token = t.issue(1, 2);
+        assert_eq!(t.redeem(&token), Some(Ticket { user_id: 1, server_id: 2 }));
+        assert_eq!(t.redeem(&token), None);
     }
 
     #[test]
-    fn a_minted_token_authenticates_once_minted() {
-        let s = Sessions::default();
-        let token = s.mint(identity());
-        assert_eq!(s.authenticate(&token).unwrap().subject, "lewis");
+    fn an_expired_ticket_is_refused() {
+        let t = Tickets::default();
+        let token = t.issue(1, 2);
+        let later = Instant::now() + TICKET_TTL;
+        assert_eq!(t.redeem_at(&token, later), None);
     }
 
     #[test]
-    fn an_unminted_token_is_rejected() {
-        let s = Sessions::default();
-        s.mint(identity());
-        assert!(matches!(s.authenticate("deadbeef"), Err(AuthError::Rejected)));
-    }
-
-    #[test]
-    fn an_empty_token_is_missing() {
-        let s = Sessions::default();
-        assert!(matches!(s.authenticate(""), Err(AuthError::Missing)));
+    fn an_unknown_ticket_is_refused() {
+        let t = Tickets::default();
+        t.issue(1, 2);
+        assert_eq!(t.redeem("deadbeef"), None);
+        assert_eq!(t.redeem(""), None);
     }
 
     #[test]
     fn tokens_are_distinct_and_long() {
-        let s = Sessions::default();
-        let a = s.mint(identity());
-        let b = s.mint(identity());
+        let a = random_token();
+        let b = random_token();
         assert_ne!(a, b);
-        assert_eq!(a.len(), 64, "256 bits hex encoded");
-        assert_eq!(s.count(), 2);
+        assert_eq!(a.len(), 64);
+        assert_eq!(token_hash(&a).len(), 32);
+    }
+
+    #[test]
+    fn the_session_cookie_is_persistent_for_a_day() {
+        let c = session_cookie("abc", true);
+        assert!(c.contains("Max-Age=86400"));
+        assert!(c.contains("HttpOnly"));
+        assert!(c.contains("SameSite=Strict"));
+        assert!(c.ends_with("; Secure"));
+        assert!(!session_cookie("abc", false).contains("Secure"));
+    }
+
+    #[test]
+    fn cookies_are_read_by_exact_name() {
+        let h = "other=1; wa_session=tok; wa_session_x=2";
+        assert_eq!(cookie_value(h, COOKIE), Some("tok"));
+        assert_eq!(cookie_value("wa_sessionx=1", COOKIE), None);
+        assert_eq!(cookie_value("wa_session=", COOKIE), None);
     }
 }
