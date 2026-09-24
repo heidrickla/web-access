@@ -42,7 +42,7 @@ pub struct App {
     /// Bounds concurrent password hashing, whatever the connection count.
     pub hash_permits: Arc<tokio::sync::Semaphore>,
     /// One export at a time, so a failed export can only undo a freeze it set itself.
-    pub export_lock: tokio::sync::Mutex<()>,
+    pub export_lock: Arc<tokio::sync::Mutex<()>>,
     /// Failed local-account sign-ins, per username.
     pub throttle: crate::auth::Throttle,
 }
@@ -84,7 +84,7 @@ impl App {
             gate: tokio::sync::RwLock::new(()),
             generation: AtomicU64::new(0),
             hash_permits: Arc::new(tokio::sync::Semaphore::new(HASH_PERMITS)),
-            export_lock: tokio::sync::Mutex::new(()),
+            export_lock: Arc::new(tokio::sync::Mutex::new(())),
             throttle: crate::auth::Throttle::default(),
         }
     }

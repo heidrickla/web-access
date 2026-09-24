@@ -147,7 +147,8 @@ request in flight, so nothing acknowledged is missing from it.
 | Import and export run in a task of their own that the request awaits. A request that ends before the task has the gate abandons it; once the task has the gate, it runs to the end | the gate is never released partway through a swap |
 | An export verifies the passphrase against the recovery wrap inside its own snapshot | the archive always opens with the passphrase it was made under |
 | Exports run one at a time. One that fails, or whose archive is not delivered, lifts only a freeze it set, and only in the database it set it in | a failed export cannot undo another export's freeze |
-| A connection records the database generation it was admitted under. Its end is recorded only in that database | numeric ids from a replaced database never land on another user's history |
+| A connection records the database generation it was admitted under. Its opening and its end are recorded only in that database | identities from a replaced database never land on another user's history |
+| A freeze an export set travels with its archive: an archive dropped before the response takes it lifts the freeze, and the next export waits until it has | a cancelled export leaves no freeze, whichever step it was cancelled at, and cannot take a later export's freeze with it |
 
 ### Connections
 
