@@ -469,7 +469,7 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
 const THROTTLED: &str = "too many failed sign-ins; refused without checking the password";
 
 async fn check_local(
-    app: &App,
+    app: &Shared,
     username: &str,
     user_id: i64,
     hash: String,
@@ -493,17 +493,24 @@ async fn check_local(
     }
     let candidate = password.to_owned();
     let stored = hash.clone();
+    let counter = Arc::clone(app);
+    let name = username.to_owned();
     let ok = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        crate::vault::verify_password(&candidate, &stored)
+        let ok = crate::vault::verify_password(&candidate, &stored);
+        // Counted by the hashing task, so a request abandoned mid-hash still counts.
+        if ok {
+            counter.throttle.clear(&name);
+        } else {
+            counter.throttle.fail(&name);
+        }
+        ok
     })
     .await
     .map_err(ApiError::internal)?;
     if !ok {
-        app.throttle.fail(username);
         return Ok(Checked::Refused("local password did not match"));
     }
-    app.throttle.clear(username);
     Ok(Checked::Local { user_id, hash })
 }
 
@@ -1166,6 +1173,34 @@ pub mod tests {
         assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
         let user = app.store.user_by_name("jdoe").unwrap().unwrap();
         assert_eq!(user.sid.as_deref(), Some("local:test"), "the local account was bound to a directory SID");
+    }
+
+    /// A failed local password counts toward the throttle even when its request is abandoned
+    /// mid-hash.
+    #[tokio::test]
+    async fn an_abandoned_local_sign_in_still_counts_as_a_failure() {
+        let app = test_app_local(true, false);
+        // A real hash, so the check takes long enough to abandon partway.
+        local_account(&app, "devtest", "a dev test password");
+        let app2 = Arc::clone(&app);
+        let task = tokio::spawn(async move { login_as(&app2, "devtest", "not the password").await });
+        let hashing = crate::app::HASH_PERMITS - 1;
+        for _ in 0..30_000 {
+            if app.hash_permits.available_permits() == hashing {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(app.hash_permits.available_permits(), hashing, "the hash never started");
+        task.abort();
+        let _ = task.await;
+        for _ in 0..6000 {
+            if app.hash_permits.available_permits() == crate::app::HASH_PERMITS {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(app.throttle.failures("devtest"), 1, "a failure abandoned mid-hash was not counted");
     }
 
     /// After five failures a local account is refused without its password being checked, even the

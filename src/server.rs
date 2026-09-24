@@ -30,7 +30,7 @@ pub async fn run(
             None
         }
     };
-    let app = Arc::new(App::new(cfg)?);
+    let app = Arc::new(App::for_serving(cfg)?);
     let counts = app.store.counts()?;
     info!(
         users = counts.users,
@@ -385,6 +385,30 @@ mod tests {
         let mut a = _a;
         let still = tokio::time::timeout(Duration::from_millis(300), a.read(&mut buf)).await;
         assert!(still.is_err(), "a connection within the limit was closed");
+    }
+
+    /// The service's start lifts a freeze an unfinished export left behind.
+    #[tokio::test]
+    async fn the_service_start_lifts_a_stranded_freeze() {
+        let dir = std::env::temp_dir().join(format!("web-access-test-{}", &crate::auth::random_token()[..12]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nadmins = [\"boss\"]\nallow_local_accounts = true\n[tls]\nverify = \"insecure\"\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let app = App::new(Config::load(&path).unwrap()).unwrap();
+        app.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
+        app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
+        drop(app);
+        run(&path, async {}).await.unwrap();
+        let app = App::new(Config::load(&path).unwrap()).unwrap();
+        assert!(!app.frozen(), "the service started with a stranded freeze in place");
     }
 
     async fn closed(addr: SocketAddr, wait: Duration) -> bool {

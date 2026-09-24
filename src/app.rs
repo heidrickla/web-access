@@ -18,6 +18,9 @@ pub const HASH_PERMITS: usize = 4;
 const META_DIRECTORY_PASSWORD: &str = "directory_password";
 const AAD_DIRECTORY_PASSWORD: &[u8] = b"directory service password";
 pub const META_FROZEN: &str = "frozen";
+/// Set with a freeze an export sets, cleared once the export hands over its archive. Found at
+/// start, it marks a freeze whose export never finished.
+pub const META_FREEZE_PENDING: &str = "freeze_pending";
 const META_SEEDED: &str = "seeded_from_config";
 
 pub struct App {
@@ -59,6 +62,28 @@ impl App {
         let app = Self::from_parts(cfg, store, vault, directory, target_tls, host_name(), secure);
         app.seed_from_config()?;
         Ok(app)
+    }
+
+    /// `new`, for the process that serves. Only it settles what an earlier run left behind:
+    /// command-line tools open the same database while the service runs, and must not lift the
+    /// freeze of an export still in progress.
+    pub fn for_serving(cfg: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let app = Self::new(cfg)?;
+        app.lift_stranded_freeze()?;
+        Ok(app)
+    }
+
+    /// A freeze whose export never handed over its archive, because the service stopped, crashed
+    /// or lost power mid-export, is lifted when the service starts. Returns whether one was.
+    pub fn lift_stranded_freeze(&self) -> Result<bool, crate::store::StoreError> {
+        if !self.store.flag(META_FREEZE_PENDING)? {
+            return Ok(false);
+        }
+        self.store.set_flag(META_FROZEN, false)?;
+        self.store.set_flag(META_FREEZE_PENDING, false)?;
+        self.store.audit("system", "unfreeze", "the export that froze this proxy did not finish");
+        tracing::warn!("lifted a freeze left by an export that did not finish");
+        Ok(true)
     }
 
     pub fn from_parts(
@@ -177,4 +202,38 @@ pub fn host_name() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "web-access".to_owned())
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_in(dir: &std::path::Path) -> Config {
+        let text = format!(
+            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nadmins = [\"boss\"]\nallow_local_accounts = true\n[tls]\nverify = \"insecure\"\n",
+            dir.to_string_lossy()
+        );
+        Config::parse("test", &text).unwrap()
+    }
+
+    /// A freeze stranded by an export that never finished (the service stopped, crashed or lost
+    /// power) is lifted when the service next starts, and not by a command-line tool, which may run
+    /// while the service's export is still in progress. A freeze with no export pending stays.
+    #[test]
+    fn a_stranded_freeze_is_lifted_when_the_service_starts_and_only_then() {
+        let dir = std::env::temp_dir().join(format!("web-access-test-{}", &crate::auth::random_token()[..12]));
+        let app = App::for_serving(config_in(&dir)).unwrap();
+        app.store.set_flag(META_FREEZE_PENDING, true).unwrap();
+        app.store.set_flag(META_FROZEN, true).unwrap();
+        drop(app);
+        let tool = App::new(config_in(&dir)).unwrap();
+        assert!(tool.frozen(), "a command-line tool lifted a freeze whose export may still be running");
+        drop(tool);
+        let app = App::for_serving(config_in(&dir)).unwrap();
+        assert!(!app.frozen(), "a stranded freeze survived a restart");
+        app.store.set_flag(META_FROZEN, true).unwrap();
+        drop(app);
+        let app = App::for_serving(config_in(&dir)).unwrap();
+        assert!(app.frozen(), "a freeze with no export pending was lifted at start");
+    }
 }

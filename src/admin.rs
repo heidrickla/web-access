@@ -1,7 +1,7 @@
 //! The management plane: users, their server lists, servers, groups, activity, migration.
 //! Every route requires an administrator.
 
-use crate::app::META_FROZEN;
+use crate::app::{META_FREEZE_PENDING, META_FROZEN};
 use crate::directory::normalize_username;
 use crate::migrate;
 use crate::store::{ImportRow, User};
@@ -798,12 +798,18 @@ async fn export_task(
         still_wanted(&gone)?;
         let admin = revalidate_admin(&app, &token)?;
         let froze = !app.frozen();
-        app.store.set_flag(META_FROZEN, true)?;
+        if froze {
+            // Marked pending until the archive is handed over, so a freeze stranded by a stop or
+            // a crash is lifted at the next start.
+            app.store.set_flag(META_FREEZE_PENDING, true)?;
+            app.store.set_flag(META_FROZEN, true)?;
+        }
         match snapshot_of(&app, &passphrase).await {
             Ok(s) => (admin, s, app.generation(), froze),
             Err(e) => {
                 if froze {
                     let _ = app.store.set_flag(META_FROZEN, false);
+                    let _ = app.store.set_flag(META_FREEZE_PENDING, false);
                 }
                 return Err(e);
             }
@@ -840,6 +846,10 @@ async fn export_task(
             if freeze { "export.freeze" } else { "export" },
             &delivery.export.file_name,
         );
+        // Handed over: from here the freeze is the one the administrator asked for.
+        if froze {
+            app.store.set_flag(META_FREEZE_PENDING, false)?;
+        }
     }
     Ok(delivery)
 }
@@ -856,14 +866,19 @@ async fn snapshot_of(app: &Shared, passphrase: &str) -> ApiResult<(Vec<u8>, crat
 async fn unfreeze_if_current(app: &Shared, generation: u64) {
     let _exclusive = app.gate.write().await;
     if app.generation() == generation {
-        if let Err(e) = app.store.set_flag(META_FROZEN, false) {
+        let lifted = app
+            .store
+            .set_flag(META_FROZEN, false)
+            .and_then(|()| app.store.set_flag(META_FREEZE_PENDING, false));
+        if let Err(e) = lifted {
             tracing::warn!(error = %e, "an export that was not delivered could not lift its freeze");
         }
     }
 }
 
 async fn unfreeze(State(app): State<Shared>, AdminUser(admin): AdminUser) -> ApiResult<StatusCode> {
-    app.store.set_flag(crate::app::META_FROZEN, false)?;
+    app.store.set_flag(META_FROZEN, false)?;
+    app.store.set_flag(META_FREEZE_PENDING, false)?;
     app.store.audit(&admin.username, "unfreeze", "");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1235,6 +1250,26 @@ mod tests {
         until("the export lifts its freeze", || !app.frozen()).await;
         let actions: Vec<String> = app.store.audit_list(50, None).unwrap().into_iter().map(|r| r.action).collect();
         assert!(!actions.iter().any(|a| a == "export.freeze"), "an export nobody received was recorded: {actions:?}");
+    }
+
+    /// A freezing export marks its freeze pending until it hands over its archive, so a restart
+    /// mid-export lifts the freeze and a restart after the handover keeps it.
+    #[tokio::test]
+    async fn a_freeze_is_pending_until_its_archive_is_handed_over() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        let app2 = app.clone();
+        let token = token_of(&cookie);
+        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the snapshot is taken", || app.frozen() && app.gate.try_write().is_ok()).await;
+        let held = app.gate.write().await;
+        assert!(app.store.flag(META_FREEZE_PENDING).unwrap(), "a freeze mid-export was not marked pending");
+        drop(held);
+        task.await.unwrap().unwrap().into_export();
+        assert!(!app.store.flag(META_FREEZE_PENDING).unwrap(), "a handed-over freeze stayed pending");
+        assert!(!app.lift_stranded_freeze().unwrap());
+        assert!(app.frozen());
     }
 
     /// An archive dropped before the response takes it lifts its freeze; one handed over keeps it.

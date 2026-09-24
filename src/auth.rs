@@ -150,6 +150,15 @@ impl Throttle {
             .unwrap_or_else(|p| p.into_inner())
             .remove(key);
     }
+
+    #[cfg(test)]
+    pub fn failures(&self, key: &str) -> usize {
+        self.failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .map_or(0, Vec::len)
+    }
 }
 
 #[cfg(test)]
