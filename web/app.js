@@ -27,13 +27,25 @@ clientReady.catch(err => say('the RDP client failed to load: ' + describe(err), 
 
 class SignedOut extends Error {}
 
+// The database the ids on this page came from. Every request carries it; the proxy refuses a change
+// from a page loaded before an import, and a page that sees another one reloads.
+let dataInstance = null;
+
 async function api(method, path, body) {
+  const headers = body === undefined ? {} : { 'Content-Type': 'application/json' };
+  if (dataInstance) headers['X-Data-Instance'] = dataInstance;
   const res = await fetch(path, {
     method,
     cache: 'no-store',
-    headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  const instance = res.headers.get('X-Data-Instance');
+  if (instance && dataInstance && instance !== dataInstance) {
+    location.reload();
+    throw new Error("this proxy's data was replaced; reloading");
+  }
+  if (instance) dataInstance = instance;
   if (res.status === 401 && path !== '/api/login') throw new SignedOut();
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;

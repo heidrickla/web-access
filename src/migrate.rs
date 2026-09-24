@@ -284,6 +284,8 @@ pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
         let key = app.vault.adopt(&staged, passphrase)?;
         staged.set_flag(META_FROZEN, false)?;
         staged.set_flag(META_FREEZE_PENDING, false)?;
+        // Pages loaded before the import name rows by the ids they had then.
+        crate::app::new_instance(&staged)?;
         (key, staged.counts()?)
     };
 
@@ -411,6 +413,22 @@ mod tests {
         assert!(matches!(snapshot_verified(&app, PASS), Err(MigrateError::WrongPassphrase)));
         let (db, _) = snapshot_verified(&app, "a changed recovery phrase").unwrap();
         assert!(!db.is_empty());
+    }
+
+    /// Restoring a host's own export gives it a new instance: pages loaded in between named rows
+    /// that the restore may give to others.
+    #[tokio::test]
+    async fn an_import_gives_the_database_a_new_instance_even_when_restoring_its_own_export() {
+        let app = test_app_keyed([1; 32], "samehost");
+        app.vault.set_recovery(&app.store, None, PASS).unwrap();
+        app.store.user_create("jdoe", None).unwrap();
+        let exported = export(&app, PASS).unwrap();
+        let before = app.instance();
+        assert!(!before.is_empty());
+        let (upload, _) = stage(&app, &exported.bytes).unwrap();
+        confirm(&app, &upload, PASS, Some("samehost")).unwrap();
+        assert_ne!(app.instance(), before, "the restore kept the instance pages loaded before it carry");
+        assert!(!app.instance().is_empty());
     }
 
     #[tokio::test]

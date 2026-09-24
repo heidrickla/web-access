@@ -19,10 +19,13 @@ check "wrong local password refused" 401 "$(code "${O[@]}" -d '{"username":"devt
 check "local account signs in" 200 "$(code -c local.jar "${O[@]}" -d "{\"username\":\"devtest\",\"password\":\"$LOCAL_PASS\"}" "$B/api/login")"
 check "local account is an administrator" 200 "$(code -b local.jar "$B/api/admin/users")"
 check "a directory username is refused without a directory" 401 "$(code "${O[@]}" -d '{"username":"jdoe","password":"anything-at-all"}' "$B/api/login")"
-sid=$(curl -s -b local.jar "${O[@]}" -d '{"name":"xrdp-01","host":"127.0.0.1","port":13389}' "$B/api/admin/servers" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+# Changes carry the data instance, as a page loaded from this database does.
+inst=$(curl -s -D - -o /dev/null -b local.jar "$B/api/me" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-data-instance"{print $2}')
+L=(-b local.jar "${O[@]}" -H "X-Data-Instance: $inst")
+sid=$(curl -s "${L[@]}" -d '{"name":"xrdp-01","host":"127.0.0.1","port":13389}' "$B/api/admin/servers" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 uid=$(curl -s -b local.jar "$B/api/admin/users" | python3 -c 'import sys,json;print(json.load(sys.stdin)["users"][0]["id"])')
-check "local account assigns itself a server" 200 "$(code -X PUT -b local.jar "${O[@]}" -d "{\"server_ids\":[$sid]}" "$B/api/admin/users/$uid/servers")"
-check "local account gets a connect ticket" 64 "$(curl -s -b local.jar "${O[@]}" -d "{\"server\":$sid}" "$B/api/connect" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["ticket"]))')"
+check "local account assigns itself a server" 200 "$(code -X PUT "${L[@]}" -d "{\"server_ids\":[$sid]}" "$B/api/admin/users/$uid/servers")"
+check "local account gets a connect ticket" 64 "$(curl -s "${L[@]}" -d "{\"server\":$sid}" "$B/api/connect" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["ticket"]))')"
 ./proxy.sh stop 3
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

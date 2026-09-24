@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// v2: local accounts. A user row with a password hash signs in against it, never the directory.
 const SCHEMA_V2: &str = "ALTER TABLE users ADD COLUMN local_hash TEXT;";
@@ -63,6 +63,18 @@ DROP TABLE servers;
 ALTER TABLE servers_v4 RENAME TO servers;
 CREATE TRIGGER servers_incarnation AFTER INSERT ON servers WHEN NEW.incarnation IS NULL
 BEGIN UPDATE servers SET incarnation = random() WHERE id = NEW.id; END;
+";
+
+/// v5: group ids are never reused either, rebuilt the same way; servers keep their group.
+const SCHEMA_V5: &str = "
+CREATE TABLE server_groups_v5 (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    sort INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO server_groups_v5 (id, name, sort) SELECT id, name, sort FROM server_groups;
+DROP TABLE server_groups;
+ALTER TABLE server_groups_v5 RENAME TO server_groups;
 ";
 
 const SCHEMA_V1: &str = "
@@ -310,6 +322,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     if found < 4 {
         rebuild_with_foreign_keys_off(conn, SCHEMA_V4, 4)?;
     }
+    if found < 5 {
+        rebuild_with_foreign_keys_off(conn, SCHEMA_V5, 5)?;
+    }
     Ok(())
 }
 
@@ -492,8 +507,9 @@ impl Store {
     }
 
     /// Record a successful sign-in, binding the SID if this is the first.
-    /// Record a sign-in on the row the caller read, and only that row: false, and nothing
-    /// written, when the id now belongs to another incarnation.
+    /// Record a sign-in on the row the caller read, and only while that row is unbound or bound to
+    /// this SID: false, and nothing written, when the id now belongs to another incarnation or the
+    /// row was bound to another account meanwhile.
     pub fn user_record_login(
         &self,
         id: i64,
@@ -505,7 +521,7 @@ impl Store {
             "UPDATE users SET sid = COALESCE(sid, ?2),
                               display_name = COALESCE(?3, display_name),
                               last_login = ?4
-             WHERE id = ?1 AND incarnation = ?5",
+             WHERE id = ?1 AND incarnation = ?5 AND (sid IS NULL OR sid = ?2)",
             params![id, sid, display_name, now(), incarnation],
         )?;
         Ok(n > 0)
@@ -1308,7 +1324,7 @@ mod tests {
         assert!(s.session_user(b"hash", 1000).unwrap().is_none());
     }
 
-    /// A deleted user's or server's id is never given to a new row, so an id kept anywhere names
+    /// A deleted user's, server's or group's id is never given to a new row, so an id kept anywhere names
     /// that row or nothing.
     #[test]
     fn a_deleted_rows_id_is_never_given_to_a_new_row() {
@@ -1321,6 +1337,10 @@ mod tests {
         s.server_delete(a).unwrap();
         let b = s.server_create("eng-01", "e", 3389, None).unwrap();
         assert!(b > a, "server id {a} was given to a new row");
+        let g = s.group_create("G").unwrap();
+        s.group_delete(g).unwrap();
+        let h = s.group_create("H").unwrap();
+        assert!(h > g, "group id {g} was given to a new row");
         let created = s.user_create_returning("carol", None).unwrap();
         assert_eq!(Some(created.clone()), s.user_by_id(created.id).unwrap());
     }
@@ -1345,7 +1365,7 @@ mod tests {
         let before: i64 = conn.query_row("SELECT incarnation FROM users WHERE id = 2", [], |r| r.get(0)).unwrap();
 
         migrate(&conn).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 4);
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(one("SELECT COUNT(*) FROM users"), 2);
         assert_eq!(one("SELECT COUNT(*) FROM servers"), 2);
@@ -1359,6 +1379,11 @@ mod tests {
         for table in ["assignments", "credentials", "sessions", "session_log"] {
             assert_eq!(one(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = 2")), 0, "{table} kept bob's rows");
         }
+        // A deleted group leaves its servers ungrouped, and its id is not given to a new group.
+        conn.execute("DELETE FROM server_groups WHERE id = 1", []).unwrap();
+        assert_eq!(one("SELECT group_id IS NULL FROM servers WHERE id = 1"), 1);
+        conn.execute("INSERT INTO server_groups (name) VALUES ('H')", []).unwrap();
+        assert_eq!(one("SELECT id FROM server_groups WHERE name = 'H'"), 2, "a group id was given to a new group");
         conn.execute("DELETE FROM servers WHERE id = 1", []).unwrap();
         assert_eq!(one("SELECT COUNT(*) FROM assignments WHERE server_id = 1"), 0);
 
@@ -1422,6 +1447,19 @@ mod tests {
         assert!(user.sid.is_none());
         assert!(s.credential_get(u, a).unwrap().is_none());
         assert!(s.session_user(b"h", now()).unwrap().is_none());
+    }
+
+    /// Two first sign-ins that both read a row unbound cannot both use it: once one account has
+    /// bound it, a sign-in from another is refused.
+    #[test]
+    fn a_row_bound_by_one_account_refuses_a_sign_in_from_another() {
+        let s = store();
+        let u = s.user_create("jdoe", None).unwrap();
+        let row = inc(&s, u);
+        assert!(s.user_record_login(u, row, "SID-FIRST", None).unwrap());
+        assert!(!s.user_record_login(u, row, "SID-SECOND", None).unwrap(), "a second account shared the row");
+        assert_eq!(s.user_by_id(u).unwrap().unwrap().sid.as_deref(), Some("SID-FIRST"));
+        assert!(s.user_record_login(u, row, "SID-FIRST", None).unwrap(), "the bound account was refused");
     }
 
     #[test]

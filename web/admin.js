@@ -8,7 +8,13 @@ const say = (text, bad = false) => {
 
 /* ---- helpers ------------------------------------------------------------------------------ */
 
-async function api(method, path, body, raw) {
+// The database the ids on this page came from. Every request carries it; the proxy refuses a change
+// from a page loaded before an import, and a page that sees another one reloads.
+let dataInstance = null;
+
+/// `replacesData`: the request is the import, which changes the instance itself; the caller
+/// reports the result and reloads.
+async function api(method, path, body, raw, { replacesData = false } = {}) {
   const init = { method, cache: 'no-store', headers: {} };
   if (raw !== undefined) {
     init.body = raw;
@@ -17,7 +23,18 @@ async function api(method, path, body, raw) {
     init.body = JSON.stringify(body);
     init.headers['Content-Type'] = 'application/json';
   }
+  if (dataInstance) init.headers['X-Data-Instance'] = dataInstance;
   const res = await fetch(path, init);
+  const instance = res.headers.get('X-Data-Instance');
+  if (instance && dataInstance && instance !== dataInstance) {
+    if (!replacesData) {
+      location.reload();
+      throw new Error("this proxy's data was replaced; reloading");
+    }
+    // Kept at the old value, so nothing more is sent against the new data before the reload.
+  } else if (instance) {
+    dataInstance = instance;
+  }
   if (res.status === 401) {
     location.href = './';
     throw new Error('signed out');
@@ -699,12 +716,13 @@ $('import-confirm').addEventListener('submit', async ev => {
     const r = await api('POST', `/api/admin/migration/import/${upload.upload_id}`, {
       passphrase: $('imp-pass').value,
       confirm_host: $('imp-host').value || null,
-    });
+    }, undefined, { replacesData: true });
     const c = r.counts;
     $('imp-cancel').click();
-    say(`imported ${c.users} users, ${c.servers} servers, ${c.credentials} saved credentials`);
-    // The imported sign-in sessions replace this host's, so this page may need a fresh sign-in.
-    await loaders.migration();
+    say(`imported ${c.users} users, ${c.servers} servers, ${c.credentials} saved credentials; reloading`);
+    // Everything on the page came from the replaced database. The imported sign-in sessions replace
+    // this host's, so the reload may ask for a fresh sign-in.
+    setTimeout(() => location.reload(), 3000);
   } catch (err) {
     fail(err);
   } finally {

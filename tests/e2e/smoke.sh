@@ -22,7 +22,10 @@ check "admin signs in with DOMAIN\\user form" 200 "$(login 'CORP\\boss' "$USER_P
 check "admin is admin" true "$(curl -s -b boss.jar "$B/api/me" | python3 -c 'import sys,json;print(str(json.load(sys.stdin)["is_admin"]).lower())')"
 check "cookie is persistent for 24h" 1 "$(grep -c 'wa_session' boss.jar)"
 
-A=(-b boss.jar "${O[@]}")
+# Changes carry the data instance, as a page loaded from this database does.
+instance() { curl -s -D - -o /dev/null -b "$1" "$B/api/me" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-data-instance"{print $2}'; }
+I=(-H "X-Data-Instance: $(instance boss.jar)")
+A=(-b boss.jar "${O[@]}" "${I[@]}")
 check "service account password verified" true "$(curl -s "${A[@]}" -d "{\"password\":\"$SVC_PASS\"}" "$B/api/admin/settings/directory-password" | python3 -c 'import sys,json;print(str(json.load(sys.stdin).get("verified")).lower())')"
 check "wrong service password refused" 400 "$(code "${A[@]}" -d '{"password":"nope-nope"}' "$B/api/admin/settings/directory-password")"
 check "unknown user cannot be added" 404 "$(code "${A[@]}" -d '{"username":"nobody"}' "$B/api/admin/users")"
@@ -34,11 +37,12 @@ csv='name,host,port,group\nhist-01,hist-01.plant.example,,Historians\neng-01,eng
 check "CSV import" 200 "$(code "${A[@]}" -d "{\"csv\":\"$csv\"}" "$B/api/admin/servers/import")"
 jdoe_id=$(curl -s -b boss.jar "$B/api/admin/users" | python3 -c 'import sys,json;print([u["id"] for u in json.load(sys.stdin)["users"] if u["username"]=="jdoe"][0])')
 hist=$(curl -s -b boss.jar "$B/api/admin/servers" | python3 -c 'import sys,json;print([s["id"] for s in json.load(sys.stdin)["servers"] if s["name"]=="hist-01"][0])')
+check "a change carrying another data instance is refused" 409 "$(code -X PUT -b boss.jar "${O[@]}" -H 'X-Data-Instance: stale' -d "{\"server_ids\":[$sid]}" "$B/api/admin/users/$jdoe_id/servers")"
 check "assign servers to jdoe" 200 "$(code -X PUT "${A[@]}" -d "{\"server_ids\":[$sid,$hist]}" "$B/api/admin/users/$jdoe_id/servers")"
 check "recovery passphrase set" 204 "$(code "${A[@]}" -d "{\"new\":\"$RECOVERY_PASS\"}" "$B/api/admin/migration/recovery")"
 
 check "jdoe signs in with UPN form" 200 "$(login jdoe@corp.test "$USER_PASS" jdoe.jar)"
-J=(-b jdoe.jar "${O[@]}")
+J=(-b jdoe.jar "${O[@]}" "${I[@]}")
 check "jdoe sees two groups" 2 "$(curl -s -b jdoe.jar "$B/api/me/servers" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["groups"]))')"
 check "jdoe is not an admin" 403 "$(code -b jdoe.jar "$B/api/admin/users")"
 check "jdoe gets a ticket for xrdp-01" 64 "$(curl -s "${J[@]}" -d "{\"server\":$sid}" "$B/api/connect" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["ticket"]))')"

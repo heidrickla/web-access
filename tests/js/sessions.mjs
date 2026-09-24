@@ -8,12 +8,13 @@ import { fileURLToPath } from 'node:url';
 const path = process.env.APP_JS || fileURLToPath(new URL('../../web/app.js', import.meta.url));
 const source = fs.readFileSync(path, 'utf8');
 
-/// A top-level function declaration's text, found by name, braces matched.
+/// A top-level function declaration's text, found by name, braces matched from the `) {` that ends
+/// its parameters (a destructured parameter has braces of its own).
 function extract(name) {
   const start = source.search(new RegExp(`^(async )?function ${name}\\(`, 'm'));
   if (start < 0) throw new Error(`app.js has no function ${name}`);
   let depth = 0;
-  for (let i = source.indexOf('{', start); i < source.length; i++) {
+  for (let i = source.indexOf(') {', start) + 2; i < source.length; i++) {
     if (source[i] === '{') depth++;
     else if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1);
   }
