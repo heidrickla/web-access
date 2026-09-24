@@ -80,6 +80,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(filter()).init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let tool = args.first().map(String::as_str);
+    if !matches!(tool, Some("export" | "import" | "set-secret" | "local-account")) {
+        return server::serve_blocking(&config_path_from_args(), async {
+            let _ = tokio::signal::ctrl_c().await;
+        });
+    }
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         server::install_crypto_provider()?;
@@ -88,13 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("import") => cli::import(&args[1..]),
             Some("set-secret") => cli::set_secret(&args[1..]).await,
             Some("local-account") => cli::local_account(&args[1..]),
-            _ => {
-                let config_path = config_path_from_args();
-                server::run(&config_path, async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await
-            }
+            _ => Err("not a command-line tool".into()),
         }
     })
 }

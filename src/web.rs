@@ -410,7 +410,8 @@ fn refused(app: &App, username: &str, why: &str) -> ApiError {
 
 /// What a password check decided, before anything is written.
 enum Checked {
-    Local { user_id: i64, hash: String },
+    /// The row whose hash was checked, by id and incarnation.
+    Local { user_id: i64, incarnation: i64, hash: String },
     Directory(crate::directory::Account),
     Refused(&'static str),
 }
@@ -426,14 +427,16 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
     let (generation, local) = {
         let _shared = app.gate.read().await;
         let local = match app.store.user_by_name(&username)?.filter(|u| u.local) {
-            Some(u) => Some((u.id, app.store.local_hash(u.id)?.unwrap_or_default())),
+            Some(u) => Some((u.id, u.incarnation, app.store.local_hash(u.id)?.unwrap_or_default())),
             None => None,
         };
         (app.generation(), local)
     };
     // A local account never reaches the directory, and a directory user never reaches a hash.
     let checked = match local {
-        Some((user_id, hash)) => check_local(&app, &username, user_id, hash, &req.password).await?,
+        Some((user_id, incarnation, hash)) => {
+            check_local(&app, &username, user_id, incarnation, hash, &req.password).await?
+        }
         None => check_directory(&app, &username, &req.password).await?,
     };
 
@@ -447,14 +450,13 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
     }
     let user = match checked {
         Checked::Refused(why) => return Err(refused(&app, &username, why)),
-        Checked::Local { user_id, hash } => finish_local(&app, &username, user_id, &hash)?,
+        Checked::Local { user_id, incarnation, hash } => {
+            finish_local(&app, &username, user_id, incarnation, &hash)?
+        }
         Checked::Directory(account) => finish_directory(&app, &account)?,
     };
 
-    let token = auth::random_token();
-    let expires = now() + auth::SESSION_TTL.as_secs() as i64;
-    app.store
-        .session_create(&auth::token_hash(&token), user.id, expires)?;
+    let token = start_session(&app, &user)?;
     let _ = app.store.sessions_purge(now());
     app.store.audit(&user.username, "signin", if user.local { "local account" } else { "" });
 
@@ -466,12 +468,26 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
         .into_response())
 }
 
+const CHANGED: &str = "the account changed during sign-in";
+
+/// A sign-in session for the row that was authenticated, and only that row: refused when its id
+/// has since been given to another row.
+fn start_session(app: &App, user: &User) -> ApiResult<String> {
+    let token = auth::random_token();
+    let expires = now() + auth::SESSION_TTL.as_secs() as i64;
+    if !app.store.session_create(&auth::token_hash(&token), user.id, user.incarnation, expires)? {
+        return Err(refused(app, &user.username, CHANGED));
+    }
+    Ok(token)
+}
+
 const THROTTLED: &str = "too many failed sign-ins; refused without checking the password";
 
 async fn check_local(
     app: &Shared,
     username: &str,
     user_id: i64,
+    incarnation: i64,
     hash: String,
     password: &str,
 ) -> ApiResult<Checked> {
@@ -511,23 +527,28 @@ async fn check_local(
     if !ok {
         return Ok(Checked::Refused("local password did not match"));
     }
-    Ok(Checked::Local { user_id, hash })
+    Ok(Checked::Local { user_id, incarnation, hash })
 }
 
-/// The account must still be the local account whose hash was checked: a password reset meanwhile
-/// does not let the old one in.
-fn finish_local(app: &App, username: &str, user_id: i64, hash: &str) -> ApiResult<User> {
-    let user = app.store.user_by_id(user_id)?.filter(|u| u.local);
+/// The account must still be the local account whose hash was checked, the same row: a password
+/// reset meanwhile does not let the old one in, and nor does a new row on a reused id.
+fn finish_local(app: &App, username: &str, user_id: i64, incarnation: i64, hash: &str) -> ApiResult<User> {
+    let user = app
+        .store
+        .user_by_id(user_id)?
+        .filter(|u| u.local && u.incarnation == incarnation);
     let current = app.store.local_hash(user_id)?;
     let Some(user) = user.filter(|_| current.as_deref() == Some(hash)) else {
-        return Err(refused(app, username, "the local account changed during sign-in"));
+        return Err(refused(app, username, CHANGED));
     };
     // Saved credentials are bound to a SID; a local account gets a synthetic one.
     let sid = user
         .sid
         .clone()
         .unwrap_or_else(|| format!("local:{}", &auth::random_token()[..32]));
-    app.store.user_record_login(user.id, &sid, None)?;
+    if !app.store.user_record_login(user.id, user.incarnation, &sid, None)? {
+        return Err(refused(app, username, CHANGED));
+    }
     Ok(user)
 }
 
@@ -574,8 +595,12 @@ fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult
             ));
         }
     }
-    app.store
-        .user_record_login(user.id, &account.sid, account.display_name.as_deref())?;
+    if !app
+        .store
+        .user_record_login(user.id, user.incarnation, &account.sid, account.display_name.as_deref())?
+    {
+        return Err(refused(app, &account.username, CHANGED));
+    }
     Ok(user)
 }
 
@@ -891,13 +916,10 @@ pub mod tests {
             Some(u) => u.id,
             None => app.store.user_create(username, None).unwrap(),
         };
-        app.store
-            .user_record_login(id, &format!("S-1-5-21-{id}"), None)
-            .unwrap();
+        let incarnation = app.store.user_by_id(id).unwrap().unwrap().incarnation;
+        assert!(app.store.user_record_login(id, incarnation, &format!("S-1-5-21-{id}"), None).unwrap());
         let token = auth::random_token();
-        app.store
-            .session_create(&auth::token_hash(&token), id, now() + 3600)
-            .unwrap();
+        assert!(app.store.session_create(&auth::token_hash(&token), id, incarnation, now() + 3600).unwrap());
         (id, format!("{COOKIE}={token}"))
     }
 
@@ -1036,9 +1058,26 @@ pub mod tests {
         let uid = app.store.user_create("jdoe", None).unwrap();
         let start = now();
         let ttl = auth::SESSION_TTL.as_secs() as i64;
-        app.store.session_create(b"h", uid, start + ttl).unwrap();
+        let incarnation = app.store.user_by_id(uid).unwrap().unwrap().incarnation;
+        app.store.session_create(b"h", uid, incarnation, start + ttl).unwrap();
         assert!(app.store.session_user(b"h", start + ttl - 60).unwrap().is_some(), "23h59m");
         assert!(app.store.session_user(b"h", start + ttl).unwrap().is_none(), "24h");
+    }
+
+    /// A sign-in whose account was deleted, and its id given to a new account, before its session
+    /// was created gets no session.
+    #[tokio::test]
+    async fn a_sign_in_gets_no_session_on_a_row_that_reused_its_id() {
+        let app = test_app();
+        let alice_id = app.store.user_create("alice", None).unwrap();
+        let alice = app.store.user_by_id(alice_id).unwrap().unwrap();
+        app.store.user_delete(alice_id).unwrap();
+        let bob = app.store.user_create("bob", None).unwrap();
+        assert_eq!(bob, alice_id, "SQLite did not reuse the id, so this proves nothing");
+        let refused = start_session(&app, &alice).unwrap_err();
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+        let fresh = app.store.user_by_id(bob).unwrap().unwrap();
+        assert!(start_session(&app, &fresh).is_ok());
     }
 
     async fn login_as(app: &Shared, username: &str, password: &str) -> (StatusCode, Option<String>) {

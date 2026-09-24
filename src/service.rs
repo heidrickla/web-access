@@ -67,12 +67,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     status_handle.set_service_status(running)?;
 
     let config_path = crate::config_path_from_args();
-    let outcome = tokio::runtime::Runtime::new()?.block_on(async move {
-        server::install_crypto_provider()?;
-        server::run(&config_path, async {
-            let _ = stop_rx.await;
-        })
-        .await
+    let outcome = server::serve_blocking(&config_path, async move {
+        let _ = stop_rx.await;
     });
 
     // Report Stopped whatever happened, or the SCM leaves the service wedged in Running.
