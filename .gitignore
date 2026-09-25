@@ -5,6 +5,7 @@
 node_modules/
 pkg/
 target/
+mutants.out*/
 
 # Cargo.lock IS committed. Vendoring without a lockfile is incoherent: the point is a build that is
 # reproducible offline, and the lockfile is what pins it.

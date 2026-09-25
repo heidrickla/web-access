@@ -129,6 +129,16 @@ Two settings keep the vendored tree intact:
 After changing dependencies: `cargo vendor`, then `cargo build --offline` and `cargo test --offline`
 from a fresh clone with the crate cache emptied.
 
+Gates before a push; CI (`.github/workflows/ci.yml`) runs the same on Linux:
+
+| Gate | Command |
+|---|---|
+| format | `cargo fmt --check` |
+| lint | `cargo clippy --offline --all-targets -- -D warnings`; for the Linux cfg from Windows, `cargo-zigbuild clippy --offline --target x86_64-unknown-linux-musl --all-targets -- -D warnings` |
+| test | `cargo nextest run --offline` |
+| dependencies | `cargo deny check` (advisories, licenses, bans, sources; `deny.toml`) |
+| mutation | `cargo mutants --in-diff <diff>` for the lines a change touches |
+
 ## Why not the obvious things
 
 | Ruled out | Reason |
