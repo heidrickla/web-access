@@ -6,6 +6,8 @@
 
 use crate::config::DirectoryConfig;
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,7 +136,7 @@ impl Directory {
                 let pem = std::fs::read(path)
                     .map_err(|e| DirError::Config(format!("reading {path}: {e}")))?;
                 let mut roots = rustls::RootCertStore::empty();
-                for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                for cert in CertificateDer::pem_slice_iter(&pem) {
                     let cert = cert.map_err(|e| DirError::Config(format!("{path}: {e}")))?;
                     roots
                         .add(cert)

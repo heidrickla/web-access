@@ -130,7 +130,10 @@ async fn add_user(
     let mut verified = false;
     let mut display_name = None;
     if let (Some(directory), Some(pw)) = (app.lookup_directory(), password) {
-        match directory.lookup_many(&pw, &[username.clone()]).await {
+        match directory
+            .lookup_many(&pw, std::slice::from_ref(&username))
+            .await
+        {
             Ok(found) => match found.into_iter().next().and_then(|(_, a)| a) {
                 Some(account) => {
                     verified = true;

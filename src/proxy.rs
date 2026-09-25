@@ -16,6 +16,8 @@ use crate::store::{now, Server, User};
 
 use futures_util::{SinkExt, StreamExt};
 use ironrdp_rdcleanpath::{RDCleanPath, RDCleanPathPdu};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,8 +43,9 @@ const SERVER_HANDSHAKE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    /// Boxed: tungstenite's error is large enough to bloat every `Result` that carries this type.
     #[error("websocket: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("the first message was not an RDCleanPath request")]
@@ -53,6 +56,12 @@ pub enum SessionError {
     Tls(String),
     #[error("timed out {0}")]
     Timeout(&'static str),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for SessionError {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(e))
+    }
 }
 
 /// Why admission refused a connection. Logged; the client sees one refusal shape for all of them.
@@ -376,7 +385,7 @@ async fn read_tpkt(stream: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
     let mut head = [0u8; TPKT_HEADER];
     stream.read_exact(&mut head).await?;
     let length = u16::from_be_bytes([head[2], head[3]]) as usize;
-    if length < TPKT_HEADER || length > TPKT_MAX {
+    if !(TPKT_HEADER..=TPKT_MAX).contains(&length) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("implausible TPKT length {length}"),
@@ -398,8 +407,8 @@ pub fn tls_setup(cfg: &Tls) -> Result<TlsSetup, SessionError> {
                 .ok_or_else(|| SessionError::Tls("ca_bundle required".into()))?;
             let pem = std::fs::read(path)?;
             let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-                let cert = cert?;
+            for cert in CertificateDer::pem_slice_iter(&pem) {
+                let cert = cert.map_err(|e| SessionError::Tls(format!("{path}: {e}")))?;
                 roots
                     .add(cert)
                     .map_err(|e| SessionError::Tls(e.to_string()))?;
