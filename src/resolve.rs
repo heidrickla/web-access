@@ -73,7 +73,10 @@ mod tests {
         // .invalid is reserved by RFC 2606 and must never resolve.
         let err = resolve_one("nothing.invalid", 3389).await.unwrap_err();
         assert!(
-            matches!(err, ResolveError::Failed { .. } | ResolveError::NoAddress { .. }),
+            matches!(
+                err,
+                ResolveError::Failed { .. } | ResolveError::NoAddress { .. }
+            ),
             "unexpected: {err}"
         );
     }

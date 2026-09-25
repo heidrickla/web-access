@@ -285,7 +285,10 @@ fn rebuild_with_foreign_keys_off(conn: &Connection, sql: &str, version: i64) -> 
     let migrated = (|| -> Result<()> {
         conn.execute_batch("BEGIN;")?;
         conn.execute_batch(sql)?;
-        let broken: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+        let broken: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
         if broken > 0 {
             return Err(StoreError::Invalid(format!(
                 "migrating to schema {version} would break {broken} reference(s); nothing was changed"
@@ -311,13 +314,19 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         });
     }
     if found < 1 {
-        conn.execute_batch(&format!("BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"))?;
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"
+        ))?;
     }
     if found < 2 {
-        conn.execute_batch(&format!("BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"))?;
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"
+        ))?;
     }
     if found < 3 {
-        conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"))?;
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"
+        ))?;
     }
     if found < 4 {
         rebuild_with_foreign_keys_off(conn, SCHEMA_V4, 4)?;
@@ -469,21 +478,35 @@ impl Store {
 
     /// Create a user and return its row as stored, incarnation included, under one hold of the
     /// connection, so nothing comes between the insert and the read.
-    pub fn user_create_returning(&self, username: &str, display_name: Option<&str>) -> Result<User> {
+    pub fn user_create_returning(
+        &self,
+        username: &str,
+        display_name: Option<&str>,
+    ) -> Result<User> {
         let c = self.c();
         let exists: bool = c
-            .query_row("SELECT 1 FROM users WHERE username = ?1", [username], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM users WHERE username = ?1",
+                [username],
+                |_| Ok(()),
+            )
             .optional()?
             .is_some();
         if exists {
-            return Err(StoreError::Conflict(format!("{username} is already a user")));
+            return Err(StoreError::Conflict(format!(
+                "{username} is already a user"
+            )));
         }
         c.execute(
             "INSERT INTO users (username, display_name, created) VALUES (?1, ?2, ?3)",
             params![username, display_name, now()],
         )?;
         let id = c.last_insert_rowid();
-        Ok(c.query_row(&format!("SELECT {USER_COLS} FROM users u WHERE u.id = ?1"), [id], user_from)?)
+        Ok(c.query_row(
+            &format!("SELECT {USER_COLS} FROM users u WHERE u.id = ?1"),
+            [id],
+            user_from,
+        )?)
     }
 
     /// A row on an id used before, which ids that are never reused cannot produce: for testing the
@@ -543,7 +566,10 @@ impl Store {
                 "{username} is a directory user; choose another name for the local account"
             ))),
             Some((id, true)) => {
-                c.execute("UPDATE users SET local_hash = ?2 WHERE id = ?1", params![id, hash])?;
+                c.execute(
+                    "UPDATE users SET local_hash = ?2 WHERE id = ?1",
+                    params![id, hash],
+                )?;
                 Ok(id)
             }
             None => {
@@ -560,7 +586,9 @@ impl Store {
     pub fn local_hash(&self, id: i64) -> Result<Option<String>> {
         Ok(self
             .c()
-            .query_row("SELECT local_hash FROM users WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT local_hash FROM users WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .optional()?
             .flatten())
     }
@@ -774,7 +802,9 @@ impl Store {
     }
 
     pub fn server_delete(&self, id: i64) -> Result<()> {
-        let n = self.c().execute("DELETE FROM servers WHERE id = ?1", [id])?;
+        let n = self
+            .c()
+            .execute("DELETE FROM servers WHERE id = ?1", [id])?;
         if n == 0 {
             return Err(StoreError::NotFound);
         }
@@ -968,7 +998,12 @@ impl Store {
             .optional()?)
     }
 
-    pub fn credential_put(&self, user_id: i64, server_id: i64, cred: &StoredCredential) -> Result<()> {
+    pub fn credential_put(
+        &self,
+        user_id: i64,
+        server_id: i64,
+        cred: &StoredCredential,
+    ) -> Result<()> {
         self.c().execute(
             "INSERT INTO credentials (user_id, server_id, username, domain, nonce, secret, updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1190,7 +1225,11 @@ fn counts_of(c: &Connection) -> Result<Counts> {
 
 fn group_insert(c: &Connection, name: &str) -> Result<i64> {
     let exists = c
-        .query_row("SELECT 1 FROM server_groups WHERE name = ?1", [name], |_| Ok(()))
+        .query_row(
+            "SELECT 1 FROM server_groups WHERE name = ?1",
+            [name],
+            |_| Ok(()),
+        )
         .optional()?
         .is_some();
     if exists {
@@ -1217,7 +1256,9 @@ fn name_free(c: &Connection, name: &str, except: Option<i64>) -> Result<()> {
         )
         .optional()?;
     if taken.is_some() {
-        return Err(StoreError::Conflict(format!("a server named {name} exists")));
+        return Err(StoreError::Conflict(format!(
+            "a server named {name} exists"
+        )));
     }
     Ok(())
 }
@@ -1225,7 +1266,11 @@ fn name_free(c: &Connection, name: &str, except: Option<i64>) -> Result<()> {
 fn group_exists(c: &Connection, group_id: Option<i64>) -> Result<()> {
     if let Some(id) = group_id {
         let ok = c
-            .query_row("SELECT 1 FROM server_groups WHERE id = ?1", [id], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM server_groups WHERE id = ?1",
+                [id],
+                |_| Ok(()),
+            )
             .optional()?
             .is_some();
         if !ok {
@@ -1247,8 +1292,12 @@ mod tests {
     fn assignment_replacement_reports_what_changed() {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
-        let a = s.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
-        let b = s.server_create("eng-02", "eng-02.example", 3389, None).unwrap();
+        let a = s
+            .server_create("hist-01", "hist-01.example", 3389, None)
+            .unwrap();
+        let b = s
+            .server_create("eng-02", "eng-02.example", 3389, None)
+            .unwrap();
         assert_eq!(s.set_assignments(u, &[a, b]).unwrap(), (2, 0));
         assert_eq!(s.set_assignments(u, &[b]).unwrap(), (0, 1));
         assert_eq!(s.assignment_ids(u).unwrap(), vec![b]);
@@ -1256,7 +1305,11 @@ mod tests {
             s.set_assignments(u, &[b, 999]),
             Err(StoreError::Invalid(_))
         ));
-        assert_eq!(s.assignment_ids(u).unwrap(), vec![b], "a refused set changes nothing");
+        assert_eq!(
+            s.assignment_ids(u).unwrap(),
+            vec![b],
+            "a refused set changes nothing"
+        );
     }
 
     #[test]
@@ -1300,14 +1353,34 @@ mod tests {
     fn import_creates_groups_and_updates_by_name() {
         let s = store();
         let rows = vec![
-            ImportRow { name: "a".into(), host: "a.example".into(), port: 3389, group: Some("G1".into()) },
-            ImportRow { name: "b".into(), host: "b.example".into(), port: 3390, group: None },
+            ImportRow {
+                name: "a".into(),
+                host: "a.example".into(),
+                port: 3389,
+                group: Some("G1".into()),
+            },
+            ImportRow {
+                name: "b".into(),
+                host: "b.example".into(),
+                port: 3390,
+                group: None,
+            },
         ];
         assert_eq!(s.servers_import(&rows).unwrap(), (2, 0));
-        let again = vec![ImportRow { name: "A".into(), host: "a2.example".into(), port: 3389, group: Some("g1".into()) }];
+        let again = vec![ImportRow {
+            name: "A".into(),
+            host: "a2.example".into(),
+            port: 3389,
+            group: Some("g1".into()),
+        }];
         assert_eq!(s.servers_import(&again).unwrap(), (0, 1));
         assert_eq!(s.groups_list().unwrap().len(), 1);
-        let a = s.servers_list().unwrap().into_iter().find(|r| r.server.name == "a").unwrap();
+        let a = s
+            .servers_list()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.server.name == "a")
+            .unwrap();
         assert_eq!(a.server.host, "a2.example");
     }
 
@@ -1351,7 +1424,10 @@ mod tests {
     fn a_version_3_database_migrates_to_ids_that_are_never_reused() {
         let conn = Connection::open_in_memory().unwrap();
         configure(&conn).unwrap();
-        conn.execute_batch(&format!("{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;")).unwrap();
+        conn.execute_batch(&format!(
+            "{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;"
+        ))
+        .unwrap();
         conn.execute_batch(
             "INSERT INTO users (id, username, created) VALUES (1, 'alice', 1), (2, 'bob', 1);
              INSERT INTO server_groups (id, name) VALUES (1, 'G');
@@ -1362,7 +1438,11 @@ mod tests {
              INSERT INTO session_log VALUES (2, 2, 5);",
         )
         .unwrap();
-        let before: i64 = conn.query_row("SELECT incarnation FROM users WHERE id = 2", [], |r| r.get(0)).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT incarnation FROM users WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
 
         migrate(&conn).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
@@ -1370,27 +1450,60 @@ mod tests {
         assert_eq!(one("SELECT COUNT(*) FROM users"), 2);
         assert_eq!(one("SELECT COUNT(*) FROM servers"), 2);
         assert_eq!(one("SELECT group_id FROM servers WHERE id = 1"), 1);
-        assert_eq!(one("SELECT incarnation FROM users WHERE id = 2"), before, "an incarnation changed");
+        assert_eq!(
+            one("SELECT incarnation FROM users WHERE id = 2"),
+            before,
+            "an incarnation changed"
+        );
         assert_eq!(one("SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
         assert_eq!(one("PRAGMA foreign_keys"), 1, "foreign keys were left off");
 
         // References survived: deleting bob cascades to everything of his.
         conn.execute("DELETE FROM users WHERE id = 2", []).unwrap();
         for table in ["assignments", "credentials", "sessions", "session_log"] {
-            assert_eq!(one(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = 2")), 0, "{table} kept bob's rows");
+            assert_eq!(
+                one(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = 2")),
+                0,
+                "{table} kept bob's rows"
+            );
         }
         // A deleted group leaves its servers ungrouped, and its id is not given to a new group.
-        conn.execute("DELETE FROM server_groups WHERE id = 1", []).unwrap();
+        conn.execute("DELETE FROM server_groups WHERE id = 1", [])
+            .unwrap();
         assert_eq!(one("SELECT group_id IS NULL FROM servers WHERE id = 1"), 1);
-        conn.execute("INSERT INTO server_groups (name) VALUES ('H')", []).unwrap();
-        assert_eq!(one("SELECT id FROM server_groups WHERE name = 'H'"), 2, "a group id was given to a new group");
-        conn.execute("DELETE FROM servers WHERE id = 1", []).unwrap();
-        assert_eq!(one("SELECT COUNT(*) FROM assignments WHERE server_id = 1"), 0);
+        conn.execute("INSERT INTO server_groups (name) VALUES ('H')", [])
+            .unwrap();
+        assert_eq!(
+            one("SELECT id FROM server_groups WHERE name = 'H'"),
+            2,
+            "a group id was given to a new group"
+        );
+        conn.execute("DELETE FROM servers WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            one("SELECT COUNT(*) FROM assignments WHERE server_id = 1"),
+            0
+        );
 
-        conn.execute("INSERT INTO users (username, created) VALUES ('carol', 1)", []).unwrap();
-        assert_eq!(one("SELECT id FROM users WHERE username = 'carol'"), 3, "bob's id was given to a new row");
-        assert_ne!(one("SELECT incarnation IS NOT NULL FROM users WHERE username = 'carol'"), 0);
-        conn.execute("INSERT INTO servers (name, host) VALUES ('new-01', 'n')", []).unwrap();
+        conn.execute(
+            "INSERT INTO users (username, created) VALUES ('carol', 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            one("SELECT id FROM users WHERE username = 'carol'"),
+            3,
+            "bob's id was given to a new row"
+        );
+        assert_ne!(
+            one("SELECT incarnation IS NOT NULL FROM users WHERE username = 'carol'"),
+            0
+        );
+        conn.execute(
+            "INSERT INTO servers (name, host) VALUES ('new-01', 'n')",
+            [],
+        )
+        .unwrap();
         assert_eq!(one("SELECT id FROM servers WHERE name = 'new-01'"), 3);
     }
 
@@ -1400,20 +1513,35 @@ mod tests {
     fn a_migration_that_would_break_references_changes_nothing() {
         let conn = Connection::open_in_memory().unwrap();
         configure(&conn).unwrap();
-        conn.execute_batch(&format!("{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;")).unwrap();
+        conn.execute_batch(&format!(
+            "{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;"
+        ))
+        .unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys = OFF;
              INSERT INTO sessions VALUES (x'bb', 99, 1, 99);
              PRAGMA foreign_keys = ON;",
         )
         .unwrap();
-        assert!(migrate(&conn).is_err(), "a migration with a broken reference went through");
+        assert!(
+            migrate(&conn).is_err(),
+            "a migration with a broken reference went through"
+        );
         assert_eq!(schema_version(&conn).unwrap(), 3);
         let rebuilt: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE sql LIKE '%AUTOINCREMENT%'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE sql LIKE '%AUTOINCREMENT%'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(rebuilt, 0, "the refused migration left rebuilt tables behind");
-        let on: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            rebuilt, 0,
+            "the refused migration left rebuilt tables behind"
+        );
+        let on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(on, 1, "foreign keys were left off");
     }
 
@@ -1426,12 +1554,26 @@ mod tests {
         let authenticated = inc(&s, alice);
         s.user_delete(alice).unwrap();
         let bob = s.user_create_at(alice, "bob").unwrap();
-        assert!(!s.user_record_login(bob, authenticated, "S-1-5-21-9", None).unwrap());
-        assert!(s.user_by_id(bob).unwrap().unwrap().sid.is_none(), "the login landed on another row");
-        assert!(!s.session_create(b"alice's", bob, authenticated, now() + 100).unwrap());
-        assert!(s.session_user(b"alice's", now()).unwrap().is_none(), "the session went to another row");
-        assert!(s.user_record_login(bob, inc(&s, bob), "S-1-5-21-9", None).unwrap());
-        assert!(s.session_create(b"bob's", bob, inc(&s, bob), now() + 100).unwrap());
+        assert!(!s
+            .user_record_login(bob, authenticated, "S-1-5-21-9", None)
+            .unwrap());
+        assert!(
+            s.user_by_id(bob).unwrap().unwrap().sid.is_none(),
+            "the login landed on another row"
+        );
+        assert!(!s
+            .session_create(b"alice's", bob, authenticated, now() + 100)
+            .unwrap());
+        assert!(
+            s.session_user(b"alice's", now()).unwrap().is_none(),
+            "the session went to another row"
+        );
+        assert!(s
+            .user_record_login(bob, inc(&s, bob), "S-1-5-21-9", None)
+            .unwrap());
+        assert!(s
+            .session_create(b"bob's", bob, inc(&s, bob), now() + 100)
+            .unwrap());
     }
 
     #[test]
@@ -1439,8 +1581,19 @@ mod tests {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
         let a = s.server_create("hist-01", "h", 3389, None).unwrap();
-        s.user_record_login(u, inc(&s, u), "S-1-5-21-1", None).unwrap();
-        s.credential_put(u, a, &StoredCredential { username: "x".into(), domain: None, nonce: vec![0; 12], secret: vec![1] }).unwrap();
+        s.user_record_login(u, inc(&s, u), "S-1-5-21-1", None)
+            .unwrap();
+        s.credential_put(
+            u,
+            a,
+            &StoredCredential {
+                username: "x".into(),
+                domain: None,
+                nonce: vec![0; 12],
+                secret: vec![1],
+            },
+        )
+        .unwrap();
         s.session_create(b"h", u, inc(&s, u), now() + 100).unwrap();
         s.user_clear_sid(u).unwrap();
         let user = s.user_by_id(u).unwrap().unwrap();
@@ -1457,17 +1610,28 @@ mod tests {
         let u = s.user_create("jdoe", None).unwrap();
         let row = inc(&s, u);
         assert!(s.user_record_login(u, row, "SID-FIRST", None).unwrap());
-        assert!(!s.user_record_login(u, row, "SID-SECOND", None).unwrap(), "a second account shared the row");
-        assert_eq!(s.user_by_id(u).unwrap().unwrap().sid.as_deref(), Some("SID-FIRST"));
-        assert!(s.user_record_login(u, row, "SID-FIRST", None).unwrap(), "the bound account was refused");
+        assert!(
+            !s.user_record_login(u, row, "SID-SECOND", None).unwrap(),
+            "a second account shared the row"
+        );
+        assert_eq!(
+            s.user_by_id(u).unwrap().unwrap().sid.as_deref(),
+            Some("SID-FIRST")
+        );
+        assert!(
+            s.user_record_login(u, row, "SID-FIRST", None).unwrap(),
+            "the bound account was refused"
+        );
     }
 
     #[test]
     fn a_first_login_binds_the_sid_and_later_ones_do_not_change_it() {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
-        s.user_record_login(u, inc(&s, u), "S-1-5-21-1", Some("J Doe")).unwrap();
-        s.user_record_login(u, inc(&s, u), "S-1-5-21-2", None).unwrap();
+        s.user_record_login(u, inc(&s, u), "S-1-5-21-1", Some("J Doe"))
+            .unwrap();
+        s.user_record_login(u, inc(&s, u), "S-1-5-21-2", None)
+            .unwrap();
         let user = s.user_by_id(u).unwrap().unwrap();
         assert_eq!(user.sid.as_deref(), Some("S-1-5-21-1"));
         assert_eq!(user.display_name.as_deref(), Some("J Doe"));
@@ -1476,7 +1640,8 @@ mod tests {
     #[test]
     fn a_version_1_database_gains_local_accounts() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;")).unwrap();
+        conn.execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;"))
+            .unwrap();
         conn.execute(
             "INSERT INTO users (username, created) VALUES ('jdoe', 1)",
             [],
@@ -1485,7 +1650,11 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let local: i64 = conn
-            .query_row("SELECT local_hash IS NOT NULL FROM users WHERE username = 'jdoe'", [], |r| r.get(0))
+            .query_row(
+                "SELECT local_hash IS NOT NULL FROM users WHERE username = 'jdoe'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(local, 0);
     }
@@ -1495,10 +1664,17 @@ mod tests {
         let s = store();
         let id = s.local_account_set("devtest", "h1", "local:1").unwrap();
         assert!(s.user_by_id(id).unwrap().unwrap().local);
-        assert_eq!(s.local_account_set("devtest", "h2", "local:ignored").unwrap(), id);
+        assert_eq!(
+            s.local_account_set("devtest", "h2", "local:ignored")
+                .unwrap(),
+            id
+        );
         assert_eq!(s.local_hash(id).unwrap().as_deref(), Some("h2"));
         s.user_create("jdoe", None).unwrap();
-        assert!(matches!(s.local_account_set("jdoe", "h", "local:2"), Err(StoreError::Conflict(_))));
+        assert!(matches!(
+            s.local_account_set("jdoe", "h", "local:2"),
+            Err(StoreError::Conflict(_))
+        ));
     }
 
     #[test]
@@ -1506,16 +1682,24 @@ mod tests {
         let s = store();
         let local = s.local_account_set("devtest", "h", "local:1").unwrap();
         let dir = s.user_create("jdoe", None).unwrap();
-        s.session_create(b"a", local, inc(&s, local), now() + 100).unwrap();
-        s.session_create(b"b", dir, inc(&s, dir), now() + 100).unwrap();
-        let swept: Vec<i64> = s.directory_users_with_sessions(now()).unwrap().iter().map(|u| u.id).collect();
+        s.session_create(b"a", local, inc(&s, local), now() + 100)
+            .unwrap();
+        s.session_create(b"b", dir, inc(&s, dir), now() + 100)
+            .unwrap();
+        let swept: Vec<i64> = s
+            .directory_users_with_sessions(now())
+            .unwrap()
+            .iter()
+            .map(|u| u.id)
+            .collect();
         assert_eq!(swept, vec![dir]);
     }
 
     #[test]
     fn a_newer_schema_is_refused() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
         assert!(matches!(migrate(&conn), Err(StoreError::Newer { .. })));
     }
 }

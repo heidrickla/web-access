@@ -62,7 +62,15 @@ impl App {
         let directory = cfg.directory.as_ref().map(Directory::new).transpose()?;
         let target_tls = tls_setup(&cfg.tls)?;
         let secure = cfg.https.is_some();
-        let app = Self::from_parts(cfg, store, vault, directory, target_tls, host_name(), secure);
+        let app = Self::from_parts(
+            cfg,
+            store,
+            vault,
+            directory,
+            target_tls,
+            host_name(),
+            secure,
+        );
         app.seed_from_config()?;
         if app.store.meta_get(META_INSTANCE)?.is_none() {
             new_instance(&app.store)?;
@@ -96,7 +104,11 @@ impl App {
         }
         self.store.set_flag(META_FROZEN, false)?;
         self.store.set_flag(META_FREEZE_PENDING, false)?;
-        self.store.audit("system", "unfreeze", "the export that froze this proxy did not finish");
+        self.store.audit(
+            "system",
+            "unfreeze",
+            "the export that froze this proxy did not finish",
+        );
         tracing::warn!("lifted a freeze left by an export that did not finish");
         Ok(true)
     }
@@ -241,19 +253,28 @@ mod tests {
     /// while the service's export is still in progress. A freeze with no export pending stays.
     #[test]
     fn a_stranded_freeze_is_lifted_when_the_service_starts_and_only_then() {
-        let dir = std::env::temp_dir().join(format!("web-access-test-{}", &crate::auth::random_token()[..12]));
+        let dir = std::env::temp_dir().join(format!(
+            "web-access-test-{}",
+            &crate::auth::random_token()[..12]
+        ));
         let app = App::for_serving(config_in(&dir)).unwrap();
         app.store.set_flag(META_FREEZE_PENDING, true).unwrap();
         app.store.set_flag(META_FROZEN, true).unwrap();
         drop(app);
         let tool = App::new(config_in(&dir)).unwrap();
-        assert!(tool.frozen(), "a command-line tool lifted a freeze whose export may still be running");
+        assert!(
+            tool.frozen(),
+            "a command-line tool lifted a freeze whose export may still be running"
+        );
         drop(tool);
         let app = App::for_serving(config_in(&dir)).unwrap();
         assert!(!app.frozen(), "a stranded freeze survived a restart");
         app.store.set_flag(META_FROZEN, true).unwrap();
         drop(app);
         let app = App::for_serving(config_in(&dir)).unwrap();
-        assert!(app.frozen(), "a freeze with no export pending was lifted at start");
+        assert!(
+            app.frozen(),
+            "a freeze with no export pending was lifted at start"
+        );
     }
 }

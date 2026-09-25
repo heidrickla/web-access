@@ -60,15 +60,51 @@ pub const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval';
 
 /// (request path, content type, bytes).
 pub const ASSETS: &[(&str, &str, &[u8])] = &[
-    ("/", "text/html; charset=utf-8", include_bytes!("../web/index.html")),
-    ("/index.html", "text/html; charset=utf-8", include_bytes!("../web/index.html")),
-    ("/admin", "text/html; charset=utf-8", include_bytes!("../web/admin.html")),
-    ("/admin.html", "text/html; charset=utf-8", include_bytes!("../web/admin.html")),
-    ("/app.css", "text/css; charset=utf-8", include_bytes!("../web/app.css")),
-    ("/app.js", "text/javascript; charset=utf-8", include_bytes!("../web/app.js")),
-    ("/admin.js", "text/javascript; charset=utf-8", include_bytes!("../web/admin.js")),
-    ("/ironrdp_web.js", "text/javascript; charset=utf-8", include_bytes!("../web/ironrdp_web.js")),
-    ("/ironrdp_web_bg.wasm", "application/wasm", include_bytes!("../web/ironrdp_web_bg.wasm")),
+    (
+        "/",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/index.html"),
+    ),
+    (
+        "/index.html",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/index.html"),
+    ),
+    (
+        "/admin",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/admin.html"),
+    ),
+    (
+        "/admin.html",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/admin.html"),
+    ),
+    (
+        "/app.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../web/app.css"),
+    ),
+    (
+        "/app.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/app.js"),
+    ),
+    (
+        "/admin.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/admin.js"),
+    ),
+    (
+        "/ironrdp_web.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/ironrdp_web.js"),
+    ),
+    (
+        "/ironrdp_web_bg.wasm",
+        "application/wasm",
+        include_bytes!("../web/ironrdp_web_bg.wasm"),
+    ),
 ];
 
 // ---- errors ---------------------------------------------------------------------------------
@@ -97,7 +133,10 @@ impl ApiError {
     }
     pub fn internal(e: impl std::fmt::Display) -> Self {
         tracing::error!(error = %e, "request failed");
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "the proxy could not complete that request")
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the proxy could not complete that request",
+        )
     }
 }
 
@@ -267,10 +306,19 @@ async fn origin_guard(req: Request, next: Next) -> Response {
 
 async fn security_headers(mut res: Response) -> Response {
     let h = res.headers_mut();
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
     h.entry(header::CACHE_CONTROL)
         .or_insert(HeaderValue::from_static("no-store"));
     res
@@ -292,7 +340,10 @@ pub fn router(app: Shared) -> Router {
         .route("/ws", get(ws_upgrade))
         .nest("/api/admin", crate::admin::router())
         .fallback(static_asset)
-        .layer(middleware::from_fn_with_state(Arc::clone(&app), gate_requests))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            gate_requests,
+        ))
         .layer(middleware::from_fn(deadline))
         .layer(middleware::from_fn(origin_guard))
         .layer(middleware::map_response(security_headers))
@@ -315,7 +366,12 @@ pub const SELF_GATED_ROUTES: &[(&str, &str)] = &[
 
 fn route_in(routes: &[(&str, &str)], method: &Method, path: &str) -> bool {
     routes.iter().any(|(m, p)| {
-        *m == method.as_str() && if p.ends_with('/') { path.starts_with(p) } else { path == *p }
+        *m == method.as_str()
+            && if p.ends_with('/') {
+                path.starts_with(p)
+            } else {
+                path == *p
+            }
     })
 }
 
@@ -336,15 +392,21 @@ async fn gate_requests(State(app): State<Shared>, req: Request, next: Next) -> R
     let bytes = match axum::body::to_bytes(body, GATED_BODY_LIMIT).await {
         Ok(b) => b,
         Err(_) => {
-            return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "the request body is too large")
-                .into_response()
+            return ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "the request body is too large",
+            )
+            .into_response()
         }
     };
     let req = Request::from_parts(parts, Body::from(bytes));
     let _shared = app.gate.read().await;
     if needs_instance(req.method(), req.uri().path()) {
         let current = app.instance();
-        let sent = req.headers().get(INSTANCE_HEADER).and_then(|v| v.to_str().ok());
+        let sent = req
+            .headers()
+            .get(INSTANCE_HEADER)
+            .and_then(|v| v.to_str().ok());
         if current.is_empty() || sent != Some(current.as_str()) {
             let mut res = ApiError::conflict(
                 "this proxy's data changed after the page was loaded; reload the page",
@@ -396,7 +458,9 @@ async fn deadline(req: Request, next: Next) -> Response {
     };
     match tokio::time::timeout(limit, next.run(req)).await {
         Ok(res) => res,
-        Err(_) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "the request took too long").into_response(),
+        Err(_) => {
+            ApiError::new(StatusCode::REQUEST_TIMEOUT, "the request took too long").into_response()
+        }
     }
 }
 
@@ -445,7 +509,11 @@ fn refused(app: &App, username: &str, why: &str) -> ApiError {
 /// What a password check decided, before anything is written.
 enum Checked {
     /// The row whose hash was checked, by id and incarnation.
-    Local { user_id: i64, incarnation: i64, hash: String },
+    Local {
+        user_id: i64,
+        incarnation: i64,
+        hash: String,
+    },
     Directory(crate::directory::Account),
     Refused(&'static str),
 }
@@ -461,7 +529,11 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
     let (generation, local) = {
         let _shared = app.gate.read().await;
         let local = match app.store.user_by_name(&username)?.filter(|u| u.local) {
-            Some(u) => Some((u.id, u.incarnation, app.store.local_hash(u.id)?.unwrap_or_default())),
+            Some(u) => Some((
+                u.id,
+                u.incarnation,
+                app.store.local_hash(u.id)?.unwrap_or_default(),
+            )),
             None => None,
         };
         (app.generation(), local)
@@ -484,19 +556,31 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
     }
     let user = match checked {
         Checked::Refused(why) => return Err(refused(&app, &username, why)),
-        Checked::Local { user_id, incarnation, hash } => {
-            finish_local(&app, &username, user_id, incarnation, &hash)?
-        }
+        Checked::Local {
+            user_id,
+            incarnation,
+            hash,
+        } => finish_local(&app, &username, user_id, incarnation, &hash)?,
         Checked::Directory(account) => finish_directory(&app, &account)?,
     };
 
     let token = start_session(&app, &user)?;
     let _ = app.store.sessions_purge(now());
-    app.store.audit(&user.username, "signin", if user.local { "local account" } else { "" });
+    app.store.audit(
+        &user.username,
+        "signin",
+        if user.local { "local account" } else { "" },
+    );
 
-    let user = app.store.user_by_id(user.id)?.ok_or_else(ApiError::not_found)?;
+    let user = app
+        .store
+        .user_by_id(user.id)?
+        .ok_or_else(ApiError::not_found)?;
     Ok((
-        [(header::SET_COOKIE, auth::session_cookie(&token, app.secure_cookies))],
+        [(
+            header::SET_COOKIE,
+            auth::session_cookie(&token, app.secure_cookies),
+        )],
         Json(me_of(&app, &user)),
     )
         .into_response())
@@ -509,7 +593,12 @@ const CHANGED: &str = "the account changed during sign-in";
 fn start_session(app: &App, user: &User) -> ApiResult<String> {
     let token = auth::random_token();
     let expires = now() + auth::SESSION_TTL.as_secs() as i64;
-    if !app.store.session_create(&auth::token_hash(&token), user.id, user.incarnation, expires)? {
+    if !app.store.session_create(
+        &auth::token_hash(&token),
+        user.id,
+        user.incarnation,
+        expires,
+    )? {
         return Err(refused(app, &user.username, CHANGED));
     }
     Ok(token)
@@ -526,7 +615,9 @@ async fn check_local(
     password: &str,
 ) -> ApiResult<Checked> {
     if !app.cfg.allow_local_accounts {
-        return Ok(Checked::Refused("local accounts are not allowed by config.toml"));
+        return Ok(Checked::Refused(
+            "local accounts are not allowed by config.toml",
+        ));
     }
     // No directory lockout stands behind a local account, so the proxy keeps its own.
     if app.throttle.blocked(username) {
@@ -561,12 +652,22 @@ async fn check_local(
     if !ok {
         return Ok(Checked::Refused("local password did not match"));
     }
-    Ok(Checked::Local { user_id, incarnation, hash })
+    Ok(Checked::Local {
+        user_id,
+        incarnation,
+        hash,
+    })
 }
 
 /// The account must still be the local account whose hash was checked, the same row: a password
 /// reset meanwhile does not let the old one in, and nor does a new row on a reused id.
-fn finish_local(app: &App, username: &str, user_id: i64, incarnation: i64, hash: &str) -> ApiResult<User> {
+fn finish_local(
+    app: &App,
+    username: &str,
+    user_id: i64,
+    incarnation: i64,
+    hash: &str,
+) -> ApiResult<User> {
     let user = app
         .store
         .user_by_id(user_id)?
@@ -580,7 +681,10 @@ fn finish_local(app: &App, username: &str, user_id: i64, incarnation: i64, hash:
         .sid
         .clone()
         .unwrap_or_else(|| format!("local:{}", &auth::random_token()[..32]));
-    if !app.store.user_record_login(user.id, user.incarnation, &sid, None)? {
+    if !app
+        .store
+        .user_record_login(user.id, user.incarnation, &sid, None)?
+    {
         return Err(refused(app, username, CHANGED));
     }
     Ok(user)
@@ -592,7 +696,9 @@ async fn check_directory(app: &App, username: &str, password: &str) -> ApiResult
     };
     match directory.authenticate(username, password).await {
         Ok(account) => Ok(Checked::Directory(account)),
-        Err(DirError::InvalidCredentials) => Ok(Checked::Refused("directory refused the credentials")),
+        Err(DirError::InvalidCredentials) => {
+            Ok(Checked::Refused("directory refused the credentials"))
+        }
         Err(e) => {
             tracing::warn!(%username, error = %e, "sign-in could not reach a decision");
             Err(e.into())
@@ -610,7 +716,11 @@ fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult
     };
     // A local account created under this name while the directory was asked is not the directory's.
     if user.local {
-        return Err(refused(app, &account.username, "a local account holds this name"));
+        return Err(refused(
+            app,
+            &account.username,
+            "a local account holds this name",
+        ));
     }
     // A username reused by a different account never inherits the old one's list or credentials.
     if let Some(bound) = &user.sid {
@@ -620,10 +730,12 @@ fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult
     }
     // The binding is written only if the row is still unbound or bound to this SID, so a second
     // sign-in that read the row unbound cannot share it with the account that bound it first.
-    if !app
-        .store
-        .user_record_login(user.id, user.incarnation, &account.sid, account.display_name.as_deref())?
-    {
+    if !app.store.user_record_login(
+        user.id,
+        user.incarnation,
+        &account.sid,
+        account.display_name.as_deref(),
+    )? {
         let now_bound = app
             .store
             .user_by_id(user.id)?
@@ -648,7 +760,10 @@ fn sid_mismatch(
     app.store.audit(
         &account.username,
         "signin.refused",
-        &format!("account SID {} does not match the registered {bound}", account.sid),
+        &format!(
+            "account SID {} does not match the registered {bound}",
+            account.sid
+        ),
     );
     Ok(ApiError::new(
         StatusCode::FORBIDDEN,
@@ -690,7 +805,10 @@ struct ListedServerJson {
     reconnect: bool,
 }
 
-async fn my_servers(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Json<serde_json::Value>> {
+async fn my_servers(
+    State(app): State<Shared>,
+    current: CurrentUser,
+) -> ApiResult<Json<serde_json::Value>> {
     let user = &current.user;
     let listed = policy::permitted(&app.store, user.id)?;
     let saved = app.store.saved_server_ids(user.id)?;
@@ -740,7 +858,11 @@ async fn connect(
     // performs NLA in the browser, so that is where the password has to be.
     let credential = match (app.store.credential_get(user.id, server.id)?, &user.sid) {
         (Some(stored), Some(sid)) if app.vault.is_unlocked() => {
-            match app.vault.open(&credential_aad(sid, server.id), &stored.nonce, &stored.secret) {
+            match app.vault.open(
+                &credential_aad(sid, server.id),
+                &stored.nonce,
+                &stored.secret,
+            ) {
                 Ok(password) => Some(json!({
                     "username": stored.username,
                     "domain": stored.domain,
@@ -795,11 +917,20 @@ async fn save_credential(
     let user = &current.user;
     let server = policy::resolve(&app.store, user.id, &server_id.to_string())?;
     let username = req.username.trim();
-    let domain = req.domain.as_deref().map(str::trim).filter(|d| !d.is_empty());
-    if username.is_empty() || username.len() > 256 || req.password.is_empty() || req.password.len() > 1024
+    let domain = req
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if username.is_empty()
+        || username.len() > 256
+        || req.password.is_empty()
+        || req.password.len() > 1024
         || domain.is_some_and(|d| d.len() > 256)
     {
-        return Err(ApiError::bad_request("a username and password are required"));
+        return Err(ApiError::bad_request(
+            "a username and password are required",
+        ));
     }
     let sid = user
         .sid
@@ -818,7 +949,8 @@ async fn save_credential(
             secret,
         },
     )?;
-    app.store.audit(&user.username, "credential.save", &server.name);
+    app.store
+        .audit(&user.username, "credential.save", &server.name);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -828,12 +960,15 @@ async fn forget_credential(
     Path(server_id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     if app.frozen() {
-        return Err(ApiError::conflict("changes are paused while this proxy is being migrated"));
+        return Err(ApiError::conflict(
+            "changes are paused while this proxy is being migrated",
+        ));
     }
     let user = &current.user;
     let server = policy::resolve(&app.store, user.id, &server_id.to_string())?;
     if app.store.credential_delete(user.id, server.id)? {
-        app.store.audit(&user.username, "credential.forget", &server.name);
+        app.store
+            .audit(&user.username, "credential.forget", &server.name);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -849,7 +984,10 @@ async fn ws_upgrade(
     // A GET, so origin_guard let it through; a WebSocket is not subject to the same-origin policy,
     // so the check is made here.
     if !same_origin(headers) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "cross-origin request refused"));
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "cross-origin request refused",
+        ));
     }
     let is_upgrade = headers
         .get(header::UPGRADE)
@@ -878,7 +1016,9 @@ async fn ws_upgrade(
     // ends.
     let user = current.user;
     let token_hash = current.token_hash;
-    let (live_id, mut ended) = app.live.register(user.id, token_hash.clone(), app.generation());
+    let (live_id, mut ended) = app
+        .live
+        .register(user.id, token_hash.clone(), app.generation());
     let guard = crate::live::LiveGuard::new(Arc::clone(&app), live_id);
     tokio::spawn(async move {
         let _guard = guard;
@@ -939,11 +1079,17 @@ pub mod tests {
 
     /// Local accounts allowed or not, with or without a directory.
     pub fn test_app_local(allow: bool, with_directory: bool) -> Shared {
-        build([9; 32], "testhost", &format!("allow_local_accounts = {allow}\n"), with_directory)
+        build(
+            [9; 32],
+            "testhost",
+            &format!("allow_local_accounts = {allow}\n"),
+            with_directory,
+        )
     }
 
     fn build(key: [u8; 32], host: &str, top: &str, with_directory: bool) -> Shared {
-        let dir = std::env::temp_dir().join(format!("web-access-test-{}", &auth::random_token()[..12]));
+        let dir =
+            std::env::temp_dir().join(format!("web-access-test-{}", &auth::random_token()[..12]));
         std::fs::create_dir_all(&dir).unwrap();
         let directory_section = if with_directory {
             "[directory]\ndomain = \"corp.example.com\"\nurls = [\"ldaps://dc.corp.example.com\"]\n"
@@ -971,9 +1117,15 @@ pub mod tests {
             None => app.store.user_create(username, None).unwrap(),
         };
         let incarnation = app.store.user_by_id(id).unwrap().unwrap().incarnation;
-        assert!(app.store.user_record_login(id, incarnation, &format!("S-1-5-21-{id}"), None).unwrap());
+        assert!(app
+            .store
+            .user_record_login(id, incarnation, &format!("S-1-5-21-{id}"), None)
+            .unwrap());
         let token = auth::random_token();
-        assert!(app.store.session_create(&auth::token_hash(&token), id, incarnation, now() + 3600).unwrap());
+        assert!(app
+            .store
+            .session_create(&auth::token_hash(&token), id, incarnation, now() + 3600)
+            .unwrap());
         (id, format!("{COOKIE}={token}"))
     }
 
@@ -1003,7 +1155,9 @@ pub mod tests {
         };
         let res = router(Arc::clone(app)).oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), 64 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 64 << 20)
+            .await
+            .unwrap();
         let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, v)
     }
@@ -1011,7 +1165,11 @@ pub mod tests {
     #[tokio::test]
     async fn unauthenticated_api_calls_are_refused() {
         let app = test_app();
-        for (m, p) in [("GET", "/api/me"), ("GET", "/api/me/servers"), ("POST", "/api/logout")] {
+        for (m, p) in [
+            ("GET", "/api/me"),
+            ("GET", "/api/me/servers"),
+            ("POST", "/api/logout"),
+        ] {
             let (s, _) = call(&app, m, p, None, None).await;
             assert_eq!(s, StatusCode::UNAUTHORIZED, "{m} {p}");
         }
@@ -1038,9 +1196,18 @@ pub mod tests {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
         let g = app.store.group_create("Historians").unwrap();
-        let a = app.store.server_create("hist-01", "hist-01.example", 3389, Some(g)).unwrap();
-        let _b = app.store.server_create("dc-01", "dc-01.example", 3389, None).unwrap();
-        let c = app.store.server_create("eng-01", "eng-01.example", 3389, None).unwrap();
+        let a = app
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, Some(g))
+            .unwrap();
+        let _b = app
+            .store
+            .server_create("dc-01", "dc-01.example", 3389, None)
+            .unwrap();
+        let c = app
+            .store
+            .server_create("eng-01", "eng-01.example", 3389, None)
+            .unwrap();
         app.store.set_assignments(uid, &[a, c]).unwrap();
         let (s, v) = call(&app, "GET", "/api/me/servers", Some(&cookie), None).await;
         assert_eq!(s, StatusCode::OK);
@@ -1056,9 +1223,26 @@ pub mod tests {
     async fn connecting_to_an_unassigned_server_looks_like_a_missing_one() {
         let app = test_app();
         let (_, cookie) = signed_in(&app, "jdoe");
-        let other = app.store.server_create("dc-01", "dc-01.example", 3389, None).unwrap();
-        let (s1, v1) = call(&app, "POST", "/api/connect", Some(&cookie), Some(json!({"server": other}))).await;
-        let (s2, v2) = call(&app, "POST", "/api/connect", Some(&cookie), Some(json!({"server": 9999}))).await;
+        let other = app
+            .store
+            .server_create("dc-01", "dc-01.example", 3389, None)
+            .unwrap();
+        let (s1, v1) = call(
+            &app,
+            "POST",
+            "/api/connect",
+            Some(&cookie),
+            Some(json!({"server": other})),
+        )
+        .await;
+        let (s2, v2) = call(
+            &app,
+            "POST",
+            "/api/connect",
+            Some(&cookie),
+            Some(json!({"server": 9999})),
+        )
+        .await;
         assert_eq!(s1, StatusCode::NOT_FOUND);
         assert_eq!((s1, v1), (s2, v2));
     }
@@ -1067,18 +1251,44 @@ pub mod tests {
     async fn saving_needs_a_recovery_passphrase_then_round_trips_through_connect() {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
-        let a = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let a = app
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, None)
+            .unwrap();
         app.store.set_assignments(uid, &[a]).unwrap();
         let cred = json!({"username": "ops", "domain": "PLANT", "password": "p@ss"});
 
-        let (s, _) = call(&app, "PUT", &format!("/api/credentials/{a}"), Some(&cookie), Some(cred.clone())).await;
+        let (s, _) = call(
+            &app,
+            "PUT",
+            &format!("/api/credentials/{a}"),
+            Some(&cookie),
+            Some(cred.clone()),
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT, "no recovery passphrase yet");
 
-        app.vault.set_recovery(&app.store, None, "a long recovery phrase").unwrap();
-        let (s, _) = call(&app, "PUT", &format!("/api/credentials/{a}"), Some(&cookie), Some(cred)).await;
+        app.vault
+            .set_recovery(&app.store, None, "a long recovery phrase")
+            .unwrap();
+        let (s, _) = call(
+            &app,
+            "PUT",
+            &format!("/api/credentials/{a}"),
+            Some(&cookie),
+            Some(cred),
+        )
+        .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
 
-        let (s, v) = call(&app, "POST", "/api/connect", Some(&cookie), Some(json!({"server": a}))).await;
+        let (s, v) = call(
+            &app,
+            "POST",
+            "/api/connect",
+            Some(&cookie),
+            Some(json!({"server": a})),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["credential"]["username"], "ops");
         assert_eq!(v["credential"]["domain"], "PLANT");
@@ -1088,9 +1298,23 @@ pub mod tests {
         let (_, list) = call(&app, "GET", "/api/me/servers", Some(&cookie), None).await;
         assert_eq!(list["groups"][0]["servers"][0]["saved"], true);
 
-        let (s, _) = call(&app, "DELETE", &format!("/api/credentials/{a}"), Some(&cookie), None).await;
+        let (s, _) = call(
+            &app,
+            "DELETE",
+            &format!("/api/credentials/{a}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
-        let (_, v) = call(&app, "POST", "/api/connect", Some(&cookie), Some(json!({"server": a}))).await;
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/connect",
+            Some(&cookie),
+            Some(json!({"server": a})),
+        )
+        .await;
         assert!(v["credential"].is_null());
     }
 
@@ -1100,10 +1324,18 @@ pub mod tests {
         let (uid, cookie) = signed_in(&app, "jdoe");
         let a = app.store.server_create("hist-01", "h", 3389, None).unwrap();
         app.store.set_assignments(uid, &[a]).unwrap();
-        app.vault.set_recovery(&app.store, None, "a long recovery phrase").unwrap();
+        app.vault
+            .set_recovery(&app.store, None, "a long recovery phrase")
+            .unwrap();
         app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
-        let (s, v) = call(&app, "PUT", &format!("/api/credentials/{a}"), Some(&cookie),
-            Some(json!({"username": "ops", "password": "x"}))).await;
+        let (s, v) = call(
+            &app,
+            "PUT",
+            &format!("/api/credentials/{a}"),
+            Some(&cookie),
+            Some(json!({"username": "ops", "password": "x"})),
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert!(v["error"].as_str().unwrap().contains("migrated"));
     }
@@ -1115,9 +1347,20 @@ pub mod tests {
         let start = now();
         let ttl = auth::SESSION_TTL.as_secs() as i64;
         let incarnation = app.store.user_by_id(uid).unwrap().unwrap().incarnation;
-        app.store.session_create(b"h", uid, incarnation, start + ttl).unwrap();
-        assert!(app.store.session_user(b"h", start + ttl - 60).unwrap().is_some(), "23h59m");
-        assert!(app.store.session_user(b"h", start + ttl).unwrap().is_none(), "24h");
+        app.store
+            .session_create(b"h", uid, incarnation, start + ttl)
+            .unwrap();
+        assert!(
+            app.store
+                .session_user(b"h", start + ttl - 60)
+                .unwrap()
+                .is_some(),
+            "23h59m"
+        );
+        assert!(
+            app.store.session_user(b"h", start + ttl).unwrap().is_none(),
+            "24h"
+        );
     }
 
     /// Behind ids that are never reused: a sign-in whose account row was replaced on the same id
@@ -1135,14 +1378,20 @@ pub mod tests {
         assert!(start_session(&app, &fresh).is_ok());
     }
 
-    async fn login_as(app: &Shared, username: &str, password: &str) -> (StatusCode, Option<String>) {
+    async fn login_as(
+        app: &Shared,
+        username: &str,
+        password: &str,
+    ) -> (StatusCode, Option<String>) {
         let req = Request::builder()
             .method("POST")
             .uri("/api/login")
             .header(header::HOST, "proxy.test")
             .header(header::ORIGIN, "https://proxy.test")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({"username": username, "password": password}).to_string()))
+            .body(Body::from(
+                json!({"username": username, "password": password}).to_string(),
+            ))
             .unwrap();
         let res = router(Arc::clone(app)).oneshot(req).await.unwrap();
         let cookie = res
@@ -1156,7 +1405,9 @@ pub mod tests {
 
     fn local_account(app: &App, name: &str, password: &str) -> i64 {
         let hash = crate::vault::hash_password(password).unwrap();
-        app.store.local_account_set(name, &hash, "local:test").unwrap()
+        app.store
+            .local_account_set(name, &hash, "local:test")
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1209,7 +1460,10 @@ pub mod tests {
             .unwrap();
         let task = tokio::spawn(router(Arc::clone(&app)).oneshot(req));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(app.gate.try_write().is_ok(), "a request still receiving its body holds the gate");
+        assert!(
+            app.gate.try_write().is_ok(),
+            "a request still receiving its body holds the gate"
+        );
         task.abort();
     }
 
@@ -1219,16 +1473,25 @@ pub mod tests {
     async fn a_local_sign_in_hashes_within_the_bound_and_outside_the_gate() {
         let app = test_app_local(true, false);
         // A malformed stored hash fails at once, so only the permit can make this wait.
-        app.store.local_account_set("devtest", "not-a-hash", "local:test").unwrap();
+        app.store
+            .local_account_set("devtest", "not-a-hash", "local:test")
+            .unwrap();
         let all = Arc::clone(&app.hash_permits)
             .acquire_many_owned(crate::app::HASH_PERMITS as u32)
             .await
             .unwrap();
         let app2 = Arc::clone(&app);
-        let task = tokio::spawn(async move { login_as(&app2, "devtest", "any password at all").await });
+        let task =
+            tokio::spawn(async move { login_as(&app2, "devtest", "any password at all").await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!task.is_finished(), "a password was checked with every hashing permit taken");
-        assert!(app.gate.try_write().is_ok(), "a sign-in held the gate while waiting to hash");
+        assert!(
+            !task.is_finished(),
+            "a password was checked with every hashing permit taken"
+        );
+        assert!(
+            app.gate.try_write().is_ok(),
+            "a sign-in held the gate while waiting to hash"
+        );
         drop(all);
         assert_eq!(task.await.unwrap().0, StatusCode::UNAUTHORIZED);
     }
@@ -1237,13 +1500,16 @@ pub mod tests {
     #[tokio::test]
     async fn a_sign_in_that_straddles_an_import_is_not_recorded() {
         let app = test_app_local(true, false);
-        app.store.local_account_set("devtest", "not-a-hash", "local:test").unwrap();
+        app.store
+            .local_account_set("devtest", "not-a-hash", "local:test")
+            .unwrap();
         let all = Arc::clone(&app.hash_permits)
             .acquire_many_owned(crate::app::HASH_PERMITS as u32)
             .await
             .unwrap();
         let app2 = Arc::clone(&app);
-        let task = tokio::spawn(async move { login_as(&app2, "devtest", "any password at all").await });
+        let task =
+            tokio::spawn(async move { login_as(&app2, "devtest", "any password at all").await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         app.bump_generation();
         drop(all);
@@ -1255,7 +1521,9 @@ pub mod tests {
     #[tokio::test]
     async fn a_directory_sign_in_never_lands_on_a_local_account() {
         let app = test_app_local(true, true);
-        app.store.local_account_set("jdoe", "not-a-hash", "local:test").unwrap();
+        app.store
+            .local_account_set("jdoe", "not-a-hash", "local:test")
+            .unwrap();
         let account = crate::directory::Account {
             username: "jdoe".into(),
             display_name: None,
@@ -1266,7 +1534,11 @@ pub mod tests {
         let refused = finish_directory(&app, &account).unwrap_err();
         assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
         let user = app.store.user_by_name("jdoe").unwrap().unwrap();
-        assert_eq!(user.sid.as_deref(), Some("local:test"), "the local account was bound to a directory SID");
+        assert_eq!(
+            user.sid.as_deref(),
+            Some("local:test"),
+            "the local account was bound to a directory SID"
+        );
     }
 
     /// A failed local password counts toward the throttle even when its request is abandoned
@@ -1277,7 +1549,8 @@ pub mod tests {
         // A real hash, so the check takes long enough to abandon partway.
         local_account(&app, "devtest", "a dev test password");
         let app2 = Arc::clone(&app);
-        let task = tokio::spawn(async move { login_as(&app2, "devtest", "not the password").await });
+        let task =
+            tokio::spawn(async move { login_as(&app2, "devtest", "not the password").await });
         let hashing = crate::app::HASH_PERMITS - 1;
         for _ in 0..30_000 {
             if app.hash_permits.available_permits() == hashing {
@@ -1285,7 +1558,11 @@ pub mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert_eq!(app.hash_permits.available_permits(), hashing, "the hash never started");
+        assert_eq!(
+            app.hash_permits.available_permits(),
+            hashing,
+            "the hash never started"
+        );
         task.abort();
         let _ = task.await;
         for _ in 0..6000 {
@@ -1294,7 +1571,11 @@ pub mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert_eq!(app.throttle.failures("devtest"), 1, "a failure abandoned mid-hash was not counted");
+        assert_eq!(
+            app.throttle.failures("devtest"),
+            1,
+            "a failure abandoned mid-hash was not counted"
+        );
     }
 
     /// A change naming rows by id is refused unless it comes from a page loaded from the database as
@@ -1317,19 +1598,31 @@ pub mod tests {
             if let Some(i) = instance {
                 b = b.header(INSTANCE_HEADER, i);
             }
-            b.body(Body::from(json!({"is_admin": true}).to_string())).unwrap()
+            b.body(Body::from(json!({"is_admin": true}).to_string()))
+                .unwrap()
         };
         for sent in [Some(stale), None] {
-            let res = router(Arc::clone(&app)).oneshot(patch(sent.clone())).await.unwrap();
+            let res = router(Arc::clone(&app))
+                .oneshot(patch(sent.clone()))
+                .await
+                .unwrap();
             assert_eq!(res.status(), StatusCode::CONFLICT, "sent {sent:?}");
             assert_eq!(
-                res.headers().get(INSTANCE_HEADER).and_then(|v| v.to_str().ok()),
+                res.headers()
+                    .get(INSTANCE_HEADER)
+                    .and_then(|v| v.to_str().ok()),
                 Some(app.instance().as_str()),
                 "the refusal did not tell the page the current instance"
             );
-            assert!(!app.store.user_by_id(jdoe).unwrap().unwrap().is_admin, "a stale change landed");
+            assert!(
+                !app.store.user_by_id(jdoe).unwrap().unwrap().is_admin,
+                "a stale change landed"
+            );
         }
-        let res = router(Arc::clone(&app)).oneshot(patch(Some(app.instance()))).await.unwrap();
+        let res = router(Arc::clone(&app))
+            .oneshot(patch(Some(app.instance())))
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         assert!(app.store.user_by_id(jdoe).unwrap().unwrap().is_admin);
     }
@@ -1339,9 +1632,14 @@ pub mod tests {
     #[tokio::test]
     async fn repeated_local_failures_are_refused_without_hashing() {
         let app = test_app_local(true, false);
-        app.store.local_account_set("devtest", "not-a-hash", "local:test").unwrap();
+        app.store
+            .local_account_set("devtest", "not-a-hash", "local:test")
+            .unwrap();
         for _ in 0..auth::THROTTLE_FAILURES {
-            assert_eq!(login_as(&app, "devtest", "wrong").await.0, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                login_as(&app, "devtest", "wrong").await.0,
+                StatusCode::UNAUTHORIZED
+            );
         }
         local_account(&app, "devtest", "a dev test password");
         let all = Arc::clone(&app.hash_permits)
@@ -1368,8 +1666,14 @@ pub mod tests {
         let (_, mut elsewhere) = app.live.register(uid, b"another browser".to_vec(), 0);
         let (s, _) = call(&app, "POST", "/api/logout", Some(&cookie), None).await;
         assert_eq!(s, StatusCode::NO_CONTENT);
-        assert!(mine.try_recv().is_ok(), "the connection outlived its sign-in");
-        assert!(elsewhere.try_recv().is_err(), "another sign-in's connection was ended");
+        assert!(
+            mine.try_recv().is_ok(),
+            "the connection outlived its sign-in"
+        );
+        assert!(
+            elsewhere.try_recv().is_err(),
+            "another sign-in's connection was ended"
+        );
     }
 
     #[tokio::test]
@@ -1383,7 +1687,8 @@ pub mod tests {
     }
 
     fn page(path: &str) -> String {
-        let html = std::str::from_utf8(ASSETS.iter().find(|(p, _, _)| *p == path).unwrap().2).unwrap();
+        let html =
+            std::str::from_utf8(ASSETS.iter().find(|(p, _, _)| *p == path).unwrap().2).unwrap();
         // Comments are stripped first: a comment EXPLAINING the rule would otherwise match it.
         let mut stripped = String::with_capacity(html.len());
         let mut rest = html;
@@ -1406,7 +1711,10 @@ pub mod tests {
         for path in ["/", "/admin"] {
             let html = page(path);
             assert!(!html.contains("<style"), "{path}: inline <style>");
-            assert!(!html.contains(" style=\""), "{path}: inline style attribute");
+            assert!(
+                !html.contains(" style=\""),
+                "{path}: inline style attribute"
+            );
             assert!(!html.contains(" onclick="), "{path}: inline handler");
             for fragment in html.split("<script").skip(1) {
                 let tag = fragment.split('>').next().unwrap_or("");
@@ -1417,15 +1725,22 @@ pub mod tests {
 
     #[test]
     fn everything_the_pages_reference_is_served() {
-        for (path, needles) in [("/", vec!["./app.css", "./app.js"]), ("/admin", vec!["./app.css", "./admin.js"])] {
+        for (path, needles) in [
+            ("/", vec!["./app.css", "./app.js"]),
+            ("/admin", vec!["./app.css", "./admin.js"]),
+        ] {
             let html = page(path);
             for needle in needles {
                 assert!(html.contains(needle), "{path} does not reference {needle}");
                 let served = needle.trim_start_matches('.');
-                assert!(ASSETS.iter().any(|(p, _, _)| *p == served), "{served} not served");
+                assert!(
+                    ASSETS.iter().any(|(p, _, _)| *p == served),
+                    "{served} not served"
+                );
             }
         }
-        let app = std::str::from_utf8(ASSETS.iter().find(|(p, _, _)| *p == "/app.js").unwrap().2).unwrap();
+        let app = std::str::from_utf8(ASSETS.iter().find(|(p, _, _)| *p == "/app.js").unwrap().2)
+            .unwrap();
         assert!(app.contains("./ironrdp_web.js"));
     }
 
@@ -1433,9 +1748,15 @@ pub mod tests {
     fn origin_must_match_host() {
         let mut h = HeaderMap::new();
         h.insert(header::HOST, HeaderValue::from_static("proxy.test:8443"));
-        h.insert(header::ORIGIN, HeaderValue::from_static("https://proxy.test:8443"));
+        h.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://proxy.test:8443"),
+        );
         assert!(same_origin(&h));
-        h.insert(header::ORIGIN, HeaderValue::from_static("https://proxy.test"));
+        h.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://proxy.test"),
+        );
         assert!(!same_origin(&h));
         h.remove(header::ORIGIN);
         assert!(!same_origin(&h));

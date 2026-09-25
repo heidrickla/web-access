@@ -105,7 +105,10 @@ impl Tickets {
     }
 
     pub fn clear(&self) {
-        self.issued.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.issued
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 }
 
@@ -140,7 +143,10 @@ impl Throttle {
 
     fn fail_at(&self, key: &str, at: Instant) {
         let mut map = self.failures.lock().unwrap_or_else(|p| p.into_inner());
-        map.retain(|_, v| v.last().is_some_and(|t| at.saturating_duration_since(*t) < THROTTLE_WINDOW));
+        map.retain(|_, v| {
+            v.last()
+                .is_some_and(|t| at.saturating_duration_since(*t) < THROTTLE_WINDOW)
+        });
         map.entry(key.to_owned()).or_default().push(at);
     }
 
@@ -186,7 +192,13 @@ mod tests {
     fn a_ticket_is_spent_by_its_first_use() {
         let t = Tickets::default();
         let token = t.issue(1, 2);
-        assert_eq!(t.redeem(&token), Some(Ticket { user_id: 1, server_id: 2 }));
+        assert_eq!(
+            t.redeem(&token),
+            Some(Ticket {
+                user_id: 1,
+                server_id: 2
+            })
+        );
         assert_eq!(t.redeem(&token), None);
     }
 
