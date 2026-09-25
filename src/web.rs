@@ -1050,13 +1050,13 @@ async fn ws_upgrade(
         }
     });
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, "websocket")
         .header(header::SEC_WEBSOCKET_ACCEPT, accept)
         .body(Body::empty())
-        .map_err(ApiError::internal)?)
+        .map_err(ApiError::internal)
 }
 
 #[cfg(test)]

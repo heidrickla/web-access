@@ -8,6 +8,8 @@ use crate::web::{ConnectionPermit, Peer};
 
 use axum::Router;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use rustls_pki_types::pem::{self, PemObject};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -207,15 +209,16 @@ where
 fn server_tls(h: &Https) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
     let cert_pem = std::fs::read(&h.cert).map_err(|e| format!("reading {}: {e}", h.cert))?;
     let key_pem = std::fs::read(&h.key).map_err(|e| format!("reading {}: {e}", h.key))?;
-    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("{}: {e}", h.cert))?;
     if certs.is_empty() {
         return Err(format!("{} holds no certificate", h.cert).into());
     }
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|e| format!("{}: {e}", h.key))?
-        .ok_or_else(|| format!("{} holds no private key", h.key))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| match e {
+        pem::Error::NoItemsFound => format!("{} holds no private key", h.key),
+        e => format!("{}: {e}", h.key),
+    })?;
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
@@ -427,12 +430,10 @@ mod tests {
 
     fn test_acceptor() -> TlsAcceptor {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let certs = rustls_pemfile::certs(&mut TEST_CERT.as_bytes())
+        let certs = CertificateDer::pem_slice_iter(TEST_CERT.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut TEST_KEY.as_bytes())
-            .unwrap()
-            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(TEST_KEY.as_bytes()).unwrap();
         let cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)

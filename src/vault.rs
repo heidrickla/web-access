@@ -284,7 +284,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -493,6 +493,24 @@ mod tests {
 
     fn vault_with(store: &Store, key: [u8; KEY_LEN]) -> Vault {
         Vault::load(store, Box::new(KeyFile::from_key(key))).unwrap()
+    }
+
+    #[test]
+    fn a_key_file_is_created_once_reloaded_after_and_refused_when_malformed() {
+        let dir = std::env::temp_dir().join(format!("web-access-keyfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("local.key");
+        let _ = std::fs::remove_file(&path);
+
+        let first = KeyFile::load_or_create(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), KEY_LEN);
+        let blob = first.protect(b"master").unwrap();
+        let again = KeyFile::load_or_create(&path).unwrap();
+        assert_eq!(again.unprotect(&blob).unwrap(), b"master");
+
+        std::fs::write(&path, [1u8; 5]).unwrap();
+        assert!(KeyFile::load_or_create(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

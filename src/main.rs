@@ -120,7 +120,7 @@ mod cli {
 
     fn app(config: Option<&String>) -> std::result::Result<App, Box<dyn Error>> {
         let path = config.ok_or("the config path is required")?;
-        Ok(App::new(Config::load(&absolute(path))?)?)
+        App::new(Config::load(&absolute(path))?)
     }
 
     pub fn export(args: &[String]) -> Result {

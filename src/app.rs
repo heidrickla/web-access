@@ -218,7 +218,7 @@ impl App {
 
 /// Give a database a new instance.
 pub fn new_instance(store: &Store) -> Result<(), crate::store::StoreError> {
-    store.meta_set(META_INSTANCE, crate::auth::random_token()[..32].as_bytes())
+    store.meta_set(META_INSTANCE, &crate::auth::random_token().as_bytes()[..32])
 }
 
 /// This machine's name, for export file names and the import confirmation.
