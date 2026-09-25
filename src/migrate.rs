@@ -90,7 +90,10 @@ impl Drop for TempFile {
 }
 
 fn temp_path(dir: &Path, prefix: &str) -> PathBuf {
-    dir.join(format!("{prefix}-{}.tmp", &crate::auth::random_token()[..16]))
+    dir.join(format!(
+        "{prefix}-{}.tmp",
+        &crate::auth::random_token()[..16]
+    ))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -165,11 +168,13 @@ pub fn build_zip(manifest: &Manifest, blob: &[u8]) -> Result<Vec<u8>> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
     let (y, mo, d, h, mi, s) = utc_parts(manifest.exported_at);
     let mut options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    if let Ok(t) = zip::DateTime::from_date_and_time(y as u16, mo as u8, d as u8, h as u8, mi as u8, s as u8) {
+    if let Ok(t) =
+        zip::DateTime::from_date_and_time(y as u16, mo as u8, d as u8, h as u8, mi as u8, s as u8)
+    {
         options = options.last_modified_time(t);
     }
-    let json = serde_json::to_vec_pretty(manifest)
-        .map_err(|e| MigrateError::BadArchive(e.to_string()))?;
+    let json =
+        serde_json::to_vec_pretty(manifest).map_err(|e| MigrateError::BadArchive(e.to_string()))?;
     let bad = |e: zip::result::ZipError| MigrateError::BadArchive(e.to_string());
     zip.start_file(MANIFEST, options).map_err(bad)?;
     zip.write_all(&json)?;
@@ -351,7 +356,10 @@ mod tests {
 
     #[test]
     fn a_non_zip_is_refused() {
-        assert!(matches!(read_zip(b"not a zip"), Err(MigrateError::BadArchive(_))));
+        assert!(matches!(
+            read_zip(b"not a zip"),
+            Err(MigrateError::BadArchive(_))
+        ));
     }
 
     use crate::web::tests::{call, signed_in, test_app_keyed};
@@ -369,23 +377,38 @@ mod tests {
 
         let (uid, cookie) = signed_in(&old, "jdoe");
         let g = old.store.group_create("Historians").unwrap();
-        let s = old.store.server_create("hist-01", "hist-01.example", 3389, Some(g)).unwrap();
+        let s = old
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, Some(g))
+            .unwrap();
         old.store.set_assignments(uid, &[s]).unwrap();
         old.vault.set_recovery(&old.store, None, PASS).unwrap();
-        let (st, _) = call(&old, "PUT", &format!("/api/credentials/{s}"), Some(&cookie),
-            Some(json!({"username": "ops", "password": "p@ss"}))).await;
+        let (st, _) = call(
+            &old,
+            "PUT",
+            &format!("/api/credentials/{s}"),
+            Some(&cookie),
+            Some(json!({"username": "ops", "password": "p@ss"})),
+        )
+        .await;
         assert_eq!(st, StatusCode::NO_CONTENT);
         // Frozen before the snapshot, as a console export may be: the import must not arrive frozen.
         old.store.set_flag(META_FROZEN, true).unwrap();
 
-        assert!(matches!(export(&old, "not the passphrase"), Err(MigrateError::WrongPassphrase)));
+        assert!(matches!(
+            export(&old, "not the passphrase"),
+            Err(MigrateError::WrongPassphrase)
+        ));
         let exported = export(&old, PASS).unwrap();
         assert_eq!(exported.manifest.counts.credentials, 1);
         assert!(exported.file_name.starts_with("web-access-export-oldhost-"));
 
         let (upload, manifest) = stage(&new, &exported.bytes).unwrap();
         assert_eq!(manifest.counts.users, 1);
-        assert!(matches!(confirm(&new, &upload, "not the passphrase", None), Err(MigrateError::WrongPassphrase)));
+        assert!(matches!(
+            confirm(&new, &upload, "not the passphrase", None),
+            Err(MigrateError::WrongPassphrase)
+        ));
         // Still staged after a wrong passphrase.
         let counts = confirm(&new, &upload, PASS, None).unwrap();
         assert_eq!(counts.servers, 1);
@@ -396,11 +419,21 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(me["username"], "jdoe");
         // And the password saved under the old host's key opens under the new one.
-        let (st, v) = call(&new, "POST", "/api/connect", Some(&cookie), Some(json!({"server": s}))).await;
+        let (st, v) = call(
+            &new,
+            "POST",
+            "/api/connect",
+            Some(&cookie),
+            Some(json!({"server": s})),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["credential"]["password"], "p@ss");
         // The staged upload is gone once used.
-        assert!(matches!(confirm(&new, &upload, PASS, None), Err(MigrateError::Expired)));
+        assert!(matches!(
+            confirm(&new, &upload, PASS, None),
+            Err(MigrateError::Expired)
+        ));
     }
 
     /// The passphrase is checked against the recovery wrap inside the snapshot, the one an import
@@ -409,8 +442,13 @@ mod tests {
     async fn an_export_is_checked_against_the_wrap_in_its_own_snapshot() {
         let app = test_app_keyed([1; 32], "oldhost");
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
-        app.vault.set_recovery(&app.store, Some(PASS), "a changed recovery phrase").unwrap();
-        assert!(matches!(snapshot_verified(&app, PASS), Err(MigrateError::WrongPassphrase)));
+        app.vault
+            .set_recovery(&app.store, Some(PASS), "a changed recovery phrase")
+            .unwrap();
+        assert!(matches!(
+            snapshot_verified(&app, PASS),
+            Err(MigrateError::WrongPassphrase)
+        ));
         let (db, _) = snapshot_verified(&app, "a changed recovery phrase").unwrap();
         assert!(!db.is_empty());
     }
@@ -427,7 +465,11 @@ mod tests {
         assert!(!before.is_empty());
         let (upload, _) = stage(&app, &exported.bytes).unwrap();
         confirm(&app, &upload, PASS, Some("samehost")).unwrap();
-        assert_ne!(app.instance(), before, "the restore kept the instance pages loaded before it carry");
+        assert_ne!(
+            app.instance(),
+            before,
+            "the restore kept the instance pages loaded before it carry"
+        );
         assert!(!app.instance().is_empty());
     }
 
@@ -437,12 +479,20 @@ mod tests {
         let new = test_app_keyed([2; 32], "newhost");
         old.vault.set_recovery(&old.store, None, PASS).unwrap();
         old.store.user_create("jdoe", None).unwrap();
-        new.store.server_create("existing", "e.example", 3389, None).unwrap();
+        new.store
+            .server_create("existing", "e.example", 3389, None)
+            .unwrap();
 
         let exported = export(&old, PASS).unwrap();
         let (upload, _) = stage(&new, &exported.bytes).unwrap();
-        assert!(matches!(confirm(&new, &upload, PASS, None), Err(MigrateError::Confirm(_))));
-        assert!(matches!(confirm(&new, &upload, PASS, Some("oldhost")), Err(MigrateError::Confirm(_))));
+        assert!(matches!(
+            confirm(&new, &upload, PASS, None),
+            Err(MigrateError::Confirm(_))
+        ));
+        assert!(matches!(
+            confirm(&new, &upload, PASS, Some("oldhost")),
+            Err(MigrateError::Confirm(_))
+        ));
         confirm(&new, &upload, PASS, Some("NewHost")).unwrap();
         assert!(new.store.user_by_name("jdoe").unwrap().is_some());
         let backups = std::fs::read_dir(new.cfg.data_dir())
@@ -464,11 +514,17 @@ mod tests {
         let last = blob.len() - 1;
         blob[last] ^= 1;
         // Re-packed with a matching checksum, so only the encryption can notice.
-        let forged = Manifest { data_sha256: hex(digest(&SHA256, &blob).as_ref()), ..manifest };
+        let forged = Manifest {
+            data_sha256: hex(digest(&SHA256, &blob).as_ref()),
+            ..manifest
+        };
         let zip = build_zip(&forged, &blob).unwrap();
         let (upload, _) = stage(&new, &zip).unwrap();
         // Refused by the authenticated decryption itself, not by some later check.
-        assert!(matches!(confirm(&new, &upload, PASS, None), Err(MigrateError::WrongPassphrase)));
+        assert!(matches!(
+            confirm(&new, &upload, PASS, None),
+            Err(MigrateError::WrongPassphrase)
+        ));
         assert_eq!(new.store.counts().unwrap(), Counts::default());
     }
 }

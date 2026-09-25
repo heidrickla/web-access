@@ -46,7 +46,10 @@ pub struct ServingLock {
 impl ServingLock {
     pub fn acquire(cfg: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let data_dir = cfg.data_dir();
-        Ok(Self { _file: serving_lock(&data_dir)?, data_dir })
+        Ok(Self {
+            _file: serving_lock(&data_dir)?,
+            data_dir,
+        })
     }
 }
 
@@ -108,9 +111,11 @@ fn serving_lock(data_dir: &std::path::Path) -> Result<std::fs::File, Box<dyn std
         .open(data_dir.join("serving.lock"))?;
     match file.try_lock() {
         Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            Err(format!("another web-access proxy is already serving {}", data_dir.display()).into())
-        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another web-access proxy is already serving {}",
+            data_dir.display()
+        )
+        .into()),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
@@ -234,7 +239,10 @@ async fn session_checks(app: Arc<App>) {
         }
         let orphans = end_orphaned_connections(&app);
         if orphans > 0 {
-            info!(ended = orphans, "connections ended because their sign-in ended");
+            info!(
+                ended = orphans,
+                "connections ended because their sign-in ended"
+            );
         }
     }
 }
@@ -267,11 +275,13 @@ pub fn end_orphaned_connections(app: &App) -> usize {
         .live
         .connections()
         .into_iter()
-        .filter(|(_, user_id, hash)| match app.store.session_user(hash, at) {
-            Ok(Some(u)) => u.id != *user_id,
-            Ok(None) => true,
-            Err(_) => false,
-        })
+        .filter(
+            |(_, user_id, hash)| match app.store.session_user(hash, at) {
+                Ok(Some(u)) => u.id != *user_id,
+                Ok(None) => true,
+                Err(_) => false,
+            },
+        )
         .map(|(id, _, _)| id)
         .collect();
     app.live.end_ids(&stale)
@@ -299,7 +309,9 @@ fn revocation_reason(
         None => Some("the account no longer exists"),
         Some(a) if a.disabled => Some("the account is disabled"),
         Some(a) if a.expired => Some("the account has expired"),
-        Some(a) if user.sid.as_deref().is_some_and(|s| s != a.sid) => Some("the account's SID changed"),
+        Some(a) if user.sid.as_deref().is_some_and(|s| s != a.sid) => {
+            Some("the account's SID changed")
+        }
         _ => None,
     }
 }
@@ -374,7 +386,9 @@ mod tests {
         let (uid, cookie) = signed_in(&app, "jdoe");
         let hash = crate::auth::token_hash(cookie.split_once('=').unwrap().1);
         let (_, mut live) = app.live.register(uid, hash.clone(), 0);
-        let (_, mut other) = app.live.register(uid, b"a session that never existed".to_vec(), 0);
+        let (_, mut other) = app
+            .live
+            .register(uid, b"a session that never existed".to_vec(), 0);
         assert_eq!(end_orphaned_connections(&app), 1);
         assert!(other.try_recv().is_ok(), "no sign-in behind it");
         assert!(live.try_recv().is_err(), "its sign-in is live");
@@ -387,11 +401,18 @@ mod tests {
     fn users_with_a_connection_are_checked_even_without_a_sign_in_row() {
         let app = test_app();
         let uid = app.store.user_create("jdoe", None).unwrap();
-        let local = app.store.local_account_set("devtest", "h", "local:1").unwrap();
+        let local = app
+            .store
+            .local_account_set("devtest", "h", "local:1")
+            .unwrap();
         let (_a, _ra) = app.live.register(uid, b"gone".to_vec(), 0);
         let (_b, _rb) = app.live.register(local, b"gone".to_vec(), 0);
         let ids: Vec<i64> = users_to_check(&app).unwrap().iter().map(|u| u.id).collect();
-        assert_eq!(ids, vec![uid], "local accounts are never checked against the directory");
+        assert_eq!(
+            ids,
+            vec![uid],
+            "local accounts are never checked against the directory"
+        );
     }
 
     async fn loopback() -> (tokio::net::TcpListener, SocketAddr) {
@@ -409,7 +430,9 @@ mod tests {
         let certs = rustls_pemfile::certs(&mut TEST_CERT.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut TEST_KEY.as_bytes()).unwrap().unwrap();
+        let key = rustls_pemfile::private_key(&mut TEST_KEY.as_bytes())
+            .unwrap()
+            .unwrap();
         let cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
@@ -421,29 +444,53 @@ mod tests {
     #[tokio::test]
     async fn a_silent_tls_client_is_dropped_at_the_handshake_deadline() {
         let (listener, addr) = loopback().await;
-        let limits = Limits { max_connections: 8, tls_handshake: Duration::from_millis(300) };
+        let limits = Limits {
+            max_connections: 8,
+            tls_handshake: Duration::from_millis(300),
+        };
         let router = crate::web::router(test_app());
-        tokio::spawn(accept_loop(listener, Some(test_acceptor()), router, limits, std::future::pending()));
+        tokio::spawn(accept_loop(
+            listener,
+            Some(test_acceptor()),
+            router,
+            limits,
+            std::future::pending(),
+        ));
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 1];
         let read = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf)).await;
-        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "still open after the deadline: {read:?}");
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "still open after the deadline: {read:?}"
+        );
     }
 
     /// Connections over the limit are closed on accept, while those within it stay open.
     #[tokio::test]
     async fn connections_over_the_limit_are_closed_on_accept() {
         let (listener, addr) = loopback().await;
-        let limits = Limits { max_connections: 2, tls_handshake: Duration::from_secs(30) };
+        let limits = Limits {
+            max_connections: 2,
+            tls_handshake: Duration::from_secs(30),
+        };
         let router = crate::web::router(test_app());
-        tokio::spawn(accept_loop(listener, Some(test_acceptor()), router, limits, std::future::pending()));
+        tokio::spawn(accept_loop(
+            listener,
+            Some(test_acceptor()),
+            router,
+            limits,
+            std::future::pending(),
+        ));
         let _a = tokio::net::TcpStream::connect(addr).await.unwrap();
         let _b = tokio::net::TcpStream::connect(addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 1];
         let read = tokio::time::timeout(Duration::from_secs(2), c.read(&mut buf)).await;
-        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the third connection was not closed: {read:?}");
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "the third connection was not closed: {read:?}"
+        );
         let mut a = _a;
         let still = tokio::time::timeout(Duration::from_millis(300), a.read(&mut buf)).await;
         assert!(still.is_err(), "a connection within the limit was closed");
@@ -451,7 +498,10 @@ mod tests {
 
     /// A config file in a scratch data directory, as its path.
     fn scratch_config() -> String {
-        let dir = std::env::temp_dir().join(format!("web-access-test-{}", &crate::auth::random_token()[..12]));
+        let dir = std::env::temp_dir().join(format!(
+            "web-access-test-{}",
+            &crate::auth::random_token()[..12]
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(
@@ -470,14 +520,19 @@ mod tests {
     async fn the_service_start_lifts_a_stranded_freeze() {
         let path = scratch_config();
         let app = App::new(Config::load(&path).unwrap()).unwrap();
-        app.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
+        app.store
+            .set_flag(crate::app::META_FREEZE_PENDING, true)
+            .unwrap();
         app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
         drop(app);
         let cfg = Config::load(&path).unwrap();
         let lock = ServingLock::acquire(&cfg).unwrap();
         run(&path, cfg, &lock, async {}).await.unwrap();
         let app = App::new(Config::load(&path).unwrap()).unwrap();
-        assert!(!app.frozen(), "the service started with a stranded freeze in place");
+        assert!(
+            !app.frozen(),
+            "the service started with a stranded freeze in place"
+        );
     }
 
     fn lock_for(path: &str) -> Result<ServingLock, Box<dyn std::error::Error>> {
@@ -494,10 +549,14 @@ mod tests {
         // Another directory, with an export of its own in progress.
         let other = scratch_config();
         let b = App::new(Config::load(&other).unwrap()).unwrap();
-        b.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
+        b.store
+            .set_flag(crate::app::META_FREEZE_PENDING, true)
+            .unwrap();
         b.store.set_flag(crate::app::META_FROZEN, true).unwrap();
         assert!(
-            run(&other, Config::load(&other).unwrap(), &lock, async {}).await.is_err(),
+            run(&other, Config::load(&other).unwrap(), &lock, async {})
+                .await
+                .is_err(),
             "a directory was served under another directory's lock"
         );
         // The config file now names the other directory.
@@ -512,16 +571,27 @@ mod tests {
     fn a_second_serving_process_changes_nothing() {
         let path = scratch_config();
         let app = App::new(Config::load(&path).unwrap()).unwrap();
-        app.store.set_flag(crate::app::META_FREEZE_PENDING, true).unwrap();
+        app.store
+            .set_flag(crate::app::META_FREEZE_PENDING, true)
+            .unwrap();
         app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
         // The first process, mid-export.
         let first = lock_for(&path).unwrap();
-        assert!(serve_blocking(&path, async {}).is_err(), "a second serving process started");
-        assert!(app.frozen(), "a second serving process lifted a freeze in progress");
+        assert!(
+            serve_blocking(&path, async {}).is_err(),
+            "a second serving process started"
+        );
+        assert!(
+            app.frozen(),
+            "a second serving process lifted a freeze in progress"
+        );
         assert!(app.store.flag(crate::app::META_FREEZE_PENDING).unwrap());
         drop(first);
         serve_blocking(&path, async {}).unwrap();
-        assert!(!app.frozen(), "with the first process gone, the stranded freeze stayed");
+        assert!(
+            !app.frozen(),
+            "with the first process gone, the stranded freeze stayed"
+        );
     }
 
     /// Blocking work still running when serving stops, an import's swap among it, keeps the
@@ -543,13 +613,19 @@ mod tests {
             Some(true),
             "another process could start while the last one's blocking work was still running"
         );
-        assert!(lock_for(&path).is_ok(), "the lock outlived the process's work");
+        assert!(
+            lock_for(&path).is_ok(),
+            "the lock outlived the process's work"
+        );
     }
 
     async fn closed(addr: SocketAddr, wait: Duration) -> bool {
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 1];
-        matches!(tokio::time::timeout(wait, c.read(&mut buf)).await, Ok(Ok(0)) | Ok(Err(_)))
+        matches!(
+            tokio::time::timeout(wait, c.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
     }
 
     /// An upgraded WebSocket keeps its connection's place under max_connections until its session
@@ -560,9 +636,18 @@ mod tests {
         let (listener, addr) = loopback().await;
         let app = test_app();
         let (_, cookie) = signed_in(&app, "jdoe");
-        let limits = Limits { max_connections: 1, tls_handshake: Duration::from_secs(30) };
+        let limits = Limits {
+            max_connections: 1,
+            tls_handshake: Duration::from_secs(30),
+        };
         let router = crate::web::router(Arc::clone(&app));
-        tokio::spawn(accept_loop(listener, None, router, limits, std::future::pending()));
+        tokio::spawn(accept_loop(
+            listener,
+            None,
+            router,
+            limits,
+            std::future::pending(),
+        ));
 
         let mut ws = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
@@ -574,16 +659,29 @@ mod tests {
         let mut head = Vec::new();
         let mut buf = [0u8; 512];
         while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf)).await.unwrap().unwrap();
+            let n = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
             assert!(n > 0, "closed before answering the upgrade");
             head.extend_from_slice(&buf[..n]);
         }
-        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        assert!(
+            head.starts_with(b"HTTP/1.1 101"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(closed(addr, Duration::from_secs(2)).await, "a pending WebSocket gave up its place");
+        assert!(
+            closed(addr, Duration::from_secs(2)).await,
+            "a pending WebSocket gave up its place"
+        );
 
         drop(ws);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!closed(addr, Duration::from_millis(300)).await, "an ended WebSocket kept its place");
+        assert!(
+            !closed(addr, Duration::from_millis(300)).await,
+            "an ended WebSocket kept its place"
+        );
     }
 }

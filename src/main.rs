@@ -70,7 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt()
             .with_env_filter(filter())
             .with_ansi(false)
-            .with_writer(move || file.try_clone().expect("could not clone the log file handle"))
+            .with_writer(move || {
+                file.try_clone()
+                    .expect("could not clone the log file handle")
+            })
             .init();
         tracing::info!(log = %path.display(), "starting as a windows service");
         service::start()?;
@@ -81,7 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let tool = args.first().map(String::as_str);
-    if !matches!(tool, Some("export" | "import" | "set-secret" | "local-account")) {
+    if !matches!(
+        tool,
+        Some("export" | "import" | "set-secret" | "local-account")
+    ) {
         return server::serve_blocking(&config_path_from_args(), async {
             let _ = tokio::signal::ctrl_c().await;
         });
@@ -136,7 +142,9 @@ mod cli {
 
     pub fn import(args: &[String]) -> Result {
         let app = app(args.first())?;
-        let zip = args.get(1).ok_or("usage: import <config.toml> <in.zip> [--replace]")?;
+        let zip = args
+            .get(1)
+            .ok_or("usage: import <config.toml> <in.zip> [--replace]")?;
         let replace = args.iter().any(|a| a == "--replace");
         let (manifest, blob) = migrate::read_zip(&std::fs::read(zip)?)?;
         let current = app.store.counts()?;
@@ -157,7 +165,9 @@ mod cli {
         );
         let pass = prompt::secret("Recovery passphrase: ")?;
         let counts = migrate::apply(&app, &blob, &pass).map_err(|e| match e {
-            migrate::MigrateError::Store(s) => format!("{s} (stop the WebAccessProxy service first)"),
+            migrate::MigrateError::Store(s) => {
+                format!("{s} (stop the WebAccessProxy service first)")
+            }
             other => other.to_string(),
         })?;
         app.store.audit("console", "import", &format!("{counts:?}"));
@@ -179,7 +189,8 @@ mod cli {
                 if prompt::secret("Repeat it: ")? != new {
                     return Err("the two entries differ".into());
                 }
-                app.vault.set_recovery(&app.store, current.as_deref(), &new)?;
+                app.vault
+                    .set_recovery(&app.store, current.as_deref(), &new)?;
                 app.store.audit("console", "recovery.set", "");
                 println!("recovery passphrase set; keep it with the proxy's documentation");
             }
@@ -209,8 +220,11 @@ mod cli {
             .get(1)
             .filter(|a| !a.starts_with("--"))
             .ok_or("usage: local-account <config.toml> <name> [--admin]")?;
-        let username = crate::directory::normalize_username(name).ok_or("that is not a valid username")?;
-        let password = prompt::secret(&format!("Password for {username} (12 characters or more): "))?;
+        let username =
+            crate::directory::normalize_username(name).ok_or("that is not a valid username")?;
+        let password = prompt::secret(&format!(
+            "Password for {username} (12 characters or more): "
+        ))?;
         crate::vault::check_strength(&password).map_err(|e| e.to_string())?;
         if prompt::secret("Repeat it: ")? != password {
             return Err("the two entries differ".into());
@@ -250,7 +264,8 @@ mod cli {
         impl EchoOff {
             fn new() -> Self {
                 use windows_sys::Win32::System::Console::{
-                    GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
+                    GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT,
+                    STD_INPUT_HANDLE,
                 };
                 // SAFETY: plain console API calls on this process's standard input handle.
                 unsafe {

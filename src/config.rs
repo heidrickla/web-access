@@ -179,7 +179,8 @@ impl Config {
                 return Ok(());
             }
             return Err(ConfigError::Directory(
-                "nobody could sign in: add a [directory] section, or allow_local_accounts = true".into(),
+                "nobody could sign in: add a [directory] section, or allow_local_accounts = true"
+                    .into(),
             ));
         };
         if d.domain.trim().is_empty() || !d.domain.contains('.') {
@@ -188,9 +189,15 @@ impl Config {
             ));
         }
         if d.urls.is_empty() {
-            return Err(ConfigError::Directory("urls lists no domain controller".into()));
+            return Err(ConfigError::Directory(
+                "urls lists no domain controller".into(),
+            ));
         }
-        if let Some(bad) = d.urls.iter().find(|u| !u.to_ascii_lowercase().starts_with("ldaps://")) {
+        if let Some(bad) = d
+            .urls
+            .iter()
+            .find(|u| !u.to_ascii_lowercase().starts_with("ldaps://"))
+        {
             return Err(ConfigError::Directory(format!(
                 "{bad}: only ldaps:// is accepted"
             )));
@@ -250,7 +257,10 @@ urls = ["ldaps://dc1.corp.example.com"]
         let text = GOOD.replace("data_dir = \"/var/lib/web-access\"\n", "");
         let c = Config::parse("/etc/web-access/config.toml", &text).unwrap();
         assert_eq!(c.data_dir(), PathBuf::from("/etc/web-access"));
-        assert_eq!(c.database_path(), PathBuf::from("/etc/web-access/web-access.db"));
+        assert_eq!(
+            c.database_path(),
+            PathBuf::from("/etc/web-access/web-access.db")
+        );
     }
 
     #[test]
@@ -277,18 +287,27 @@ verify = "insecure"
     #[test]
     fn a_config_nobody_can_sign_in_with_is_refused() {
         let text = LOCAL_ONLY.replace("allow_local_accounts = true\n", "");
-        assert!(matches!(Config::parse("t", &text), Err(ConfigError::Directory(_))));
+        assert!(matches!(
+            Config::parse("t", &text),
+            Err(ConfigError::Directory(_))
+        ));
     }
 
     #[test]
     fn plain_ldap_is_refused() {
         let text = GOOD.replace("ldaps://dc1", "ldap://dc1");
-        assert!(matches!(Config::parse("t", &text), Err(ConfigError::Directory(_))));
+        assert!(matches!(
+            Config::parse("t", &text),
+            Err(ConfigError::Directory(_))
+        ));
     }
 
     #[test]
     fn ca_mode_needs_a_bundle() {
         let text = GOOD.replace("verify = \"insecure\"", "verify = \"ca\"");
-        assert!(matches!(Config::parse("t", &text), Err(ConfigError::MissingCaBundle)));
+        assert!(matches!(
+            Config::parse("t", &text),
+            Err(ConfigError::MissingCaBundle)
+        ));
     }
 }

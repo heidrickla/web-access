@@ -58,7 +58,10 @@ pub fn normalize_username(input: &str) -> Option<String> {
     if s.is_empty() || s.chars().count() > 64 {
         return None;
     }
-    const FORBIDDEN: &[char] = &['"', '/', '\\', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>', '@', '(', ')', '\0'];
+    const FORBIDDEN: &[char] = &[
+        '"', '/', '\\', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>', '@', '(', ')',
+        '\0',
+    ];
     if s.chars().any(|c| c.is_control() || FORBIDDEN.contains(&c)) {
         return None;
     }
@@ -229,7 +232,10 @@ impl Directory {
         match result.rc {
             0 => Ok(()),
             RC_INVALID_CREDENTIALS => Err(DirError::InvalidCredentials),
-            rc => Err(DirError::Protocol(format!("bind returned {rc}: {}", result.text))),
+            rc => Err(DirError::Protocol(format!(
+                "bind returned {rc}: {}",
+                result.text
+            ))),
         }
     }
 
@@ -288,10 +294,9 @@ impl Directory {
         let outcome = async {
             self.bind(&mut ldap, username, password).await?;
             // An account may read its own entry, so no service account is needed here.
-            let account = self
-                .find(&mut ldap, username)
-                .await?
-                .ok_or_else(|| DirError::Protocol("bound, but the account's entry was not found".into()))?;
+            let account = self.find(&mut ldap, username).await?.ok_or_else(|| {
+                DirError::Protocol("bound, but the account's entry was not found".into())
+            })?;
             if !account.usable() {
                 return Err(DirError::InvalidCredentials);
             }
@@ -319,9 +324,9 @@ impl Directory {
             self.bind(&mut ldap, &service, service_password)
                 .await
                 .map_err(|e| match e {
-                    DirError::InvalidCredentials => DirError::Config(
-                        "the service account's password was refused".into(),
-                    ),
+                    DirError::InvalidCredentials => {
+                        DirError::Config("the service account's password was refused".into())
+                    }
                     other => other,
                 })?;
             let mut out = Vec::with_capacity(usernames.len());
@@ -343,7 +348,10 @@ mod tests {
     #[test]
     fn usernames_normalise_from_every_form() {
         assert_eq!(normalize_username("CORP\\JDoe").as_deref(), Some("jdoe"));
-        assert_eq!(normalize_username("jdoe@corp.example.com").as_deref(), Some("jdoe"));
+        assert_eq!(
+            normalize_username("jdoe@corp.example.com").as_deref(),
+            Some("jdoe")
+        );
         assert_eq!(normalize_username("  JDoe ").as_deref(), Some("jdoe"));
         assert_eq!(normalize_username(""), None);
         assert_eq!(normalize_username("a*b"), None);

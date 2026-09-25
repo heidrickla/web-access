@@ -67,7 +67,9 @@ pub fn local_protector(data_dir: &Path) -> Result<Box<dyn KeyProtector>> {
     }
     #[cfg(not(windows))]
     {
-        Ok(Box::new(KeyFile::load_or_create(&data_dir.join("local.key"))?))
+        Ok(Box::new(KeyFile::load_or_create(
+            &data_dir.join("local.key"),
+        )?))
     }
 }
 
@@ -224,7 +226,9 @@ impl Vault {
 
     /// Confirm a passphrase opens this database's recovery wrap.
     pub fn verify_recovery(store: &Store, passphrase: &str) -> Result<[u8; KEY_LEN]> {
-        let blob = store.meta_get(META_RECOVERY)?.ok_or(VaultError::NoRecovery)?;
+        let blob = store
+            .meta_get(META_RECOVERY)?
+            .ok_or(VaultError::NoRecovery)?;
         unwrap_recovery(&blob, passphrase)
     }
 
@@ -267,7 +271,10 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
         return false;
     };
     match derive(password, &salt) {
-        Ok(got) => got.len() == want.len() && got.iter().zip(&want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0,
+        Ok(got) => {
+            got.len() == want.len()
+                && got.iter().zip(&want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        }
         Err(_) => false,
     }
 }
@@ -355,9 +362,8 @@ fn to_key(bytes: &[u8]) -> [u8; KEY_LEN] {
 
 /// `nonce || ciphertext+tag` under AES-256-GCM with a fresh random nonce.
 fn seal_blob(key: &[u8; KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let sealing = LessSafeKey::new(
-        UnboundKey::new(&AES_256_GCM, key).map_err(|_| VaultError::Crypto)?,
-    );
+    let sealing =
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| VaultError::Crypto)?);
     let mut nonce = [0u8; NONCE_LEN];
     SystemRandom::new()
         .fill(&mut nonce)
@@ -381,9 +387,8 @@ fn open_blob(key: &[u8; KEY_LEN], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
         return Err(VaultError::Crypto);
     }
     let (nonce, ct) = blob.split_at(NONCE_LEN);
-    let opening = LessSafeKey::new(
-        UnboundKey::new(&AES_256_GCM, key).map_err(|_| VaultError::Crypto)?,
-    );
+    let opening =
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| VaultError::Crypto)?);
     let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| VaultError::Crypto)?;
     let mut in_out = ct.to_vec();
     let plain = opening
@@ -497,15 +502,24 @@ mod tests {
         let aad = credential_aad("S-1-5-21-1", 4);
         let (nonce, ct) = v.seal(&aad, b"hunter22").unwrap();
         assert_eq!(v.open(&aad, &nonce, &ct).unwrap(), b"hunter22");
-        assert!(v.open(&credential_aad("S-1-5-21-2", 4), &nonce, &ct).is_err(), "other user");
-        assert!(v.open(&credential_aad("S-1-5-21-1", 5), &nonce, &ct).is_err(), "other server");
+        assert!(
+            v.open(&credential_aad("S-1-5-21-2", 4), &nonce, &ct)
+                .is_err(),
+            "other user"
+        );
+        assert!(
+            v.open(&credential_aad("S-1-5-21-1", 5), &nonce, &ct)
+                .is_err(),
+            "other server"
+        );
     }
 
     #[test]
     fn the_recovery_wrap_round_trips_and_refuses_a_wrong_passphrase() {
         let store = Store::open_in_memory().unwrap();
         let v = vault_with(&store, [7; KEY_LEN]);
-        v.set_recovery(&store, None, "correct horse battery").unwrap();
+        v.set_recovery(&store, None, "correct horse battery")
+            .unwrap();
         assert!(Vault::verify_recovery(&store, "correct horse battery").is_ok());
         assert!(matches!(
             Vault::verify_recovery(&store, "wrong passphrase!!"),
@@ -520,8 +534,11 @@ mod tests {
         let (nonce, ct) = v.seal(b"a", b"secret").unwrap();
         v.set_recovery(&store, None, "first passphrase").unwrap();
         assert!(v.set_recovery(&store, None, "second passphrase").is_err());
-        assert!(v.set_recovery(&store, Some("not the first!"), "second passphrase").is_err());
-        v.set_recovery(&store, Some("first passphrase"), "second passphrase").unwrap();
+        assert!(v
+            .set_recovery(&store, Some("not the first!"), "second passphrase")
+            .is_err());
+        v.set_recovery(&store, Some("first passphrase"), "second passphrase")
+            .unwrap();
         assert!(Vault::verify_recovery(&store, "second passphrase").is_ok());
         assert_eq!(v.open(b"a", &nonce, &ct).unwrap(), b"secret");
     }
@@ -530,7 +547,10 @@ mod tests {
     fn a_short_passphrase_is_refused() {
         let store = Store::open_in_memory().unwrap();
         let v = vault_with(&store, [7; KEY_LEN]);
-        assert!(matches!(v.set_recovery(&store, None, "short"), Err(VaultError::Weak)));
+        assert!(matches!(
+            v.set_recovery(&store, None, "short"),
+            Err(VaultError::Weak)
+        ));
     }
 
     #[test]
@@ -538,12 +558,17 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let first = vault_with(&store, [1; KEY_LEN]);
         let (nonce, ct) = first.seal(b"a", b"secret").unwrap();
-        first.set_recovery(&store, None, "migration passphrase").unwrap();
+        first
+            .set_recovery(&store, None, "migration passphrase")
+            .unwrap();
 
         // Same database, different host key: the local wrap does not open.
         let second = vault_with(&store, [2; KEY_LEN]);
         assert!(!second.is_unlocked());
-        assert!(matches!(second.open(b"a", &nonce, &ct), Err(VaultError::Locked)));
+        assert!(matches!(
+            second.open(b"a", &nonce, &ct),
+            Err(VaultError::Locked)
+        ));
 
         assert!(second.adopt(&store, "wrong passphrase!").is_err());
         let key = second.adopt(&store, "migration passphrase").unwrap();
@@ -562,7 +587,11 @@ mod tests {
         assert!(verify_password("dev account password", &stored));
         assert!(!verify_password("dev account passworD", &stored));
         assert!(!verify_password("", &stored));
-        assert_ne!(stored, hash_password("dev account password").unwrap(), "salted");
+        assert_ne!(
+            stored,
+            hash_password("dev account password").unwrap(),
+            "salted"
+        );
         assert!(!verify_password("x", "argon2id$zz$00"));
         assert!(!verify_password("x", "plain"));
     }
@@ -570,7 +599,10 @@ mod tests {
     #[test]
     fn passphrase_encryption_detects_tampering() {
         let mut blob = encrypt_with_passphrase("export passphrase", b"x", b"data").unwrap();
-        assert_eq!(decrypt_with_passphrase("export passphrase", b"x", &blob).unwrap(), b"data");
+        assert_eq!(
+            decrypt_with_passphrase("export passphrase", b"x", &blob).unwrap(),
+            b"data"
+        );
         let last = blob.len() - 1;
         blob[last] ^= 1;
         assert!(decrypt_with_passphrase("export passphrase", b"x", &blob).is_err());

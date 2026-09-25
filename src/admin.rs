@@ -27,7 +27,10 @@ pub fn router() -> Router<Shared> {
     Router::new()
         .route("/users", get(users).post(add_user))
         .route("/users/{id}", patch(update_user).delete(remove_user))
-        .route("/users/{id}/servers", get(user_servers).put(set_user_servers))
+        .route(
+            "/users/{id}/servers",
+            get(user_servers).put(set_user_servers),
+        )
         .route("/users/{id}/copy-from/{from}", post(copy_from))
         .route("/users/{id}/clear-sid", post(clear_sid))
         .route("/servers", get(servers).post(add_server))
@@ -172,7 +175,11 @@ async fn update_user(
     app.store.user_set_admin(id, req.is_admin)?;
     app.store.audit(
         &admin.username,
-        if req.is_admin { "user.admin.grant" } else { "user.admin.revoke" },
+        if req.is_admin {
+            "user.admin.grant"
+        } else {
+            "user.admin.revoke"
+        },
         &user.username,
     );
     Ok(StatusCode::NO_CONTENT)
@@ -187,7 +194,8 @@ async fn remove_user(
     let user = user_or_404(&app, id)?;
     app.store.user_delete(id)?;
     app.live.end_user(id);
-    app.store.audit(&admin.username, "user.remove", &user.username);
+    app.store
+        .audit(&admin.username, "user.remove", &user.username);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -255,7 +263,8 @@ async fn clear_sid(
     let user = user_or_404(&app, id)?;
     app.store.user_clear_sid(id)?;
     app.live.end_user(id);
-    app.store.audit(&admin.username, "user.sid.reset", &user.username);
+    app.store
+        .audit(&admin.username, "user.sid.reset", &user.username);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -336,8 +345,11 @@ async fn add_server(
     not_frozen(&app)?;
     let (name, host, port) = server_fields(&req)?;
     let id = app.store.server_create(&name, &host, port, req.group_id)?;
-    app.store
-        .audit(&admin.username, "server.add", &format!("{name} ({host}:{port})"));
+    app.store.audit(
+        &admin.username,
+        "server.add",
+        &format!("{name} ({host}:{port})"),
+    );
     Ok(Json(json!({ "id": id })))
 }
 
@@ -349,9 +361,13 @@ async fn update_server(
 ) -> ApiResult<StatusCode> {
     not_frozen(&app)?;
     let (name, host, port) = server_fields(&req)?;
-    app.store.server_update(id, &name, &host, port, req.group_id)?;
     app.store
-        .audit(&admin.username, "server.edit", &format!("{name} ({host}:{port})"));
+        .server_update(id, &name, &host, port, req.group_id)?;
+    app.store.audit(
+        &admin.username,
+        "server.edit",
+        &format!("{name} ({host}:{port})"),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -361,10 +377,14 @@ async fn remove_server(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     not_frozen(&app)?;
-    let server = app.store.server_by_id(id)?.ok_or_else(ApiError::not_found)?;
+    let server = app
+        .store
+        .server_by_id(id)?
+        .ok_or_else(ApiError::not_found)?;
     app.store.server_delete(id)?;
     app.live.end_server(id);
-    app.store.audit(&admin.username, "server.remove", &server.name);
+    app.store
+        .audit(&admin.username, "server.remove", &server.name);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -464,7 +484,12 @@ pub fn parse_import(text: &str) -> Result<Vec<ImportRow>, Vec<String>> {
             errors.push(format!("line {n}: {name} appears more than once"));
             continue;
         }
-        rows.push(ImportRow { name, host, port, group });
+        rows.push(ImportRow {
+            name,
+            host,
+            port,
+            group,
+        });
     }
     if errors.is_empty() {
         Ok(rows)
@@ -569,7 +594,8 @@ async fn remove_group(
 ) -> ApiResult<StatusCode> {
     not_frozen(&app)?;
     app.store.group_delete(id)?;
-    app.store.audit(&admin.username, "group.remove", &id.to_string());
+    app.store
+        .audit(&admin.username, "group.remove", &id.to_string());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -635,7 +661,11 @@ async fn set_recovery(
         .set_recovery(&app.store, req.current.as_deref(), &req.new)?;
     app.store.audit(
         &admin.username,
-        if changing { "recovery.change" } else { "recovery.set" },
+        if changing {
+            "recovery.change"
+        } else {
+            "recovery.set"
+        },
         "",
     );
     Ok(StatusCode::NO_CONTENT)
@@ -689,7 +719,10 @@ where
 /// A requester that left before an operation got the gate has abandoned it.
 fn still_wanted(gone: &AtomicBool) -> ApiResult<()> {
     if gone.load(Ordering::SeqCst) {
-        Err(ApiError::new(StatusCode::REQUEST_TIMEOUT, "the request ended before it could start"))
+        Err(ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "the request ended before it could start",
+        ))
     } else {
         Ok(())
     }
@@ -739,7 +772,9 @@ impl Drop for FreezeUndo {
                         drop(lock);
                     });
                 }
-                Err(_) => tracing::warn!("an export that was not delivered could not lift its freeze"),
+                Err(_) => {
+                    tracing::warn!("an export that was not delivered could not lift its freeze")
+                }
             }
         }
     }
@@ -831,7 +866,12 @@ async fn export_task(
         let _shared = app.gate.read().await;
         still_wanted(&gone)?;
         let admin = revalidate_admin(&app, &token)?;
-        (admin, snapshot_of(&app, &passphrase).await?, app.generation(), false)
+        (
+            admin,
+            snapshot_of(&app, &passphrase).await?,
+            app.generation(),
+            false,
+        )
     };
     // From here a freeze this export set travels with its archive, with the export lock: every
     // early return below drops it, and dropping it lifts the freeze.
@@ -866,9 +906,11 @@ async fn export_task(
 async fn snapshot_of(app: &Shared, passphrase: &str) -> ApiResult<(Vec<u8>, crate::store::Counts)> {
     let app = app.clone();
     let pass = passphrase.to_owned();
-    Ok(tokio::task::spawn_blocking(move || migrate::snapshot_verified(&app, &pass))
-        .await
-        .map_err(ApiError::internal)??)
+    Ok(
+        tokio::task::spawn_blocking(move || migrate::snapshot_verified(&app, &pass))
+            .await
+            .map_err(ApiError::internal)??,
+    )
 }
 
 /// Undo an export's freeze, unless an import has replaced the database it was set in.
@@ -910,7 +952,10 @@ async fn upload_import(
     app.store.audit(
         &admin.username,
         "import.upload",
-        &format!("from {} exported {}", manifest.source_host, manifest.exported_at),
+        &format!(
+            "from {} exported {}",
+            manifest.source_host, manifest.exported_at
+        ),
     );
     Ok(Json(json!({
         "upload_id": upload_id,
@@ -985,11 +1030,16 @@ async fn set_directory_password(
     AdminToken(token): AdminToken,
     Json(req): Json<PasswordForm>,
 ) -> ApiResult<Json<Value>> {
-    let (Some(account), Some(directory)) = (app.cfg.service_account(), app.lookup_directory()) else {
-        return Err(ApiError::bad_request("no service_account is configured in config.toml"));
+    let (Some(account), Some(directory)) = (app.cfg.service_account(), app.lookup_directory())
+    else {
+        return Err(ApiError::bad_request(
+            "no service_account is configured in config.toml",
+        ));
     };
     if req.password.is_empty() {
-        return Err(ApiError::bad_request("enter the service account's password"));
+        return Err(ApiError::bad_request(
+            "enter the service account's password",
+        ));
     }
     // Self-gated: the directory is asked without the gate held.
     let generation = {
@@ -1070,18 +1120,42 @@ mod tests {
     async fn a_bootstrap_admin_can_manage_users_and_servers() {
         let app = test_app();
         let (_, cookie) = signed_in(&app, "boss");
-        let (s, v) = call(&app, "POST", "/api/admin/users", Some(&cookie), Some(json!({"username": "CORP\\JDoe"}))).await;
+        let (s, v) = call(
+            &app,
+            "POST",
+            "/api/admin/users",
+            Some(&cookie),
+            Some(json!({"username": "CORP\\JDoe"})),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         let uid = v["id"].as_i64().unwrap();
-        let (s, v) = call(&app, "POST", "/api/admin/servers", Some(&cookie),
-            Some(json!({"name": "hist-01", "host": "hist-01.example"}))).await;
+        let (s, v) = call(
+            &app,
+            "POST",
+            "/api/admin/servers",
+            Some(&cookie),
+            Some(json!({"name": "hist-01", "host": "hist-01.example"})),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         let sid = v["id"].as_i64().unwrap();
-        let (s, _) = call(&app, "PUT", &format!("/api/admin/users/{uid}/servers"), Some(&cookie),
-            Some(json!({"server_ids": [sid]}))).await;
+        let (s, _) = call(
+            &app,
+            "PUT",
+            &format!("/api/admin/users/{uid}/servers"),
+            Some(&cookie),
+            Some(json!({"server_ids": [sid]})),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         let (_, v) = call(&app, "GET", "/api/admin/users", Some(&cookie), None).await;
-        let jdoe = v["users"].as_array().unwrap().iter().find(|u| u["username"] == "jdoe").unwrap();
+        let jdoe = v["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["username"] == "jdoe")
+            .unwrap();
         assert_eq!(jdoe["servers"], 1);
     }
 
@@ -1090,11 +1164,32 @@ mod tests {
         let app = test_app();
         let (_, cookie) = signed_in(&app, "boss");
         app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
-        let (s, _) = call(&app, "POST", "/api/admin/groups", Some(&cookie), Some(json!({"name": "G"}))).await;
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/admin/groups",
+            Some(&cookie),
+            Some(json!({"name": "G"})),
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
-        let (s, _) = call(&app, "POST", "/api/admin/migration/unfreeze", Some(&cookie), None).await;
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/admin/migration/unfreeze",
+            Some(&cookie),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
-        let (s, _) = call(&app, "POST", "/api/admin/groups", Some(&cookie), Some(json!({"name": "G"}))).await;
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/admin/groups",
+            Some(&cookie),
+            Some(json!({"name": "G"})),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
     }
 
@@ -1151,15 +1246,34 @@ mod tests {
 
         let in_flight = new.gate.read().await;
         let new2 = new.clone();
-        let task = tokio::spawn(async move { import_exclusive(&new2, token, upload, PASS.into(), None).await });
-        assert!(writer_queued(&new).await, "the import never waited on the gate");
-        assert!(!task.is_finished(), "the import finished while a request was in flight");
-        assert!(new.store.user_by_name("jdoe").unwrap().is_none(), "swapped under a request in flight");
+        let task =
+            tokio::spawn(
+                async move { import_exclusive(&new2, token, upload, PASS.into(), None).await },
+            );
+        assert!(
+            writer_queued(&new).await,
+            "the import never waited on the gate"
+        );
+        assert!(
+            !task.is_finished(),
+            "the import finished while a request was in flight"
+        );
+        assert!(
+            new.store.user_by_name("jdoe").unwrap().is_none(),
+            "swapped under a request in flight"
+        );
         drop(in_flight);
         task.await.unwrap().unwrap();
         assert!(new.store.user_by_name("jdoe").unwrap().is_some());
-        assert!(connection.try_recv().is_ok(), "a connection outlived the import");
-        assert_ne!(new.generation(), before, "the import did not mark the database as replaced");
+        assert!(
+            connection.try_recv().is_ok(),
+            "a connection outlived the import"
+        );
+        assert_ne!(
+            new.generation(),
+            before,
+            "the import did not mark the database as replaced"
+        );
     }
 
     /// Once an import has the gate, its request ending (a deadline, a closed tab) neither stops
@@ -1168,11 +1282,17 @@ mod tests {
     async fn an_import_that_has_the_gate_finishes_after_its_request_ends() {
         let (new, upload, token) = staged_import();
         let new2 = new.clone();
-        let task = tokio::spawn(async move { import_exclusive(&new2, token, upload, PASS.into(), None).await });
+        let task =
+            tokio::spawn(
+                async move { import_exclusive(&new2, token, upload, PASS.into(), None).await },
+            );
         until("the import holds the gate", || new.gate.try_read().is_err()).await;
         task.abort();
         let _ = task.await;
-        until("the import lets go of the gate", || new.gate.try_write().is_ok()).await;
+        until("the import lets go of the gate", || {
+            new.gate.try_write().is_ok()
+        })
+        .await;
         assert!(
             new.store.user_by_name("jdoe").unwrap().is_some(),
             "the gate came free before the swap was finished"
@@ -1185,13 +1305,25 @@ mod tests {
         let (new, upload, token) = staged_import();
         let in_flight = new.gate.read().await;
         let new2 = new.clone();
-        let task = tokio::spawn(async move { import_exclusive(&new2, token, upload, PASS.into(), None).await });
-        assert!(writer_queued(&new).await, "the import never waited on the gate");
+        let task =
+            tokio::spawn(
+                async move { import_exclusive(&new2, token, upload, PASS.into(), None).await },
+            );
+        assert!(
+            writer_queued(&new).await,
+            "the import never waited on the gate"
+        );
         task.abort();
         let _ = task.await;
         drop(in_flight);
-        until("the abandoned import lets go of the gate", || new.gate.try_write().is_ok()).await;
-        assert!(new.store.user_by_name("jdoe").unwrap().is_none(), "an abandoned import ran");
+        until("the abandoned import lets go of the gate", || {
+            new.gate.try_write().is_ok()
+        })
+        .await;
+        assert!(
+            new.store.user_by_name("jdoe").unwrap().is_none(),
+            "an abandoned import ran"
+        );
     }
 
     /// The migration routes take the gate themselves, so they check the caller again once they
@@ -1202,16 +1334,24 @@ mod tests {
         let app = test_app();
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
         for (path, body) in [
-            ("/api/admin/migration/export", json!({"passphrase": PASS, "freeze": true})),
+            (
+                "/api/admin/migration/export",
+                json!({"passphrase": PASS, "freeze": true}),
+            ),
             ("/api/admin/migration/import", json!({})),
             ("/api/admin/migration/import/x", json!({"passphrase": PASS})),
         ] {
             let (_, cookie) = signed_in(&app, "boss");
             let held = app.gate.write().await;
             let app2 = app.clone();
-            let task = tokio::spawn(async move { call(&app2, "POST", path, Some(&cookie), Some(body)).await });
+            let task =
+                tokio::spawn(
+                    async move { call(&app2, "POST", path, Some(&cookie), Some(body)).await },
+                );
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            app.store.sessions_delete_user(app.store.user_by_name("boss").unwrap().unwrap().id).unwrap();
+            app.store
+                .sessions_delete_user(app.store.user_by_name("boss").unwrap().unwrap().id)
+                .unwrap();
             drop(held);
             let (s, v) = task.await.unwrap();
             assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}: {v}");
@@ -1227,7 +1367,8 @@ mod tests {
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
         let app2 = app.clone();
         let token = token_of(&cookie);
-        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        let task =
+            tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
         until("the export froze the proxy", || app.frozen()).await;
         task.abort();
         let _ = task.await;
@@ -1243,13 +1384,20 @@ mod tests {
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
         // An unobstructed export's duration bounds how long packaging takes.
         let start = std::time::Instant::now();
-        export_supervised(&app, token_of(&cookie), PASS.into(), false).await.unwrap().into_export();
+        export_supervised(&app, token_of(&cookie), PASS.into(), false)
+            .await
+            .unwrap()
+            .into_export();
         let unobstructed = start.elapsed();
 
         let app2 = app.clone();
         let token = token_of(&cookie);
-        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
-        until("the snapshot is taken", || app.frozen() && app.gate.try_write().is_ok()).await;
+        let task =
+            tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the snapshot is taken", || {
+            app.frozen() && app.gate.try_write().is_ok()
+        })
+        .await;
         let held = app.gate.write().await;
         // Packaging finishes and the export waits on the gate to record itself.
         tokio::time::sleep(unobstructed * 2).await;
@@ -1257,8 +1405,17 @@ mod tests {
         let _ = task.await;
         drop(held);
         until("the export lifts its freeze", || !app.frozen()).await;
-        let actions: Vec<String> = app.store.audit_list(50, None).unwrap().into_iter().map(|r| r.action).collect();
-        assert!(!actions.iter().any(|a| a == "export.freeze"), "an export nobody received was recorded: {actions:?}");
+        let actions: Vec<String> = app
+            .store
+            .audit_list(50, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.action)
+            .collect();
+        assert!(
+            !actions.iter().any(|a| a == "export.freeze"),
+            "an export nobody received was recorded: {actions:?}"
+        );
     }
 
     /// A freezing export marks its freeze pending until it hands over its archive, so a restart
@@ -1270,10 +1427,17 @@ mod tests {
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
         let app2 = app.clone();
         let token = token_of(&cookie);
-        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
-        until("the snapshot is taken", || app.frozen() && app.gate.try_write().is_ok()).await;
+        let task =
+            tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the snapshot is taken", || {
+            app.frozen() && app.gate.try_write().is_ok()
+        })
+        .await;
         let held = app.gate.write().await;
-        assert!(app.store.flag(META_FREEZE_PENDING).unwrap(), "a freeze mid-export was not marked pending");
+        assert!(
+            app.store.flag(META_FREEZE_PENDING).unwrap(),
+            "a freeze mid-export was not marked pending"
+        );
         drop(held);
         let delivery = task.await.unwrap().unwrap();
         assert!(
@@ -1281,7 +1445,10 @@ mod tests {
             "the freeze stopped being pending before the archive was handed over"
         );
         delivery.hand_over().await.unwrap();
-        assert!(!app.store.flag(META_FREEZE_PENDING).unwrap(), "a handed-over freeze stayed pending");
+        assert!(
+            !app.store.flag(META_FREEZE_PENDING).unwrap(),
+            "a handed-over freeze stayed pending"
+        );
         assert!(!app.lift_stranded_freeze().unwrap());
         assert!(app.frozen());
     }
@@ -1293,10 +1460,15 @@ mod tests {
         let app = test_app();
         let (_, cookie) = signed_in(&app, "boss");
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
-        let delivery = export_supervised(&app, token_of(&cookie), PASS.into(), true).await.unwrap();
+        let delivery = export_supervised(&app, token_of(&cookie), PASS.into(), true)
+            .await
+            .unwrap();
         // The process ends here: nothing runs the delivery's drop.
         std::mem::forget(delivery);
-        assert!(app.lift_stranded_freeze().unwrap(), "no pending freeze was found at start");
+        assert!(
+            app.lift_stranded_freeze().unwrap(),
+            "no pending freeze was found at start"
+        );
         assert!(!app.frozen());
     }
 
@@ -1306,13 +1478,24 @@ mod tests {
         let app = test_app();
         let (_, cookie) = signed_in(&app, "boss");
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
-        let delivery = export_supervised(&app, token_of(&cookie), PASS.into(), true).await.unwrap();
+        let delivery = export_supervised(&app, token_of(&cookie), PASS.into(), true)
+            .await
+            .unwrap();
         assert!(app.frozen());
         drop(delivery);
-        assert!(app.export_lock.try_lock().is_err(), "the next export could start before the freeze was settled");
+        assert!(
+            app.export_lock.try_lock().is_err(),
+            "the next export could start before the freeze was settled"
+        );
         until("the dropped archive lifts its freeze", || !app.frozen()).await;
-        until("the export lock comes free", || app.export_lock.try_lock().is_ok()).await;
-        export_supervised(&app, token_of(&cookie), PASS.into(), true).await.unwrap().into_export();
+        until("the export lock comes free", || {
+            app.export_lock.try_lock().is_ok()
+        })
+        .await;
+        export_supervised(&app, token_of(&cookie), PASS.into(), true)
+            .await
+            .unwrap()
+            .into_export();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(app.frozen(), "a delivered export lost its freeze");
     }
@@ -1325,12 +1508,25 @@ mod tests {
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
         let app2 = app.clone();
         let token = token_of(&cookie);
-        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
-        until("the snapshot is taken", || app.frozen() && app.gate.try_write().is_ok()).await;
+        let task =
+            tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        until("the snapshot is taken", || {
+            app.frozen() && app.gate.try_write().is_ok()
+        })
+        .await;
         app.bump_generation();
         task.await.unwrap().unwrap().into_export();
-        let actions: Vec<String> = app.store.audit_list(50, None).unwrap().into_iter().map(|r| r.action).collect();
-        assert!(!actions.iter().any(|a| a.starts_with("export")), "{actions:?}");
+        let actions: Vec<String> = app
+            .store
+            .audit_list(50, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.action)
+            .collect();
+        assert!(
+            !actions.iter().any(|a| a.starts_with("export")),
+            "{actions:?}"
+        );
     }
 
     /// An export that fails lifts only a freeze it set itself.
@@ -1342,13 +1538,17 @@ mod tests {
         app.store.set_flag(META_FROZEN, true).unwrap();
         let app2 = app.clone();
         let token = token_of(&cookie);
-        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        let task =
+            tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
         until("the export holds the gate", || app.gate.try_read().is_err()).await;
         task.abort();
         let _ = task.await;
         until("the export finished", || app.export_lock.try_lock().is_ok()).await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(app.frozen(), "a failed export lifted a freeze it did not set");
+        assert!(
+            app.frozen(),
+            "a failed export lifted a freeze it did not set"
+        );
     }
 
     /// Exports run one at a time. Timed against an unobstructed export on the same host.
@@ -1358,16 +1558,26 @@ mod tests {
         let (_, cookie) = signed_in(&app, "boss");
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
         let start = std::time::Instant::now();
-        export_supervised(&app, token_of(&cookie), PASS.into(), false).await.unwrap().into_export();
+        export_supervised(&app, token_of(&cookie), PASS.into(), false)
+            .await
+            .unwrap()
+            .into_export();
         let unobstructed = start.elapsed();
 
         let one = app.export_lock.lock().await;
         let app2 = app.clone();
         let token = token_of(&cookie);
-        let task = tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
+        let task =
+            tokio::spawn(async move { export_supervised(&app2, token, PASS.into(), true).await });
         tokio::time::sleep(unobstructed * 3).await;
-        assert!(!task.is_finished(), "an export ran while another held the export lock");
-        assert!(!app.frozen(), "an export froze the proxy while another held the export lock");
+        assert!(
+            !task.is_finished(),
+            "an export ran while another held the export lock"
+        );
+        assert!(
+            !app.frozen(),
+            "an export froze the proxy while another held the export lock"
+        );
         drop(one);
         task.await.unwrap().unwrap().into_export();
         assert!(app.frozen());
@@ -1380,8 +1590,14 @@ mod tests {
         let (_, cookie) = signed_in(&app, "boss");
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
 
-        let (s, _) = call(&app, "POST", "/api/admin/migration/export", Some(&cookie),
-            Some(json!({"passphrase": "not the phrase at all", "freeze": true}))).await;
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/admin/migration/export",
+            Some(&cookie),
+            Some(json!({"passphrase": "not the phrase at all", "freeze": true})),
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(!app.frozen(), "a refused export froze the host");
 
@@ -1389,10 +1605,19 @@ mod tests {
         let app2 = app.clone();
         let cookie2 = cookie.clone();
         let task = tokio::spawn(async move {
-            call(&app2, "POST", "/api/admin/migration/export", Some(&cookie2),
-                Some(json!({"passphrase": PASS, "freeze": true}))).await
+            call(
+                &app2,
+                "POST",
+                "/api/admin/migration/export",
+                Some(&cookie2),
+                Some(json!({"passphrase": PASS, "freeze": true})),
+            )
+            .await
         });
-        assert!(writer_queued(&app).await, "the freezing export never waited on the gate");
+        assert!(
+            writer_queued(&app).await,
+            "the freezing export never waited on the gate"
+        );
         assert!(!app.frozen(), "frozen while an edit was in flight");
         drop(in_flight);
         let (s, _) = task.await.unwrap();
@@ -1402,7 +1627,10 @@ mod tests {
 
     #[test]
     fn a_good_csv_parses() {
-        let rows = parse_import("name,host,port,group\nhist-01,hist-01.example,,Historians\n\"eng, 2\",10.1.2.3,3390\n").unwrap();
+        let rows = parse_import(
+            "name,host,port,group\nhist-01,hist-01.example,,Historians\n\"eng, 2\",10.1.2.3,3390\n",
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].port, 3389);
         assert_eq!(rows[0].group.as_deref(), Some("Historians"));
@@ -1413,7 +1641,9 @@ mod tests {
 
     #[test]
     fn a_malformed_csv_reports_every_bad_line_and_imports_nothing() {
-        let errors = parse_import("a,host.example\nb\nc,bad host\nd,ok.example,99999\na,dup.example\n").unwrap_err();
+        let errors =
+            parse_import("a,host.example\nb\nc,bad host\nd,ok.example,99999\na,dup.example\n")
+                .unwrap_err();
         assert_eq!(errors.len(), 4, "{errors:?}");
         assert!(errors[0].starts_with("line 2"));
         assert!(errors[1].starts_with("line 3"));

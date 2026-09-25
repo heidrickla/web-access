@@ -2,8 +2,8 @@
 //! upgraded. Registered BEFORE the handshake, so a connection still setting up can be ended by
 //! revocation, sign-out, assignment removal or an import just like an established one.
 
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::oneshot;
@@ -247,7 +247,13 @@ mod tests {
         assert_eq!(live.servers_for(1), HashSet::from([10]));
         assert_eq!(
             live.remove(a),
-            Some(Ended { user_id: 1, server_id: Some(10), established: true, generation: 0, incarnations: None })
+            Some(Ended {
+                user_id: 1,
+                server_id: Some(10),
+                established: true,
+                generation: 0,
+                incarnations: None
+            })
         );
         assert_eq!(live.count(), 0);
     }

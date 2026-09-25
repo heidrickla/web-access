@@ -58,10 +58,20 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let user = store.user_create("jdoe", None).unwrap();
         let other = store.user_create("asmith", None).unwrap();
-        let assigned = store.server_create("historian-01", "historian-01.example", 3389, None).unwrap();
-        let unassigned = store.server_create("dc-01", "dc-01.example", 3389, None).unwrap();
+        let assigned = store
+            .server_create("historian-01", "historian-01.example", 3389, None)
+            .unwrap();
+        let unassigned = store
+            .server_create("dc-01", "dc-01.example", 3389, None)
+            .unwrap();
         store.set_assignments(user, &[assigned]).unwrap();
-        Fixture { store, user, other, assigned, unassigned }
+        Fixture {
+            store,
+            user,
+            other,
+            assigned,
+            unassigned,
+        }
     }
 
     fn denied(r: Result<Server, PolicyError>) -> Option<Denied> {
@@ -100,9 +110,18 @@ mod tests {
     #[test]
     fn a_server_that_does_not_exist_cannot_be_named() {
         let f = fixture();
-        assert_eq!(denied(resolve(&f.store, f.user, "999")), Some(Denied::NoSuchTarget));
-        assert_eq!(denied(resolve(&f.store, f.user, "dc-01.example")), Some(Denied::NoSuchTarget));
-        assert_eq!(denied(resolve(&f.store, f.user, "")), Some(Denied::NoSuchTarget));
+        assert_eq!(
+            denied(resolve(&f.store, f.user, "999")),
+            Some(Denied::NoSuchTarget)
+        );
+        assert_eq!(
+            denied(resolve(&f.store, f.user, "dc-01.example")),
+            Some(Denied::NoSuchTarget)
+        );
+        assert_eq!(
+            denied(resolve(&f.store, f.user, "")),
+            Some(Denied::NoSuchTarget)
+        );
     }
 
     #[test]
@@ -119,7 +138,11 @@ mod tests {
     fn the_list_and_the_connection_use_one_predicate() {
         let f = fixture();
         for user in [f.user, f.other] {
-            let listed: Vec<i64> = permitted(&f.store, user).unwrap().iter().map(|l| l.server.id).collect();
+            let listed: Vec<i64> = permitted(&f.store, user)
+                .unwrap()
+                .iter()
+                .map(|l| l.server.id)
+                .collect();
             for id in [f.assigned, f.unassigned] {
                 assert_eq!(
                     listed.contains(&id),

@@ -105,7 +105,11 @@ pub struct TlsSetup {
 impl Session<'_> {
     /// Run until either side stops or `ended` fires: revocation, sign-out, the assignment or server
     /// removed, or an import. Whatever happens, the registry entry is removed.
-    pub async fn run<S>(&self, ws: WebSocketStream<S>, ended: oneshot::Receiver<()>) -> Result<(), SessionError>
+    pub async fn run<S>(
+        &self,
+        ws: WebSocketStream<S>,
+        ended: oneshot::Receiver<()>,
+    ) -> Result<(), SessionError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -194,20 +198,18 @@ impl Session<'_> {
             Err(_) => return Err(SessionError::Timeout("waiting for the client's request")),
         };
         let pdu = RDCleanPathPdu::from_der(&first).map_err(|_| SessionError::NotARequest)?;
-        let (target_id, proxy_auth, x224) = match pdu
-            .into_enum()
-            .map_err(|_| SessionError::NotARequest)?
-        {
-            RDCleanPath::Request {
-                destination,
-                proxy_auth,
-                x224_connection_request,
-                ..
-            } => (destination, proxy_auth, x224_connection_request),
-            RDCleanPath::Response { .. }
-            | RDCleanPath::GeneralErr(_)
-            | RDCleanPath::NegotiationErr { .. } => return Err(SessionError::NotARequest),
-        };
+        let (target_id, proxy_auth, x224) =
+            match pdu.into_enum().map_err(|_| SessionError::NotARequest)? {
+                RDCleanPath::Request {
+                    destination,
+                    proxy_auth,
+                    x224_connection_request,
+                    ..
+                } => (destination, proxy_auth, x224_connection_request),
+                RDCleanPath::Response { .. }
+                | RDCleanPath::GeneralErr(_)
+                | RDCleanPath::NegotiationErr { .. } => return Err(SessionError::NotARequest),
+            };
 
         // 2. Admission.
         let target = match self.admit(&target_id, &proxy_auth).await {
@@ -282,7 +284,10 @@ impl Session<'_> {
 
         // 5. Bytes, both ways, until someone stops. Nothing below this line understands RDP.
         self.app.live.set_established(self.live_id);
-        self.setup_permit.lock().unwrap_or_else(|p| p.into_inner()).take();
+        self.setup_permit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         let (mut ws_tx, mut ws_rx) = ws.split();
         let (mut srv_rx, mut srv_tx) = tokio::io::split(tls);
 
@@ -333,7 +338,8 @@ impl Session<'_> {
 /// connection is a DISCONNECT to Windows, not a sign-out: the desktop stays. Skipped when an import
 /// has replaced the database since the connection opened: its ids now name other rows.
 pub async fn record_end(app: &App, e: &crate::live::Ended) {
-    let (true, Some(server_id), Some((user_row, server_row))) = (e.established, e.server_id, e.incarnations)
+    let (true, Some(server_id), Some((user_row, server_row))) =
+        (e.established, e.server_id, e.incarnations)
     else {
         return;
     };
@@ -341,7 +347,10 @@ pub async fn record_end(app: &App, e: &crate::live::Ended) {
     if e.generation != app.generation() {
         return;
     }
-    if let Err(err) = app.store.session_ended(e.user_id, user_row, server_id, server_row, now()) {
+    if let Err(err) = app
+        .store
+        .session_ended(e.user_id, user_row, server_id, server_row, now())
+    {
         warn!(error = %err, "could not record the session end");
     }
 }
@@ -502,12 +511,22 @@ mod tests {
     async fn admission_accepts_a_live_sign_in_with_its_ticket() {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
-        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let s = app
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, None)
+            .unwrap();
         app.store.set_assignments(uid, &[s]).unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
         let hash = hash_of(&cookie);
         let (live_id, _ended) = app.live.register(uid, hash.clone(), 0);
-        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: Default::default() };
+        let session = Session {
+            app: &app,
+            user: &user,
+            token_hash: &hash,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            live_id,
+            setup_permit: Default::default(),
+        };
         let ticket = app.tickets.issue(uid, s);
         assert_eq!(session.admit(&s.to_string(), &ticket).await.unwrap().id, s);
     }
@@ -517,15 +536,28 @@ mod tests {
     async fn admission_refuses_once_the_sign_in_has_ended() {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
-        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let s = app
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, None)
+            .unwrap();
         app.store.set_assignments(uid, &[s]).unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
         let hash = hash_of(&cookie);
         let (live_id, _ended) = app.live.register(uid, hash.clone(), 0);
-        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: Default::default() };
+        let session = Session {
+            app: &app,
+            user: &user,
+            token_hash: &hash,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            live_id,
+            setup_permit: Default::default(),
+        };
         let ticket = app.tickets.issue(uid, s);
         app.store.sessions_delete_user(uid).unwrap();
-        assert_eq!(session.admit(&s.to_string(), &ticket).await.unwrap_err(), Refusal::SignInEnded);
+        assert_eq!(
+            session.admit(&s.to_string(), &ticket).await.unwrap_err(),
+            Refusal::SignInEnded
+        );
     }
 
     #[tokio::test]
@@ -533,15 +565,31 @@ mod tests {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
         let (other, _) = signed_in(&app, "asmith");
-        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let s = app
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, None)
+            .unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
         let hash = hash_of(&cookie);
         let (live_id, _ended) = app.live.register(uid, hash.clone(), 0);
-        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: Default::default() };
+        let session = Session {
+            app: &app,
+            user: &user,
+            token_hash: &hash,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            live_id,
+            setup_permit: Default::default(),
+        };
         let theirs = app.tickets.issue(other, s);
-        assert_eq!(session.admit(&s.to_string(), &theirs).await.unwrap_err(), Refusal::TicketOtherUser);
+        assert_eq!(
+            session.admit(&s.to_string(), &theirs).await.unwrap_err(),
+            Refusal::TicketOtherUser
+        );
         let mine = app.tickets.issue(uid, s);
-        assert_eq!(session.admit(&s.to_string(), &mine).await.unwrap_err(), Refusal::NotAssigned);
+        assert_eq!(
+            session.admit(&s.to_string(), &mine).await.unwrap_err(),
+            Refusal::NotAssigned
+        );
     }
 
     /// A connection opened before an import is refused at admission after it.
@@ -549,15 +597,28 @@ mod tests {
     async fn admission_refuses_a_connection_from_before_an_import() {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
-        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let s = app
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, None)
+            .unwrap();
         app.store.set_assignments(uid, &[s]).unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
         let hash = hash_of(&cookie);
         let (live_id, _ended) = app.live.register(uid, hash.clone(), app.generation());
-        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: Default::default() };
+        let session = Session {
+            app: &app,
+            user: &user,
+            token_hash: &hash,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            live_id,
+            setup_permit: Default::default(),
+        };
         app.bump_generation();
         let ticket = app.tickets.issue(uid, s);
-        assert_eq!(session.admit(&s.to_string(), &ticket).await.unwrap_err(), Refusal::Superseded);
+        assert_eq!(
+            session.admit(&s.to_string(), &ticket).await.unwrap_err(),
+            Refusal::Superseded
+        );
     }
 
     /// After an import, a connection's numeric ids name other rows: its end is not recorded.
@@ -567,11 +628,20 @@ mod tests {
         let (uid, _) = signed_in(&app, "jdoe");
         let s = app.store.server_create("hist-01", "h", 3389, None).unwrap();
         let incarnations = app.store.incarnations(uid, s).unwrap();
-        let ended = crate::live::Ended { user_id: uid, server_id: Some(s), established: true, generation: app.generation(), incarnations };
+        let ended = crate::live::Ended {
+            user_id: uid,
+            server_id: Some(s),
+            established: true,
+            generation: app.generation(),
+            incarnations,
+        };
         app.bump_generation();
         record_end(&app, &ended).await;
         assert!(app.store.recent_ends(uid, 0).unwrap().is_empty());
-        let current = crate::live::Ended { generation: app.generation(), ..ended };
+        let current = crate::live::Ended {
+            generation: app.generation(),
+            ..ended
+        };
         record_end(&app, &current).await;
         assert_eq!(app.store.recent_ends(uid, 0).unwrap().len(), 1);
     }
@@ -593,17 +663,34 @@ mod tests {
         app.store.user_delete(uid).unwrap();
         let other = app.store.user_create_at(uid, "asmith").unwrap();
         record_end(&app, &ended).await;
-        assert!(app.store.recent_ends(other, 0).unwrap().is_empty(), "a late end landed on another user");
+        assert!(
+            app.store.recent_ends(other, 0).unwrap().is_empty(),
+            "a late end landed on another user"
+        );
 
-        let ended = crate::live::Ended { incarnations: app.store.incarnations(other, s).unwrap(), user_id: other, ..ended };
+        let ended = crate::live::Ended {
+            incarnations: app.store.incarnations(other, s).unwrap(),
+            user_id: other,
+            ..ended
+        };
         app.store.server_delete(s).unwrap();
         let replacement = app.store.server_create_at(s, "eng-01", "e").unwrap();
         record_end(&app, &ended).await;
-        assert!(app.store.recent_ends(other, 0).unwrap().is_empty(), "a late end landed on another server");
+        assert!(
+            app.store.recent_ends(other, 0).unwrap().is_empty(),
+            "a late end landed on another server"
+        );
 
-        let current = crate::live::Ended { incarnations: app.store.incarnations(other, replacement).unwrap(), ..ended };
+        let current = crate::live::Ended {
+            incarnations: app.store.incarnations(other, replacement).unwrap(),
+            ..ended
+        };
         record_end(&app, &current).await;
-        assert_eq!(app.store.recent_ends(other, 0).unwrap().len(), 1, "the current rows' end was not recorded");
+        assert_eq!(
+            app.store.recent_ends(other, 0).unwrap().len(),
+            1,
+            "the current rows' end was not recorded"
+        );
     }
 
     /// A session whose database an import replaced after admission records no opening in the new one.
@@ -611,18 +698,38 @@ mod tests {
     async fn a_session_opened_across_an_import_records_nothing_in_the_new_database() {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
-        let s = app.store.server_create("hist-01", "hist-01.example", 3389, None).unwrap();
+        let s = app
+            .store
+            .server_create("hist-01", "hist-01.example", 3389, None)
+            .unwrap();
         let server = app.store.server_by_id(s).unwrap().unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
         let hash = hash_of(&cookie);
         let (live_id, _ended) = app.live.register(uid, hash.clone(), app.generation());
-        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: Default::default() };
+        let session = Session {
+            app: &app,
+            user: &user,
+            token_hash: &hash,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            live_id,
+            setup_permit: Default::default(),
+        };
         let addr: SocketAddr = "127.0.0.1:3389".parse().unwrap();
-        let opened = |app: &App| app.store.audit_list(50, None).unwrap().iter().filter(|r| r.action == "session.open").count();
+        let opened = |app: &App| {
+            app.store
+                .audit_list(50, None)
+                .unwrap()
+                .iter()
+                .filter(|r| r.action == "session.open")
+                .count()
+        };
         assert!(session.record_open(&server, addr).await);
         assert_eq!(opened(&app), 1);
         app.bump_generation();
-        assert!(!session.record_open(&server, addr).await, "an opening was recorded across an import");
+        assert!(
+            !session.record_open(&server, addr).await,
+            "an opening was recorded across an import"
+        );
         assert_eq!(opened(&app), 1);
     }
 
@@ -636,10 +743,22 @@ mod tests {
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
         let (client, server) = tokio::io::duplex(4096);
-        let ws = WebSocketStream::from_raw_socket(server, tokio_tungstenite::tungstenite::protocol::Role::Server, None).await;
+        let ws = WebSocketStream::from_raw_socket(
+            server,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
         let _client = client;
         let (live_id, ended) = app.live.register(uid, hash.clone(), app.generation());
-        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: std::sync::Mutex::new(Some(permit)) };
+        let session = Session {
+            app: &app,
+            user: &user,
+            token_hash: &hash,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            live_id,
+            setup_permit: std::sync::Mutex::new(Some(permit)),
+        };
         let app2 = Arc::clone(&app);
         let permits2 = Arc::clone(&permits);
         let probe = tokio::spawn(async move {
@@ -648,8 +767,14 @@ mod tests {
             app2.live.end_user(uid);
             held
         });
-        timeout(Duration::from_secs(5), session.run(ws, ended)).await.unwrap().ok();
-        assert!(probe.await.unwrap(), "the pending connection gave up its place");
+        timeout(Duration::from_secs(5), session.run(ws, ended))
+            .await
+            .unwrap()
+            .ok();
+        assert!(
+            probe.await.unwrap(),
+            "the pending connection gave up its place"
+        );
         drop(session);
         assert_eq!(permits.available_permits(), 1);
     }
@@ -662,10 +787,22 @@ mod tests {
         let user = app.store.user_by_id(uid).unwrap().unwrap();
         let hash = hash_of(&cookie);
         let (client, server) = tokio::io::duplex(4096);
-        let ws = WebSocketStream::from_raw_socket(server, tokio_tungstenite::tungstenite::protocol::Role::Server, None).await;
+        let ws = WebSocketStream::from_raw_socket(
+            server,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
         let _client = client; // held open, silent
         let (live_id, ended) = app.live.register(uid, hash.clone(), 0);
-        let session = Session { app: &app, user: &user, token_hash: &hash, peer: "127.0.0.1:1".parse().unwrap(), live_id, setup_permit: Default::default() };
+        let session = Session {
+            app: &app,
+            user: &user,
+            token_hash: &hash,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            live_id,
+            setup_permit: Default::default(),
+        };
         let app2 = Arc::clone(&app);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
