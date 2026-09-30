@@ -12,6 +12,9 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - `--passphrase-file` for `export` and `import`, so a scheduled task can take backups.
 - The MSI's firewall rule takes its remote addresses from `REMOTE_ADDRESSES`, any by default, and remembers them for upgrades.
 - The service is restarted a minute after the process ends unexpectedly.
+- Opening a server when the sign-in has less than 18 hours left asks for the password again, so a desktop is not cut off mid-shift.
+- Mouse-wheel scrolling on the desktop. Files dropped on the desktop go to the remote clipboard.
+- A page that cannot reach the proxy says so and tries again every ten seconds.
 
 ### Changed
 
@@ -23,6 +26,13 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - A command-line export is written beside its target, read back and renamed over it.
 - The newest five import backups are kept; temporary files an interrupted export or import left are removed at service start.
 - The installer builds the proxy itself and takes its version from `Cargo.toml`.
+- The page names why a server could not be reached (unknown name, refused, timed out, unreachable) or why its certificate was refused (untrusted issuer, expired, revoked).
+- Active Directory refusals are named once the password is proven: password expired or must change, restricted hours or workstation, disabled, expired. A lockout is logged and reported as an ordinary refusal.
+- Shortcuts reach the remote by key position, so Ctrl+C is Ctrl+C whatever the layouts. Lock keys are synchronised when the desktop takes focus, and fullscreen captures Esc and Windows-key shortcuts.
+- The desktop renders at the screen's pixel density.
+- A refresh does not replace a message said in the last eight seconds; an error wraps rather than being cut off; during a session the rail repeats messages and its button marks a new one.
+- Saved credentials are asked for again only when the server refused them.
+- Admin user rows are selectable from the keyboard.
 
 ### Fixed
 
@@ -30,6 +40,8 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - A damaged or truncated export is reported as damaged instead of as a server error.
 - A database that does not reopen after an import's swap stops the service instead of serving an empty one.
 - Pressing a server tile outside its name opened nothing; opening a server said nothing while the client loaded.
+- Enter in the server sign-in dialog cancelled it instead of connecting.
+- The server password field and the rail's clipboard text are cleared when their dialog or session ends; signing out reloads the page.
 
 ## [0.2.0] - 2026-09-24
 

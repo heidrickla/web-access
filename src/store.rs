@@ -1150,6 +1150,18 @@ impl Store {
             .optional()?)
     }
 
+    /// When a sign-in session expires, as unix seconds.
+    pub fn session_expires(&self, token_hash: &[u8]) -> Result<Option<i64>> {
+        Ok(self
+            .c()
+            .query_row(
+                "SELECT expires FROM sessions WHERE token_hash = ?1",
+                [token_hash],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn session_delete(&self, token_hash: &[u8]) -> Result<()> {
         self.c()
             .execute("DELETE FROM sessions WHERE token_hash = ?1", [token_hash])?;

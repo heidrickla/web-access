@@ -193,7 +193,7 @@ impl From<MigrateError> for ApiError {
 impl From<DirError> for ApiError {
     fn from(e: DirError) -> Self {
         match e {
-            DirError::InvalidCredentials | DirError::OtherDomain(_) => {
+            DirError::InvalidCredentials | DirError::OtherDomain(_) | DirError::Refused(_) => {
                 Self::new(StatusCode::UNAUTHORIZED, e.to_string())
             }
             DirError::Unreachable(_) => Self::new(
@@ -496,13 +496,17 @@ struct Me {
     username: String,
     display_name: Option<String>,
     is_admin: bool,
+    /// Seconds the sign-in has left, so the page can renew it before a session it opens would be
+    /// cut mid-shift. Counted here, so the browser's clock does not matter.
+    remaining_secs: Option<i64>,
 }
 
-fn me_of(app: &App, user: &User) -> Me {
+fn me_of(app: &App, user: &User, expires: Option<i64>) -> Me {
     Me {
         username: user.username.clone(),
         display_name: user.display_name.clone(),
         is_admin: app.is_admin(user),
+        remaining_secs: expires.map(|e| (e - now()).max(0)),
     }
 }
 
@@ -511,6 +515,15 @@ const REFUSED: &str = "the username or password is not correct, or the account c
 fn refused(app: &App, username: &str, why: &str) -> ApiError {
     app.store.audit(username, "signin.refused", why);
     ApiError::new(StatusCode::UNAUTHORIZED, REFUSED)
+}
+
+/// What the user is told of a directory refusal: its reason once the password is proven.
+fn told(r: crate::directory::Refusal) -> String {
+    if r.proves_password() {
+        r.to_string()
+    } else {
+        REFUSED.to_owned()
+    }
 }
 
 /// What a password check decided, before anything is written.
@@ -523,6 +536,8 @@ enum Checked {
     },
     Directory(crate::directory::Account),
     Refused(&'static str),
+    /// Active Directory refused an account and said why; the user is told.
+    Told(crate::directory::Refusal),
 }
 
 async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiResult<Response> {
@@ -563,6 +578,14 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
     }
     let user = match checked {
         Checked::Refused(why) => return Err(refused(&app, &username, why)),
+        Checked::Told(r) => {
+            app.store.audit(
+                &username,
+                "signin.refused",
+                &format!("directory: {r} (data {})", r.code()),
+            );
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, told(r)));
+        }
         Checked::Local {
             user_id,
             incarnation,
@@ -571,7 +594,7 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
         Checked::Directory(account) => finish_directory(&app, &account)?,
     };
 
-    let token = start_session(&app, &user)?;
+    let (token, expires) = start_session(&app, &user)?;
     let _ = app.store.sessions_purge(now());
     app.store.audit(
         &user.username,
@@ -588,7 +611,7 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
             header::SET_COOKIE,
             auth::session_cookie(&token, app.secure_cookies),
         )],
-        Json(me_of(&app, &user)),
+        Json(me_of(&app, &user, Some(expires))),
     )
         .into_response())
 }
@@ -597,7 +620,7 @@ const CHANGED: &str = "the account changed during sign-in";
 
 /// A sign-in session for the row that was authenticated, and only that row: refused when its id
 /// has since been given to another row.
-fn start_session(app: &App, user: &User) -> ApiResult<String> {
+fn start_session(app: &App, user: &User) -> ApiResult<(String, i64)> {
     let token = auth::random_token();
     let expires = now() + auth::SESSION_TTL.as_secs() as i64;
     if !app.store.session_create(
@@ -608,7 +631,7 @@ fn start_session(app: &App, user: &User) -> ApiResult<String> {
     )? {
         return Err(refused(app, &user.username, CHANGED));
     }
-    Ok(token)
+    Ok((token, expires))
 }
 
 const THROTTLED: &str = "too many failed sign-ins; refused without checking the password";
@@ -712,6 +735,7 @@ async fn check_directory(
         Err(DirError::InvalidCredentials) => {
             Ok(Checked::Refused("directory refused the credentials"))
         }
+        Err(DirError::Refused(r)) => Ok(Checked::Told(r)),
         Err(DirError::OtherDomain(who)) => {
             tracing::warn!(%who, "a sign-in's password was accepted for an account in another domain");
             Ok(Checked::Refused(
@@ -825,8 +849,9 @@ async fn logout(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Re
         .into_response())
 }
 
-async fn me(State(app): State<Shared>, current: CurrentUser) -> Json<Me> {
-    Json(me_of(&app, &current.user))
+async fn me(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Json<Me>> {
+    let expires = app.store.session_expires(&current.token_hash)?;
+    Ok(Json(me_of(&app, &current.user, expires)))
 }
 
 // ---- the user's servers -----------------------------------------------------------------------
@@ -1461,6 +1486,10 @@ pub mod tests {
         let (s, me) = call(&app, "GET", "/api/me", cookie.as_deref(), None).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(me["username"], "devtest");
+        // A fresh sign-in reports its whole day, counted on the proxy.
+        let ttl = auth::SESSION_TTL.as_secs() as i64;
+        let left = me["remaining_secs"].as_i64().unwrap();
+        assert!((ttl - 5..=ttl).contains(&left), "remaining_secs {left}");
         let (s, _) = login_as(&app, "devtest", "not the password").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
         // Without a directory, any other name is refused rather than tried anywhere.
@@ -1755,6 +1784,31 @@ pub mod tests {
         assert_eq!(s, StatusCode::NO_CONTENT);
         let (s, _) = call(&app, "GET", "/api/me", Some(&cookie), None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn a_directory_refusal_is_named_only_when_the_password_was_right() {
+        use crate::directory::Refusal;
+        assert_eq!(told(Refusal::Locked), REFUSED, "a lockout was named");
+        for r in [
+            Refusal::PasswordMustChange,
+            Refusal::Restricted,
+            Refusal::Disabled,
+            Refusal::Expired,
+        ] {
+            assert_eq!(told(r), r.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_reports_the_time_it_has_left() {
+        let app = test_app();
+        // `signed_in` makes a session that ends in an hour.
+        let (_, cookie) = signed_in(&app, "jdoe");
+        let (s, me) = call(&app, "GET", "/api/me", Some(&cookie), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let left = me["remaining_secs"].as_i64().unwrap();
+        assert!((3595..=3600).contains(&left), "remaining_secs {left}");
     }
 
     fn page(path: &str) -> String {

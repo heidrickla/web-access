@@ -19,6 +19,9 @@ const UAC_ACCOUNT_DISABLE: i64 = 0x2;
 pub enum DirError {
     #[error("the username or password is not correct")]
     InvalidCredentials,
+    /// The directory refused an account it would otherwise accept, and said why.
+    #[error("{0}")]
+    Refused(Refusal),
     /// The password was accepted for an account outside the configured domain.
     #[error("the account {0} is not in the configured domain")]
     OtherDomain(String),
@@ -31,6 +34,55 @@ pub enum DirError {
 }
 
 pub type Result<T> = std::result::Result<T, DirError>;
+
+/// Why Active Directory refused a bind whose password it may have accepted, from the `data <hex>`
+/// code in its error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    #[error("the password has expired or must be changed; change it at a Windows sign-in, then sign in here")]
+    PasswordMustChange,
+    #[error("the account is locked; try again later or ask the helpdesk to unlock it")]
+    Locked,
+    #[error("the account may not sign in at this time or from here")]
+    Restricted,
+    #[error("the account is disabled")]
+    Disabled,
+    #[error("the account has expired")]
+    Expired,
+}
+
+impl Refusal {
+    /// The code as Active Directory writes it, for the activity log.
+    pub fn code(self) -> &'static str {
+        match self {
+            Refusal::PasswordMustChange => "532/773",
+            Refusal::Locked => "775",
+            Refusal::Restricted => "530/531",
+            Refusal::Disabled => "533",
+            Refusal::Expired => "701",
+        }
+    }
+
+    /// Whether Active Directory gives this answer only for the right password. A lockout is
+    /// reported whatever password is typed, so naming it would tell anyone the account exists.
+    pub fn proves_password(self) -> bool {
+        !matches!(self, Refusal::Locked)
+    }
+}
+
+/// The refusal named by Active Directory's `... data 775, ...` text; None for a wrong password
+/// (`data 52e`) and for anything else.
+fn refusal_in(text: &str) -> Option<Refusal> {
+    let code = text.split("data ").nth(1)?.split([',', ' ']).next()?;
+    match code.to_ascii_lowercase().as_str() {
+        "532" | "773" => Some(Refusal::PasswordMustChange),
+        "775" => Some(Refusal::Locked),
+        "530" | "531" => Some(Refusal::Restricted),
+        "533" => Some(Refusal::Disabled),
+        "701" => Some(Refusal::Expired),
+        _ => None,
+    }
+}
 
 /// What the directory says about one account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,7 +334,10 @@ impl Directory {
             .map_err(|e| DirError::Protocol(e.to_string()))?;
         match result.rc {
             0 => Ok(()),
-            RC_INVALID_CREDENTIALS => Err(DirError::InvalidCredentials),
+            RC_INVALID_CREDENTIALS => Err(match refusal_in(&result.text) {
+                Some(r) => DirError::Refused(r),
+                None => DirError::InvalidCredentials,
+            }),
             rc => Err(DirError::Protocol(format!(
                 "bind returned {rc}: {}",
                 result.text
@@ -389,6 +444,10 @@ impl Directory {
                     DirError::InvalidCredentials => {
                         DirError::Config("the service account's password was refused".into())
                     }
+                    DirError::Refused(r) => DirError::Config(format!(
+                        "the service account was refused: {r} (data {})",
+                        r.code()
+                    )),
                     other => other,
                 })?;
             let mut out = Vec::with_capacity(usernames.len());
@@ -418,6 +477,26 @@ mod tests {
         assert_eq!(normalize_username(""), None);
         assert_eq!(normalize_username("a*b"), None);
         assert_eq!(normalize_username("x(y)"), None);
+    }
+
+    #[test]
+    fn active_directory_refusal_codes_are_named() {
+        let ad = |code: &str| {
+            format!("80090308: LdapErr: DSID-0C09044E, comment: AcceptSecurityContext error, data {code}, v4563")
+        };
+        assert_eq!(
+            refusal_in(&ad("52e")),
+            None,
+            "a wrong password named a reason"
+        );
+        assert_eq!(refusal_in(&ad("532")), Some(Refusal::PasswordMustChange));
+        assert_eq!(refusal_in(&ad("773")), Some(Refusal::PasswordMustChange));
+        assert_eq!(refusal_in(&ad("775")), Some(Refusal::Locked));
+        assert_eq!(refusal_in(&ad("530")), Some(Refusal::Restricted));
+        assert_eq!(refusal_in(&ad("531")), Some(Refusal::Restricted));
+        assert_eq!(refusal_in(&ad("533")), Some(Refusal::Disabled));
+        assert_eq!(refusal_in(&ad("701")), Some(Refusal::Expired));
+        assert_eq!(refusal_in("Invalid credentials"), None);
     }
 
     #[test]

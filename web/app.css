@@ -170,6 +170,8 @@ body > header {
 }
 #status:empty { display: none; }
 #status.bad { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+/* An error is read whole: it wraps rather than ending in an ellipsis. */
+#status.bad { white-space: normal; border-radius: 10px; line-height: 1.35; padding: 4px 11px; }
 
 .navlink {
   display: inline-flex;
@@ -495,7 +497,7 @@ button.srv:focus-visible { outline: none; }
 
 /* ---- server sign-in dialog --------------------------------------------------------------- */
 
-dialog#signin {
+dialog#signin, dialog#renew {
   border: 1px solid var(--border-strong);
   border-radius: var(--r-lg);
   background: var(--surface);
@@ -505,11 +507,13 @@ dialog#signin {
   box-shadow: var(--shadow-lg);
 }
 dialog::backdrop { background: rgba(5, 7, 12, .6); backdrop-filter: blur(4px); }
-#signin-form { padding: 26px 26px 22px; display: flex; flex-direction: column; gap: 14px; }
-#signin h2 { margin: 0 0 2px; font-size: 18px; font-weight: 650; letter-spacing: -.01em; }
+#signin-form, #renew-form { padding: 26px 26px 22px; display: flex; flex-direction: column; gap: 14px; }
+#signin h2, #renew h2 { margin: 0 0 2px; font-size: 18px; font-weight: 650; letter-spacing: -.01em; }
 #signin-note { color: var(--warn); background: var(--warn-soft); border-radius: var(--r-sm); padding: 8px 11px; }
-#signin .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
-#signin .actions button { min-height: 36px; }
+#signin .actions, #renew .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+#signin .actions button, #renew .actions button { min-height: 36px; }
+#offline .empty { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+#offline .empty p { margin: 0; }
 
 /* ---- session ----------------------------------------------------------------------------- */
 
@@ -547,6 +551,7 @@ body.connected #screen { display: block; }
   --on-accent: #0a0f22;
   --bad: #f87171;
   --bad-soft: rgba(248, 113, 113, .12);
+  --warn: #f3b650;
   color: var(--text);
 }
 
@@ -561,11 +566,23 @@ body.connected #screen { display: block; }
   border-radius: 0 9px 9px 0;
   background: rgba(18, 21, 28, .85);
   color: var(--text-2);
-  opacity: .45;
+  opacity: .6;
   transition: opacity .15s ease, color .15s ease, background .15s ease;
 }
-.rail-btn:hover { opacity: 1; color: var(--text); background: var(--surface-3); border-color: var(--accent); }
+.rail-btn:hover, .rail-btn:focus-visible { opacity: 1; color: var(--text); background: var(--surface-3); border-color: var(--accent); }
 #rail.open #rail-toggle { display: none; }
+/* Something was said while the panel was closed. */
+#rail-toggle.attention { opacity: 1; color: var(--warn); border-color: var(--warn); }
+
+.panel-msg {
+  margin: 0;
+  padding: 10px 18px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.panel-msg.bad { color: var(--bad); background: var(--bad-soft); }
 
 #panel {
   display: none;
@@ -713,6 +730,7 @@ table.grid td { padding: 10px 12px; border-bottom: 1px solid var(--border); vert
 table.grid tbody tr:last-child td { border-bottom: 0; }
 table.grid tr.pick { cursor: pointer; }
 table.grid tr.pick:hover td { background: var(--surface-2); }
+table.grid tr.pick:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 table.grid tr.selected td { background: var(--accent-soft); }
 table.grid tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 table.grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
