@@ -105,6 +105,17 @@ try {
   check('the Migration tab shows the scanner admitting files', m.scan && m.scan.admitting === true
     && /^command sh/.test(m.scan.health.scanner), JSON.stringify(m.scan));
 
+  const admin = await page.context().newPage();
+  await admin.goto(P4 + '/admin');
+  await admin.click('button[data-tab="migration"]');
+  await admin.waitForFunction(() => document.getElementById('scan-status').textContent.length > 0);
+  const line = await admin.textContent('#scan-status');
+  check('the Migration tab says every file is scanned, by which scanner',
+    /^Every file is scanned by command sh\. Last check .*: detects the EICAR test file and passes a harmless one\.$/.test(line)
+    && !(await admin.evaluate(() => document.getElementById('scan-status').classList.contains('bad'))), line);
+  await shot(admin, 'e2e4-migration');
+  await admin.close();
+
   await shot(page, 'e2e4-done');
   await page.click('#panel-close');
   await disconnect(page);
