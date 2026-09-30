@@ -36,7 +36,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - A command-line export is written beside its target, read back and renamed over it.
 - The newest five import backups are kept; temporary files an interrupted export or import left are removed at service start.
 - The installer builds the proxy itself and takes its version from `Cargo.toml`.
-- The MSI is a 64-bit package, and the proxy is built with the MSVC toolchain with the C runtime linked in, so no Visual C++ Redistributable is needed.
+- The MSI is a 64-bit package and installs to `%ProgramFiles%\web-access`; 0.2's x86 package used `%ProgramFiles(x86)%\web-access`, and the upgrade removes that copy. The proxy is built with the MSVC toolchain with the C runtime linked in, so no Visual C++ Redistributable is needed.
 - The page names why a server could not be reached (unknown name, refused, timed out, unreachable) or why its certificate was refused (untrusted issuer, expired, revoked).
 - Active Directory refusals are named once the password is proven: password expired or must change, restricted hours or workstation, disabled, expired. A lockout is logged and reported as an ordinary refusal.
 - Shortcuts reach the remote by key position, so Ctrl+C is Ctrl+C whatever the layouts. Lock keys are synchronised when the desktop takes focus, and fullscreen captures Esc and Windows-key shortcuts.
