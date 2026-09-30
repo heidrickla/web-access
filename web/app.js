@@ -643,6 +643,7 @@ async function openServer(id) {
   if (!server) return;
   if (opening) return say(opening.name + ' is already opening or open');
   opening = server;
+  say('opening ' + server.name);   // the client may still be loading; say so rather than nothing
   try {
     await connectTo(server, id);
   } finally {
