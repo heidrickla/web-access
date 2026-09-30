@@ -110,6 +110,16 @@ pub const ASSETS: &[(&str, &str, &[u8])] = &[
         "application/wasm",
         include_bytes!("../web/ironrdp_web_bg.wasm"),
     ),
+    (
+        "/notices",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/notices.html"),
+    ),
+    (
+        "/notices-client",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/notices-client.html"),
+    ),
 ];
 
 // ---- errors ---------------------------------------------------------------------------------
@@ -478,6 +488,8 @@ fn packed(path: &str) -> Option<(&'static [u8], &'static str, &'static str)> {
     let file = match path {
         "/" => "index.html",
         "/admin" => "admin.html",
+        "/notices" => "notices.html",
+        "/notices-client" => "notices-client.html",
         p => p.strip_prefix('/')?,
     };
     PACKED
@@ -506,7 +518,7 @@ fn takes_gzip(headers: &HeaderMap) -> bool {
 }
 
 /// Pages and the client are revalidated on every load, so an upgrade is picked up at once, and a
-/// repeat load of the 7 MB client costs a 304.
+/// repeat load of the multi-megabyte client costs a 304.
 async fn static_asset(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
@@ -1902,7 +1914,7 @@ pub mod tests {
     /// the console.
     #[test]
     fn no_page_inlines_anything_the_csp_forbids() {
-        for path in ["/", "/admin"] {
+        for path in ["/", "/admin", "/notices", "/notices-client"] {
             let html = page(path);
             assert!(!html.contains("<style"), "{path}: inline <style>");
             assert!(
@@ -1988,6 +2000,37 @@ pub mod tests {
     async fn api_answers_are_never_cached() {
         let (_, h, _) = fetch_asset("/api/me", &[]).await;
         assert_eq!(h[header::CACHE_CONTROL], "no-store");
+    }
+
+    /// scripts/build-client.sh reproduces these bytes from the pinned IronRDP commit, and
+    /// README.md records the same digests.
+    #[test]
+    fn the_served_client_is_the_recorded_build() {
+        let sha = |path: &str| {
+            let body = ASSETS.iter().find(|(p, ..)| *p == path).unwrap().2;
+            ring::digest::digest(&ring::digest::SHA256, body)
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let readme = include_str!("../README.md");
+        for (path, recorded) in [
+            (
+                "/ironrdp_web_bg.wasm",
+                "e34898c6ba5cbc72bf4b313e5d8085b55ddb60bf65b55177b4f6632f2f090996",
+            ),
+            (
+                "/ironrdp_web.js",
+                "00544efdca030a0284d66ba021743deb49c9277260034f80da7f7aeda89bde3f",
+            ),
+        ] {
+            assert_eq!(sha(path), recorded, "{path} is not the recorded build");
+            assert!(
+                readme.contains(recorded),
+                "README.md does not record {path}"
+            );
+        }
     }
 
     #[test]

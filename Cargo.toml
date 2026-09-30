@@ -63,6 +63,6 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 [dev-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
-# The build script compresses a 7 MB WASM file; optimised, a debug build does it in a moment.
+# The build script compresses a multi-megabyte WASM file; optimised, a debug build does it in a moment.
 [profile.dev.build-override]
 opt-level = 3

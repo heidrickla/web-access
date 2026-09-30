@@ -317,6 +317,12 @@ pub fn valid_name(name: &str) -> Result<String, String> {
 /// A DNS name or an IP address. Resolved at connection time, never here.
 pub fn valid_host(host: &str) -> Result<String, String> {
     let host = host.trim();
+    // One colon is `host:port`; an IPv6 address has at least two.
+    if host.matches(':').count() == 1 {
+        return Err(format!(
+            "{host:?} includes a port; give the host alone and the port in its own field"
+        ));
+    }
     let ok = !host.is_empty()
         && host.len() <= 253
         && host
@@ -467,20 +473,22 @@ pub fn parse_import(text: &str) -> Result<Vec<ImportRow>, Vec<String>> {
                 continue;
             }
         };
-        let port = match fields.get(2).map(String::as_str).unwrap_or("") {
-            "" => 3389,
+        let port = match fields.get(2).map(|p| p.trim()).unwrap_or("") {
+            "" => None,
             p => match p.parse::<u16>() {
-                Ok(p) if p > 0 => p,
+                Ok(p) if p > 0 => Some(p),
                 _ => {
                     errors.push(format!("line {n}: port {p:?} is not 1 to 65535"));
                     continue;
                 }
             },
         };
-        let group = match fields.get(3).map(|g| g.trim()).filter(|g| !g.is_empty()) {
+        // An absent column keeps the group a server has; an empty cell ungroups it.
+        let group = match fields.get(3).map(|g| g.trim()) {
             None => None,
+            Some("") => Some(None),
             Some(g) => match valid_name(g) {
-                Ok(v) => Some(v),
+                Ok(v) => Some(Some(v)),
                 Err(e) => {
                     errors.push(format!("line {n}: group: {e}"));
                     continue;
@@ -614,6 +622,9 @@ struct AuditQuery {
     limit: Option<i64>,
     #[serde(default)]
     before: Option<i64>,
+    /// Text the actor, action or detail must contain.
+    #[serde(default)]
+    q: Option<String>,
 }
 
 async fn audit(
@@ -624,7 +635,7 @@ async fn audit(
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let rows: Vec<Value> = app
         .store
-        .audit_list(limit, q.before)?
+        .audit_search(limit, q.before, q.q.as_deref().map(str::trim))?
         .into_iter()
         .map(|r| json!({ "id": r.id, "at": r.at, "actor": r.actor, "action": r.action, "detail": r.detail }))
         .collect();
@@ -1736,11 +1747,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].port, 3389);
-        assert_eq!(rows[0].group.as_deref(), Some("Historians"));
+        assert_eq!(rows[0].port, None);
+        assert_eq!(rows[0].group, Some(Some("Historians".into())));
         assert_eq!(rows[1].name, "eng, 2");
-        assert_eq!(rows[1].port, 3390);
-        assert_eq!(rows[1].group, None);
+        assert_eq!(rows[1].port, Some(3390));
+        assert_eq!(
+            rows[1].group, None,
+            "an absent group column must keep the group"
+        );
+    }
+
+    #[test]
+    fn a_host_with_a_port_is_refused_and_ipv6_is_not() {
+        assert!(valid_host("hist-01.example:3390").is_err());
+        assert!(valid_host("10.1.2.3:3389").is_err());
+        assert_eq!(valid_host(" fd00::1 ").unwrap(), "fd00::1");
+        assert_eq!(valid_host("hist-01.example").unwrap(), "hist-01.example");
     }
 
     #[test]

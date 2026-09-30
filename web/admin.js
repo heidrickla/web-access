@@ -75,6 +75,25 @@ function el(tag, props = {}, ...children) {
 
 const when = unix => (unix ? new Date(unix * 1000).toLocaleString() : 'never');
 
+// A filter re-renders once typing pauses, not on every key: a list of thousands stays usable.
+const debounced = (fn, ms = 150) => {
+  let timer = null;
+  return () => {
+    clearTimeout(timer);
+    timer = setTimeout(fn, ms);
+  };
+};
+
+// Rows drawn at once; the filter finds the rest.
+const MAX_ROWS = 500;
+
+function moreRow(body, hidden, columns) {
+  if (hidden > 0) {
+    body.append(el('tr', { class: 'more' },
+      el('td', { colspan: String(columns), text: `${hidden} more; narrow the filter to see them` })));
+  }
+}
+
 function fail(err) {
   say(err.message, true);
 }
@@ -85,6 +104,7 @@ const loaders = {};
 let current = 'users';
 
 function showTab(name) {
+  if (name !== current && !discardUnsaved()) return;
   current = name;
   for (const b of $('tabs').querySelectorAll('button')) b.classList.toggle('active', b.dataset.tab === name);
   for (const s of document.querySelectorAll('main > section')) s.hidden = s.id !== 'tab-' + name;
@@ -141,6 +161,7 @@ let wanted = null;
 let selection = 0;            // bumped per click; a response to an older click is discarded
 let assigned = new Set();     // working copy for the selected user
 let savedAssigned = new Set();
+let myName = null;             // the signed-in administrator, for the self checks
 
 function detailBusy(busy) {
   for (const c of $('user-detail').querySelectorAll('button, input, select')) c.disabled = busy;
@@ -176,8 +197,16 @@ function renderUsers() {
   // A row had keyboard focus: give it back to the selected row once the rows are rebuilt.
   const hadFocus = body.contains(document.activeElement);
   body.innerHTML = '';
+  let shown = 0;
+  let hidden = 0;
   for (const u of users) {
     if (q && !(u.username + ' ' + (u.display_name || '')).toLowerCase().includes(q)) continue;
+    // The selected user always keeps a row, so the list and the pane agree.
+    if (shown >= MAX_ROWS && u.id !== selected) {
+      hidden++;
+      continue;
+    }
+    shown++;
     const name = el('td', {}, u.username);
     if (u.is_admin || u.bootstrap_admin) name.append(el('span', { class: 'tag good', text: 'admin' }));
     if (u.local) name.append(el('span', { class: 'tag', text: 'local' }));
@@ -201,9 +230,10 @@ function renderUsers() {
     body.append(tr);
     if (hadFocus && u.id === selected) tr.focus();
   }
+  moreRow(body, hidden, 4);
 }
 
-$('user-filter').addEventListener('input', renderUsers);
+$('user-filter').addEventListener('input', debounced(renderUsers));
 
 $('add-user').addEventListener('submit', async ev => {
   ev.preventDefault();
@@ -222,7 +252,28 @@ $('add-user').addEventListener('submit', async ev => {
   await loaders.users().catch(fail);
 });
 
+/// Unsaved ticks on the selected user's servers.
+function hasUnsaved() {
+  if (selected === null) return false;
+  if (assigned.size !== savedAssigned.size) return true;
+  return [...assigned].some(x => !savedAssigned.has(x));
+}
+
+/// True when there is nothing unsaved, or the administrator agrees to lose it.
+function discardUnsaved() {
+  if (!hasUnsaved()) return true;
+  const u = users.find(x => x.id === selected);
+  if (!confirm(`Discard the unsaved changes to ${u ? u.username : 'this user'}'s servers?`)) return false;
+  assigned = new Set(savedAssigned);
+  return true;
+}
+
+window.addEventListener('beforeunload', e => {
+  if (hasUnsaved()) e.preventDefault();
+});
+
 async function selectUser(id) {
+  if (id !== selected && !discardUnsaved()) return;
   wanted = id;
   const mine = ++selection;
   const u = users.find(x => x.id === id);
@@ -321,17 +372,27 @@ function showChanges() {
   $('ud-save').disabled = !(added || removed);
 }
 
-$('ud-filter').addEventListener('input', renderChecklist);
+$('ud-filter').addEventListener('input', debounced(renderChecklist));
 
 $('ud-save').addEventListener('click', async () => {
+  const removed = [...savedAssigned].filter(x => !assigned.has(x)).length;
+  const u = users.find(x => x.id === selected);
+  if (removed && !confirm(`Remove ${removed} server(s) from ${u.username}? Their saved credentials for those servers are deleted, and any open session to them is ended.`)) return;
   try {
     const r = await api('PUT', `/api/admin/users/${selected}/servers`, { server_ids: [...assigned] });
+    savedAssigned = new Set(assigned);
     say(`saved: ${r.added} added, ${r.removed} removed`);
     await loaders.users();
   } catch (err) { fail(err); }
 });
 
 $('ud-admin').addEventListener('change', async () => {
+  const u = users.find(x => x.id === selected);
+  if (!$('ud-admin').checked && u && u.username === myName
+      && !confirm('Remove your own administrator flag? The admin pages close to you at once.')) {
+    $('ud-admin').checked = true;
+    return;
+  }
   try {
     await api('PATCH', `/api/admin/users/${selected}`, { is_admin: $('ud-admin').checked });
     say('saved');
@@ -361,6 +422,7 @@ $('ud-remove').addEventListener('click', async () => {
 });
 
 $('ud-copy').addEventListener('click', async () => {
+  if (!discardUnsaved()) return;
   const from = Number($('ud-copy-from').value);
   try {
     const r = await api('POST', `/api/admin/users/${selected}/copy-from/${from}`);
@@ -394,8 +456,15 @@ function renderServers() {
   const q = $('server-filter').value.trim().toLowerCase();
   const body = $('server-table').tBodies[0];
   body.innerHTML = '';
+  let shown = 0;
+  let hidden = 0;
   for (const s of [...serverList].sort((a, b) => a.name.localeCompare(b.name))) {
     if (q && !(s.name + ' ' + s.host + ' ' + groupName(s.group_id)).toLowerCase().includes(q)) continue;
+    if (shown >= MAX_ROWS) {
+      hidden++;
+      continue;
+    }
+    shown++;
     body.append(el('tr', {},
       el('td', { text: s.name }),
       el('td', { text: s.host }),
@@ -406,9 +475,10 @@ function renderServers() {
         el('button', { class: 'ghost', text: 'Edit', onclick: () => editServer(s) }),
         el('button', { class: 'danger', text: 'Delete', onclick: () => deleteServer(s) }))));
   }
+  moreRow(body, hidden, 6);
 }
 
-$('server-filter').addEventListener('input', renderServers);
+$('server-filter').addEventListener('input', debounced(renderServers));
 
 function editServer(s) {
   editing = s.id;
@@ -560,7 +630,9 @@ loaders.activity = async () => {
 };
 
 async function loadAudit() {
-  const r = await api('GET', '/api/admin/audit?limit=100' + (oldest ? '&before=' + oldest : ''));
+  const text = $('audit-filter').value.trim();
+  const r = await api('GET', '/api/admin/audit?limit=100' + (oldest ? '&before=' + oldest : '')
+    + (text ? '&q=' + encodeURIComponent(text) : ''));
   const body = $('audit-table').tBodies[0];
   for (const e of r.entries) {
     body.append(el('tr', {},
@@ -575,6 +647,7 @@ async function loadAudit() {
 }
 
 $('audit-more').addEventListener('click', () => loadAudit().catch(fail));
+$('audit-filter').addEventListener('input', debounced(() => loaders.activity().catch(fail), 300));
 
 /* ---- migration ---------------------------------------------------------------------------- */
 
@@ -796,6 +869,7 @@ async function start() {
     setTimeout(start, 10000);
     return;
   }
+  myName = me.username;
   $('who').textContent = me.display_name || me.username;
   if (!me.is_admin) {
     $('denied').hidden = false;

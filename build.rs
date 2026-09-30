@@ -13,6 +13,8 @@ const FILES: &[&str] = &[
     "theme.js",
     "ironrdp_web.js",
     "ironrdp_web_bg.wasm",
+    "notices.html",
+    "notices-client.html",
 ];
 
 /// FNV-1a, 64 bits: a cache validator, not a security check.

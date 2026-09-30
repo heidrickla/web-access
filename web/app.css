@@ -69,7 +69,9 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 
-html, body { height: 100%; }
+/* The body grows with the page: a fixed height would let the sticky header scroll away. */
+html { height: 100%; }
+body { min-height: 100%; }
 
 body {
   margin: 0;
@@ -698,6 +700,11 @@ nav.tabs button.active { color: var(--text); background: var(--accent-soft); box
 .split { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(380px, 1.25fr); gap: 20px; align-items: start; }
 #tab-servers .split { grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); }
 @media (max-width: 960px) { .split, #tab-servers .split { grid-template-columns: 1fr; } }
+/* Beside a long list, the detail pane stays in view while the list scrolls. */
+@media (min-width: 961px) {
+  #user-detail { position: sticky; top: 74px; max-height: calc(100vh - 90px); overflow: auto; }
+}
+table.grid tr.more td { color: var(--text-2); font-style: italic; text-align: center; }
 
 #server-table td:nth-child(1), #server-table td:nth-child(3), #user-table td:first-child { white-space: nowrap; }
 #server-table td:nth-child(2) { font-family: var(--mono); font-size: 12.5px; color: var(--text-2); overflow-wrap: anywhere; }
@@ -789,3 +796,15 @@ button, .navlink { white-space: nowrap; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; }
 }
+
+/* ---- footer and licence pages ---------------------------------------------------------------- */
+
+.page-foot { padding: 0 24px 24px; text-align: center; font-size: 12px; }
+.page-foot a { color: var(--text-2); }
+body.connected .page-foot { display: none; }
+main.notices { max-width: 900px; margin: 0 auto; }
+.notice-overview { columns: 2; padding-left: 18px; }
+.card.notice { margin: 16px 0; }
+.card.notice h3 { margin-top: 0; }
+.notice-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; font-family: var(--mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+@media (max-width: 640px) { .notice-overview { columns: 1; } }

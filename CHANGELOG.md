@@ -20,6 +20,10 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - The HTTPS certificate is read again when its files change; its expiry is logged, with a daily warning from 30 days out.
 - The Migration tab shows how the directory account checks last went; the Activity tab records when they start failing and when they recover.
 - Cancel on an uploaded import releases it on the proxy.
+- Third-party licence pages for the proxy and the browser client, at `/notices` and `/notices-client`, linked from every page and installed beside the binary with `LICENSE.txt`.
+- `scripts/build-client.sh` rebuilds the browser client from a pinned IronRDP commit and checks its dependencies against `deny.toml`; the build is reproducible and a test checks the committed files against the recorded digests.
+- The Activity tab has a filter over who, what and detail.
+- CI runs the page scripts, and a Windows job where the host has a Windows runner.
 
 ### Changed
 
@@ -46,12 +50,18 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - A config key the proxy does not read is named in the log at start.
 - A failed TLS handshake is logged at info, at most one line a minute.
 - At most two uploaded imports are held, and unconfirmed ones are dropped after 30 minutes.
+- The browser client is the optimised build (4.6 MB, 1.6 MB gzipped); the one shipped before was the same client without its wasm-opt pass.
+- A CSV import leaves a server's port and group as they are when the file has no column for them; an empty group cell still ungroups.
+- Removing servers from a user asks first, naming what goes with them; switching user, tab or page with unsaved ticks asks before discarding them; unticking your own administrator flag asks first.
+- The admin lists draw at most 500 rows, and their filters wait for a pause in typing; the user detail pane stays in view beside a long list.
 
 ### Fixed
 
 - An upgrade or an uninstall no longer deletes `config.toml`.
 - A damaged or truncated export is reported as damaged instead of as a server error.
 - A `[tls] ca_bundle` that holds no certificate is refused at start instead of every server being refused, and a missing one is named in the error.
+- A host entered as `host:port` is refused with a pointer to the port field, instead of failing at connect.
+- The page header stays at the top of a long page.
 - A database that does not reopen after an import's swap stops the service instead of serving an empty one.
 - Pressing a server tile outside its name opened nothing; opening a server said nothing while the client loaded.
 - Enter in the server sign-in dialog cancelled it instead of connecting.
