@@ -272,7 +272,9 @@ async fn scan_checks(app: Arc<App>, scan: Arc<crate::scan::ScanService>) {
         tick.tick().await;
         let was = scan.health();
         let h = scan.check().await;
-        if h.ok {
+        if h.ok && (was.checked_at.is_none() || !was.ok) {
+            info!(scanner = %h.scanner, "file scanner check passed; files are scanned");
+        } else if h.ok {
             debug!(scanner = %h.scanner, "file scanner check passed");
         } else {
             warn!(scanner = %h.scanner, detail = %h.detail, "file scanner check failed; files are refused");

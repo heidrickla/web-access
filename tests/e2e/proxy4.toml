@@ -1,0 +1,15 @@
+listen = "127.0.0.1:8446"
+data_dir = "data4"
+allow_local_accounts = true
+
+[tls]
+verify = "insecure"
+
+# A stand-in scanner: the EICAR test file, read reversed so no file here carries its text, is
+# malware; anything else is clean.
+[scan]
+scanner = "command"
+command = ["sh", "-c", "if LC_ALL=C rev \"$0\" | grep -q ELIF-TSET-SURIVITNA-DRADNATS-RACIE; then exit 1; fi", "{file}"]
+detected_exit_codes = [1]
+timeout_secs = 30
+check_every_mins = 5

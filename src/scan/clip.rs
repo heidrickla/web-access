@@ -1179,6 +1179,35 @@ mod tests {
         assert_eq!(h.staging.held(), 0);
     }
 
+    #[tokio::test]
+    async fn a_verdict_for_a_replaced_offer_never_decides_the_new_one() {
+        let mut h = harness();
+        h.client(file_offer());
+        h.written();
+        h.client(descriptors(&[("bad.exe", 4)]));
+        serve_ranges(&mut h, &[b"evil".to_vec()]);
+        // A second offer replaces the first while its scan is out, and reaches a scan of its own.
+        h.client(file_offer());
+        h.written();
+        h.client(descriptors(&[("fine.txt", 4)]));
+        serve_ranges(&mut h, &[b"fine".to_vec()]);
+        let mut late = vec![h.scans.recv().await.unwrap(), h.scans.recv().await.unwrap()];
+        // The replaced offer's verdict arrives first.
+        late.sort_by_key(|i| match i {
+            Input::Scanned { generation, .. } => *generation,
+            _ => u64::MAX,
+        });
+        for i in late {
+            h.clip.handle(i).unwrap();
+        }
+        let reports = h.reports.lock().unwrap();
+        assert!(
+            matches!(reports.last(), Some(Report::Passed { files, .. }) if files[0].0 == "fine.txt"),
+            "{:?}",
+            reports.last()
+        );
+    }
+
     #[test]
     fn text_passes_both_ways_and_locks_are_masked_out() {
         let mut h = harness();

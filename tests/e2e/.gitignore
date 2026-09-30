@@ -3,12 +3,15 @@ dc-ca.pem
 data1/
 data2/
 data3/
+data4/
 log1
 log2
 log3
+log4
 pid1
 pid2
 pid3
+pid4
 *.jar
 ids.env
 shots/
@@ -23,3 +26,5 @@ all.log
 all.pid
 local.jar
 revoke-ready
+remote/
+scan.log
