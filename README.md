@@ -250,7 +250,7 @@ The service reports running only once it has read the config, opened the databas
 
 To go back: uninstall, install the previous MSI, stop the service, move `web-access.db`, `web-access.db-wal` and `web-access.db-shm` out of the data directory together, rename the `backup-schema<N>-<time>.db` copy to `web-access.db`, and start the service. A database migrated by a newer version is refused by an older one.
 
-Upgrading from 0.2 or earlier keeps `config.toml`: those packages registered the same config component. From 0.1, add `[directory]`, `admins` and `[https]` to it after the upgrade, then `Start-Service WebAccessProxy`; its `[[target]]` entries are imported once into an "Imported" group, and `[[policy]]` is no longer read.
+Upgrading from 0.2 or earlier keeps `config.toml`: those packages registered the same config component. The program moves from `C:\Program Files (x86)\web-access` to `C:\Program Files\web-access`, so a scheduled task that names the old path needs the new one. From 0.1, add `[directory]`, `admins` and `[https]` to it after the upgrade, then `Start-Service WebAccessProxy`; its `[[target]]` entries are imported once into an "Imported" group, and `[[policy]]` is no longer read.
 
 WiX v5 specifically. v6 and v7 require accepting the Open Source Maintenance Fee EULA, which is a licensing decision with a fee attached for commercial use. v5 is the last version without that gate and uses the same schema. The Firewall and Util extensions must be version-pinned to match the toolset.
 

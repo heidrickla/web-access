@@ -76,6 +76,10 @@ Check 'the upgrade succeeds' ($e -eq 0) "exit $e"
 $run = Runs
 Check 'the upgraded exe is in place and runs' ($run -like 'exit=0 *') $run
 Check 'config.toml survives the upgrade from 0.2.0' (Marked)
+$old = 'C:\Program Files (x86)\web-access\web-access-proxy.exe'
+Check "0.2.0's copy in Program Files (x86) is removed" (-not (Test-Path $old))
+$image = (Get-CimInstance Win32_Service -Filter "Name = 'WebAccessProxy'").PathName
+Check 'the service runs the new exe' ($image -like "*$exe*") $image
 Check 'the upgrade starts the service' (Running 60)
 Check 'the new version answers on 8443' (Answers)
 $pr = Products
