@@ -51,6 +51,16 @@ function Runs {
     $v = & $exe --version 2>&1
     "exit=$LASTEXITCODE $v"
 }
+# The service log's newest line holding `text`, waiting up to `secs` for one.
+function Logged([string]$text, [int]$secs) {
+    for ($i = 0; $i -lt $secs; $i++) {
+        $l = Get-ChildItem $data -Filter 'web-access-proxy-*.log' | Get-Content |
+            Select-String -SimpleMatch $text | Select-Object -Last 1
+        if ($l) { return "$l" }
+        Start-Sleep 1
+    }
+    ''
+}
 function Marked { (Test-Path $cfg) -and (Select-String -Path $cfg -SimpleMatch 'upgrade-test-marker' -Quiet) }
 $good = @'
 # upgrade-test-marker
@@ -82,6 +92,8 @@ $image = (Get-CimInstance Win32_Service -Filter "Name = 'WebAccessProxy'").PathN
 Check 'the service runs the new exe' ($image -like "*$exe*") $image
 Check 'the upgrade starts the service' (Running 60)
 Check 'the new version answers on 8443' (Answers)
+$scan = Logged 'file scanner check passed' 60
+Check 'files are scanned by the anti-malware product registered with Windows' ($scan -like '*AMSI: *') $scan
 $pr = Products
 Check 'one product is installed' ($pr.Count -eq 1) (($pr | ForEach-Object { $_.DisplayVersion }) -join ',')
 $facts = RuleFacts
