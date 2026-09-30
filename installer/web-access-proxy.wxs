@@ -6,14 +6,23 @@
   organisation already deploys things: GPO, SCCM or Intune, with a real uninstall and a real
   upgrade path. A script that copies files and calls sc.exe is not that.
 
-  Build:  installer/build.ps1
+  Build:  installer/build.ps1, which passes the version from Cargo.toml as ProductVersion.
+
+  Public properties:
+    REMOTE_ADDRESSES   who the firewall rule admits: "*" (default) or a comma-separated list of
+                       addresses, ranges or subnets. Remembered, so an upgrade keeps it.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <?ifndef ProductVersion ?>
+    <?error ProductVersion is not set; build with installer/build.ps1 ?>
+  <?endif?>
 
   <Package Name="web-access proxy"
            Manufacturer="Lewis Heidrick"
-           Version="0.2.0"
+           Version="$(var.ProductVersion)"
            UpgradeCode="7c4a1c6e-2f5b-4d8a-9e13-5b0a2d6f8c41"
            Scope="perMachine"
            Compressed="yes">
@@ -21,8 +30,20 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- The service reads the config at start, so an upgrade restarts it; that is the intended
-         behaviour and the reason the config lives outside the install directory. -->
+    <!-- The firewall rule's remote addresses: given on the command line, else the value the last
+         install recorded, else any. -->
+    <Property Id="REMOTE_ADDRESSES" Secure="yes" />
+    <Property Id="SAVED_REMOTE_ADDRESSES">
+      <RegistrySearch Id="SavedRemoteAddresses" Root="HKLM" Key="Software\web-access"
+                      Name="RemoteAddresses" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Id="REMOTE_ADDRESSES" Value="[SAVED_REMOTE_ADDRESSES]" After="AppSearch"
+                 Sequence="both" Condition="NOT REMOTE_ADDRESSES AND SAVED_REMOTE_ADDRESSES" />
+    <SetProperty Id="REMOTE_ADDRESSES" Value="*" After="SetREMOTE_ADDRESSES" Action="DefaultRemoteAddresses"
+                 Sequence="both" Condition="NOT REMOTE_ADDRESSES" />
+
+    <!-- The config and the database live outside the install directory, so an upgrade replaces
+         the program and nothing an administrator wrote. -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="web-access" />
     </StandardDirectory>
@@ -46,41 +67,69 @@
                         ErrorControl="normal"
                         Account="NT AUTHORITY\LocalService"
                         Arguments="--service &quot;[DATAFOLDER]config.toml&quot;"
-                        Vital="yes" />
+                        Vital="yes">
+          <!-- Restarted a minute after the process ends unexpectedly; the failure count resets
+               after a day. A start refused for a bad config or a port in use stops cleanly and
+               stays stopped, with the reason in the log. -->
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart"
+                              RestartServiceDelayInSeconds="60"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
 
-        <!-- DELIBERATELY NOT STARTED ON INSTALL. The allowlist is a security control that has to be
-             authored before this service does anything useful, and the shipped config names example
-             hosts. Starting here would either fail the install on an unconfigured ca_bundle or, worse,
-             succeed and leave a gateway running against a config nobody wrote. Start type stays auto,
-             so once an administrator configures and starts it, it survives reboots. -->
+        <!-- Not started on a first install: the shipped config names example hosts, and a gateway
+             should not run against a config nobody wrote. Start type is auto, so once an
+             administrator configures and starts it, it survives reboots. An upgrade starts it
+             again: see StartAfterUpgrade. -->
         <ServiceControl Id="ServiceControl"
                         Name="WebAccessProxy"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
 
-        <!-- Scoped to the PROGRAM, not to a port. The listening port comes from config.toml, which
-             an administrator edits after install, so a port-scoped rule baked in here would be
-             wrong the first time anyone changed it. -->
+        <!-- Scoped to the program, not to a port: the listening port comes from config.toml, which
+             an administrator edits after install. The remote addresses come from REMOTE_ADDRESSES,
+             any by default, since users reach the proxy from other subnets. -->
         <fw:FirewallException Id="InboundWebSocket"
                               Name="web-access proxy"
                               Description="Inbound connections to the web-access RDP proxy"
-                              Scope="localSubnet"
                               Profile="all"
                               Protocol="tcp"
-                              IgnoreFailure="no" />
+                              IgnoreFailure="no">
+          <fw:RemoteAddress Value="[REMOTE_ADDRESSES]" />
+        </fw:FirewallException>
       </Component>
 
-      <!-- NeverOverwrite so an upgrade does not replace an administrator's config with the example. -->
+      <!-- Records REMOTE_ADDRESSES so the next upgrade keeps it. -->
+      <Component Id="Settings" Directory="INSTALLFOLDER" Guid="e5a6b7c8-9d0e-4f12-8a3b-4c5d6e7f8091"
+                 Bitness="always64">
+        <RegistryValue Root="HKLM" Key="Software\web-access" Name="RemoteAddresses"
+                       Value="[REMOTE_ADDRESSES]" Type="string" KeyPath="yes" />
+      </Component>
+
+      <!-- An upgrade replaces the service, which leaves it stopped; this starts it again. Its start
+           type is auto, so it would start at the next boot anyway. A first install has no
+           WIX_UPGRADE_DETECTED and leaves it stopped. -->
+      <Component Id="StartAfterUpgrade" Directory="INSTALLFOLDER" Guid="f6b7c8d9-0e1f-4a23-9b4c-5d6e7f809102"
+                 Bitness="always64" Condition="WIX_UPGRADE_DETECTED">
+        <RegistryValue Root="HKLM" Key="Software\web-access" Name="StartedAfterUpgrade"
+                       Value="1" Type="integer" KeyPath="yes" />
+        <ServiceControl Id="StartAfterUpgrade" Name="WebAccessProxy" Start="install" Wait="yes" />
+      </Component>
+
+      <!-- Permanent: uninstalling, and the uninstall of the old version inside an upgrade, leave
+           the administrator's config in place. NeverOverwrite: installing never replaces an
+           existing config with the example. -->
       <Component Id="ConfigFile" Directory="DATAFOLDER" Guid="b2e3a4c5-6d7e-4f80-9ab1-c2d3e4f50612"
-                 NeverOverwrite="yes">
+                 NeverOverwrite="yes" Permanent="yes">
         <File Id="config.toml" Source="..\config.example.toml" Name="config.toml" KeyPath="yes" />
       </Component>
 
       <!-- The data directory holds the database, its backups and the certificates. Inheritance
            from ProgramData is cut: SYSTEM and Administrators have full control, the service account
            may modify, and nobody else has access. Permanent, so uninstalling leaves the data and
-           its protection in place. -->
+           its protection in place. Each install and upgrade applies this list again. -->
       <Component Id="DataFolderAcl" Directory="DATAFOLDER" Guid="c3f4b5d6-7e8f-4091-8bc2-d3e4f5061723"
                  Permanent="yes" KeyPath="yes">
         <CreateFolder>

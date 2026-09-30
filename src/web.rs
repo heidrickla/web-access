@@ -193,7 +193,9 @@ impl From<MigrateError> for ApiError {
 impl From<DirError> for ApiError {
     fn from(e: DirError) -> Self {
         match e {
-            DirError::InvalidCredentials => Self::new(StatusCode::UNAUTHORIZED, e.to_string()),
+            DirError::InvalidCredentials | DirError::OtherDomain(_) => {
+                Self::new(StatusCode::UNAUTHORIZED, e.to_string())
+            }
             DirError::Unreachable(_) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the directory could not be reached; try again shortly",
@@ -548,7 +550,7 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
         Some((user_id, incarnation, hash)) => {
             check_local(&app, &username, user_id, incarnation, hash, &req.password).await?
         }
-        None => check_directory(&app, &username, &req.password).await?,
+        None => check_directory(&app, &req.username, &username, &req.password).await?,
     };
 
     // Recorded under a hold, and only in the database the check was made against.
@@ -695,14 +697,26 @@ fn finish_local(
     Ok(user)
 }
 
-async fn check_directory(app: &App, username: &str, password: &str) -> ApiResult<Checked> {
+/// `typed` is the name as the user entered it; `username` its short form, for the log.
+async fn check_directory(
+    app: &App,
+    typed: &str,
+    username: &str,
+    password: &str,
+) -> ApiResult<Checked> {
     let Some(directory) = &app.directory else {
         return Ok(Checked::Refused("no directory is configured"));
     };
-    match directory.authenticate(username, password).await {
+    match directory.authenticate(typed, password).await {
         Ok(account) => Ok(Checked::Directory(account)),
         Err(DirError::InvalidCredentials) => {
             Ok(Checked::Refused("directory refused the credentials"))
+        }
+        Err(DirError::OtherDomain(who)) => {
+            tracing::warn!(%who, "a sign-in's password was accepted for an account in another domain");
+            Ok(Checked::Refused(
+                "the account is not in the configured domain",
+            ))
         }
         Err(e) => {
             tracing::warn!(%username, error = %e, "sign-in could not reach a decision");
@@ -714,10 +728,33 @@ async fn check_directory(app: &App, username: &str, password: &str) -> ApiResult
 fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult<User> {
     let user = match app.store.user_by_name(&account.username)? {
         Some(u) => u,
-        // Created and read back in one step, so the row carried on is the row created.
-        None => app
-            .store
-            .user_create_returning(&account.username, account.display_name.as_deref())?,
+        None => match app.store.directory_user_by_sid(&account.sid)? {
+            // Renamed in the directory: the row bound to this account keeps its servers and saved
+            // credentials under the new name.
+            Some(old) => {
+                if !app.store.user_rename(
+                    old.id,
+                    old.incarnation,
+                    &account.sid,
+                    &account.username,
+                )? {
+                    return Err(refused(app, &account.username, CHANGED));
+                }
+                app.store.audit(
+                    &account.username,
+                    "user.renamed",
+                    &format!("renamed in the directory from {}", old.username),
+                );
+                app.store
+                    .user_by_id(old.id)?
+                    .filter(|u| u.incarnation == old.incarnation)
+                    .ok_or_else(|| refused(app, &account.username, CHANGED))?
+            }
+            // Created and read back in one step, so the row carried on is the row created.
+            None => app
+                .store
+                .user_create_returning(&account.username, account.display_name.as_deref())?,
+        },
     };
     // A local account created under this name while the directory was asked is not the directory's.
     if user.local {
@@ -1543,6 +1580,35 @@ pub mod tests {
             user.sid.as_deref(),
             Some("local:test"),
             "the local account was bound to a directory SID"
+        );
+    }
+
+    /// An account renamed in the directory signs in on its own row, renamed, with its servers,
+    /// and a new account under the old name gets a row of its own.
+    #[tokio::test]
+    async fn an_account_renamed_in_the_directory_keeps_its_row() {
+        let app = test_app_local(false, true);
+        let account = |name: &str, sid: &str| crate::directory::Account {
+            username: name.into(),
+            display_name: None,
+            sid: sid.into(),
+            disabled: false,
+            expired: false,
+        };
+        let first = finish_directory(&app, &account("jsmith", "S-1-5-21-7")).unwrap();
+        let server = app.store.server_create("hist-01", "h", 3389, None).unwrap();
+        app.store.set_assignments(first.id, &[server]).unwrap();
+
+        let renamed = finish_directory(&app, &account("jdoe", "S-1-5-21-7")).unwrap();
+        assert_eq!(renamed.id, first.id, "the renamed account got a new row");
+        assert_eq!(renamed.username, "jdoe");
+        assert!(app.store.user_by_name("jsmith").unwrap().is_none());
+        assert_eq!(app.store.assignment_ids(first.id).unwrap(), vec![server]);
+
+        let newcomer = finish_directory(&app, &account("jsmith", "S-1-5-21-8")).unwrap();
+        assert_ne!(
+            newcomer.id, first.id,
+            "a new account took the renamed one's row"
         );
     }
 

@@ -57,7 +57,7 @@ impl App {
     pub fn new(cfg: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let data_dir = cfg.data_dir();
         std::fs::create_dir_all(&data_dir)?;
-        let store = Store::open(&cfg.database_path())?;
+        let store = Store::open_serving(&cfg.database_path())?;
         let vault = Vault::load(&store, local_protector(&data_dir)?)?;
         let directory = cfg.directory.as_ref().map(Directory::new).transpose()?;
         let target_tls = tls_setup(&cfg.tls)?;
@@ -93,6 +93,10 @@ impl App {
     pub fn for_serving(cfg: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let app = Self::new(cfg)?;
         app.lift_stranded_freeze()?;
+        crate::migrate::sweep_temp_files(
+            &app.cfg.data_dir(),
+            std::time::Duration::from_secs(60 * 60),
+        );
         Ok(app)
     }
 
@@ -204,6 +208,12 @@ impl App {
 
     pub fn directory_password_set(&self) -> bool {
         matches!(self.store.meta_get(META_DIRECTORY_PASSWORD), Ok(Some(_)))
+    }
+
+    /// Start the credential store over; see `Vault::reset`. The directory service account's
+    /// password was sealed under the old key, so it goes too.
+    pub fn reset_credential_store(&self) -> Result<usize, VaultError> {
+        self.vault.reset(&self.store, &[META_DIRECTORY_PASSWORD])
     }
 
     pub fn is_admin(&self, user: &crate::store::User) -> bool {

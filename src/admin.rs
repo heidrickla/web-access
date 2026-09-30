@@ -43,6 +43,7 @@ pub fn router() -> Router<Shared> {
         .route("/migration", get(migration_status))
         .route("/migration/recovery", post(set_recovery))
         .route("/migration/unlock", post(unlock))
+        .route("/migration/reset", post(reset_credential_store))
         .route("/migration/export", post(export))
         .route("/migration/unfreeze", post(unfreeze))
         .route(
@@ -633,6 +634,9 @@ async fn migration_status(State(app): State<Shared>, _: AdminUser) -> ApiResult<
     let counts = app.store.counts()?;
     Ok(Json(json!({
         "host": app.host_name,
+        // What is installed, named exactly, for a support call.
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": option_env!("WEB_ACCESS_BUILD"),
         "recovery_set": Vault::recovery_set(&app.store)?,
         "unlocked": app.vault.is_unlocked(),
         "frozen": app.frozen(),
@@ -641,6 +645,8 @@ async fn migration_status(State(app): State<Shared>, _: AdminUser) -> ApiResult<
         "directory": {
             "service_account": app.cfg.service_account(),
             "password_set": app.directory_password_set(),
+            // Set but sealed under a key a locked store cannot open: the account checks cannot run.
+            "password_readable": app.directory_password_set() && app.vault.is_unlocked(),
         },
         "local_accounts": app.cfg.allow_local_accounts,
     })))
@@ -688,6 +694,35 @@ async fn unlock(
     app.vault.install(key);
     app.store.audit(&admin.username, "vault.unlock", "");
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ResetForm {
+    /// This proxy's host name, typed: the reset deletes every saved credential.
+    confirm_host: String,
+}
+
+/// Start the credential store over when nothing can open it: no recovery passphrase, or one that
+/// was lost. Every saved credential and the directory service account's password go.
+async fn reset_credential_store(
+    State(app): State<Shared>,
+    AdminUser(admin): AdminUser,
+    Json(req): Json<ResetForm>,
+) -> ApiResult<Json<Value>> {
+    not_frozen(&app)?;
+    if !req.confirm_host.trim().eq_ignore_ascii_case(&app.host_name) {
+        return Err(ApiError::bad_request(format!(
+            "type this proxy's host name, {}, to confirm",
+            app.host_name
+        )));
+    }
+    let removed = app.reset_credential_store()?;
+    app.store.audit(
+        &admin.username,
+        "vault.reset",
+        &format!("{removed} saved credential(s) deleted"),
+    );
+    Ok(Json(json!({ "removed": removed })))
 }
 
 #[derive(Deserialize)]
@@ -1103,6 +1138,7 @@ mod tests {
             ("GET", "/api/admin/migration"),
             ("POST", "/api/admin/migration/recovery"),
             ("POST", "/api/admin/migration/unlock"),
+            ("POST", "/api/admin/migration/reset"),
             ("POST", "/api/admin/migration/export"),
             ("POST", "/api/admin/migration/unfreeze"),
             ("POST", "/api/admin/migration/import"),
@@ -1160,6 +1196,54 @@ mod tests {
             .find(|u| u["username"] == "jdoe")
             .unwrap();
         assert_eq!(jdoe["servers"], 1);
+    }
+
+    /// The reset needs this proxy's name typed, is refused while frozen, and leaves the store
+    /// unlocked with its saved credentials gone and the reset in the activity log.
+    #[tokio::test]
+    async fn the_credential_store_reset_needs_the_host_name_and_is_logged() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        let reset = |host: &str| Some(json!({ "confirm_host": host }));
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/admin/migration/reset",
+            Some(&cookie),
+            reset("not-this-host"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        app.store.set_flag(crate::app::META_FROZEN, true).unwrap();
+        let host = app.host_name.clone();
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/admin/migration/reset",
+            Some(&cookie),
+            reset(&host),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "a frozen proxy was reset");
+        app.store.set_flag(crate::app::META_FROZEN, false).unwrap();
+
+        let (s, v) = call(
+            &app,
+            "POST",
+            "/api/admin/migration/reset",
+            Some(&cookie),
+            reset(&host.to_uppercase()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["removed"], 0);
+        assert!(app.vault.is_unlocked());
+        let audit = app.store.audit_list(10, None).unwrap();
+        assert!(
+            audit.iter().any(|a| a.action == "vault.reset"),
+            "the reset was not logged"
+        );
     }
 
     #[tokio::test]

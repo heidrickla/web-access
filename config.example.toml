@@ -15,8 +15,11 @@ admins = ["jdoe"]
 # Where the database lives. Defaults to the directory holding this file.
 # data_dir = 'C:\ProgramData\web-access'
 
-# HTTPS. PEM files: the certificate chain for the name users browse to, and its private key.
-# Without this section the listener speaks plain HTTP.
+# Connections served at once. A WebSocket counts until its RDP session is connected.
+# max_connections = 1024
+
+# HTTPS. PEM files: the certificate for the name users browse to followed by its chain, and its
+# unencrypted private key. Without this section the listener speaks plain HTTP.
 [https]
 cert = 'C:\ProgramData\web-access\proxy-cert.pem'
 key = 'C:\ProgramData\web-access\proxy-key.pem'
@@ -32,12 +35,17 @@ ca_bundle = 'C:\ProgramData\web-access\server-ca.pem'
 # The Active Directory users sign in against, over LDAPS.
 [directory]
 domain = "corp.example.com"
-# With netbios set, sign-in binds as NETBIOS\user, which works whatever UPN suffix an account has.
+# The domain's NetBIOS name. A bare username binds as NETBIOS\user, which works whatever sign-in
+# name an account has, and a password accepted for an account in another domain is refused.
 netbios = "CORP"
 # Domain controllers, tried in order.
 urls = ["ldaps://dc1.corp.example.com", "ldaps://dc2.corp.example.com"]
 # CA that issued the domain controllers' certificates. Omit to use the Windows certificate store.
 ca_bundle = 'C:\ProgramData\web-access\directory-ca.pem'
+# Where accounts are looked up. Derived from domain when omitted (DC=corp,DC=example,DC=com).
+# base_dn = "OU=Staff,DC=corp,DC=example,DC=com"
+# Seconds to wait for a domain controller.
+# timeout_secs = 10
 # Optional read-only account. With it, the proxy checks usernames when an administrator adds them,
 # and ends the sessions of accounts disabled in the directory. Its password is set on the admin
 # Migration page or with `web-access-proxy.exe set-secret directory`, never in this file.

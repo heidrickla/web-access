@@ -1,11 +1,16 @@
 //! web-access proxy.
 //!
+//!     web-access-proxy --version                              the version and the build it came from
 //!     web-access-proxy [config.toml]                          run in the foreground; Ctrl-C stops
 //!     web-access-proxy --service [config.toml]                run under the Service Control Manager
-//!     web-access-proxy export <config.toml> <out.zip>         write an export, as the admin page does
-//!     web-access-proxy import <config.toml> <in.zip> [--replace]   apply an export; service stopped
-//!     web-access-proxy set-secret recovery <config.toml>      set or change the recovery passphrase
+//!     web-access-proxy export <config.toml> <out.zip> [--passphrase-file <path>]   write an export
+//!     web-access-proxy import <config.toml> <in.zip> [--replace] [--passphrase-file <path>]
+//!                                                             apply an export; service stopped
+//!     web-access-proxy set-secret recovery <config.toml> [--replace]   set or change the recovery
+//!                                                             passphrase; --replace for a lost one
 //!     web-access-proxy set-secret directory <config.toml>     set the service account's password
+//!     web-access-proxy unlock <config.toml>                   unlock a store moved from another host
+//!     web-access-proxy reset-credentials <config.toml>        start a store nothing can open over
 //!     web-access-proxy local-account <config.toml> <name> [--admin]   create a local account, or
 //!                                                             reset its password
 
@@ -84,13 +89,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let tool = args.first().map(String::as_str);
+    if tool == Some("--version") {
+        println!(
+            "web-access-proxy {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("WEB_ACCESS_BUILD").unwrap_or("build unrecorded")
+        );
+        return Ok(());
+    }
     if !matches!(
         tool,
-        Some("export" | "import" | "set-secret" | "local-account")
+        Some("export" | "import" | "set-secret" | "local-account" | "unlock" | "reset-credentials")
     ) {
-        return server::serve_blocking(&config_path_from_args(), async {
-            let _ = tokio::signal::ctrl_c().await;
-        });
+        return server::serve_blocking(
+            &config_path_from_args(),
+            async {
+                let _ = tokio::signal::ctrl_c().await;
+            },
+            || {},
+        );
     }
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -100,6 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("import") => cli::import(&args[1..]),
             Some("set-secret") => cli::set_secret(&args[1..]).await,
             Some("local-account") => cli::local_account(&args[1..]),
+            Some("unlock") => cli::unlock(&args[1..]),
+            Some("reset-credentials") => cli::reset_credentials(&args[1..]),
             _ => Err("not a command-line tool".into()),
         }
     })
@@ -123,12 +142,50 @@ mod cli {
         App::new(Config::load(&absolute(path))?)
     }
 
+    /// The recovery passphrase: from `--passphrase-file <path>` for a scheduled task, which has no
+    /// console, and otherwise typed. Only a trailing line ending is taken off the file's contents.
+    fn passphrase(args: &[String]) -> std::result::Result<String, Box<dyn Error>> {
+        match args.iter().position(|a| a == "--passphrase-file") {
+            Some(i) => {
+                let path = args.get(i + 1).ok_or("--passphrase-file needs a path")?;
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("reading the passphrase file {path}: {e}"))?;
+                Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+            }
+            None => Ok(prompt::secret("Recovery passphrase: ")?),
+        }
+    }
+
+    /// Write `bytes` to `out` without ever leaving a partial file there: written beside it, flushed
+    /// to disk, read back as an archive, then renamed over it. A full disk or a dropped share keeps
+    /// the previous export at `out` intact.
+    fn write_export(out: &str, bytes: &[u8]) -> Result {
+        use std::io::Write;
+        let part = format!("{out}.part");
+        let written = (|| -> Result {
+            let mut f = std::fs::File::create(&part)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            drop(f);
+            migrate::read_zip(&std::fs::read(&part)?)?;
+            std::fs::rename(&part, out)?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        written
+    }
+
     pub fn export(args: &[String]) -> Result {
         let app = app(args.first())?;
-        let out = args.get(1).ok_or("usage: export <config.toml> <out.zip>")?;
-        let pass = prompt::secret("Recovery passphrase: ")?;
+        let out = args
+            .get(1)
+            .filter(|a| !a.starts_with("--"))
+            .ok_or("usage: export <config.toml> <out.zip> [--passphrase-file <path>]")?;
+        let pass = passphrase(args)?;
         let export = migrate::export(&app, &pass)?;
-        std::fs::write(out, &export.bytes)?;
+        write_export(out, &export.bytes)?;
         app.store.audit("console", "export", &export.file_name);
         println!(
             "wrote {out}: {} users, {} servers, {} assignments, {} saved credentials",
@@ -163,7 +220,7 @@ mod cli {
             manifest.counts.assignments,
             manifest.counts.credentials
         );
-        let pass = prompt::secret("Recovery passphrase: ")?;
+        let pass = passphrase(args)?;
         let counts = migrate::apply(&app, &blob, &pass).map_err(|e| match e {
             migrate::MigrateError::Store(s) => {
                 format!("{s} (stop the WebAccessProxy service first)")
@@ -179,6 +236,20 @@ mod cli {
         let which = args.first().map(String::as_str);
         let app = app(args.get(1))?;
         match which {
+            Some("recovery") if args.iter().any(|a| a == "--replace") => {
+                // A lost passphrase. The key comes from this host's own wrap instead.
+                if !app.vault.is_unlocked() {
+                    return Err("the credential store is locked on this host, so there is no key to wrap under a new passphrase; reset-credentials starts it over".into());
+                }
+                let new = prompt::secret("New recovery passphrase (12 characters or more): ")?;
+                if prompt::secret("Repeat it: ")? != new {
+                    return Err("the two entries differ".into());
+                }
+                app.vault.replace_recovery(&app.store, &new)?;
+                app.store
+                    .audit("console", "recovery.replaced", "without the previous passphrase");
+                println!("recovery passphrase replaced; exports made before now open only with the old one");
+            }
             Some("recovery") => {
                 let current = if Vault::recovery_set(&app.store)? {
                     Some(prompt::secret("Current recovery passphrase: ")?)
@@ -207,8 +278,52 @@ mod cli {
                 app.store.audit("console", "directory.password", "");
                 println!("service account password verified and stored");
             }
-            _ => return Err("usage: set-secret recovery|directory <config.toml>".into()),
+            _ => {
+                return Err(
+                    "usage: set-secret recovery <config.toml> [--replace] | set-secret directory <config.toml>"
+                        .into(),
+                )
+            }
         }
+        Ok(())
+    }
+
+    /// Unlock a credential store moved here from another host, with the recovery passphrase.
+    pub fn unlock(args: &[String]) -> Result {
+        let app = app(args.first())?;
+        if app.vault.is_unlocked() {
+            println!("the credential store is already unlocked on this host");
+            return Ok(());
+        }
+        let pass = passphrase(args)?;
+        app.vault.adopt(&app.store, &pass)?;
+        app.store.audit("console", "vault.unlock", "");
+        println!("credential store unlocked for this host");
+        Ok(())
+    }
+
+    /// Start the credential store over when nothing can open it. Deletes every saved credential and
+    /// the directory service account's password.
+    pub fn reset_credentials(args: &[String]) -> Result {
+        let app = app(args.first())?;
+        println!(
+            "This deletes every saved credential ({}) and the directory service account's password, and starts the credential store over.",
+            app.store.counts()?.credentials
+        );
+        let typed = prompt::line(&format!(
+            "Type this host's name, {}, to confirm: ",
+            app.host_name
+        ))?;
+        if !typed.trim().eq_ignore_ascii_case(&app.host_name) {
+            return Err("the host name did not match; nothing was changed".into());
+        }
+        let removed = app.reset_credential_store()?;
+        app.store.audit(
+            "console",
+            "vault.reset",
+            &format!("{removed} saved credential(s) deleted"),
+        );
+        println!("credential store reset; {removed} saved credential(s) deleted. Set a recovery passphrase next.");
         Ok(())
     }
 
@@ -243,8 +358,45 @@ mod cli {
         Ok(())
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// An export that is not a readable archive never replaces the one already there, and
+        /// leaves no partial file behind; a good one replaces it.
+        #[test]
+        fn a_failed_export_keeps_the_previous_one() {
+            let dir = std::env::temp_dir().join(format!(
+                "web-access-cli-export-{}",
+                &crate::auth::random_token()[..12]
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let out = dir.join("nightly.zip").to_string_lossy().into_owned();
+            let blob = b"ciphertext".to_vec();
+            std::fs::write(&out, b"last night's export").unwrap();
+
+            assert!(write_export(&out, b"half a zip").is_err());
+            assert_eq!(std::fs::read(&out).unwrap(), b"last night's export");
+            assert!(!std::path::Path::new(&format!("{out}.part")).exists());
+
+            let good = migrate::build_zip(&migrate::test_manifest(&blob), &blob).unwrap();
+            write_export(&out, &good).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), good);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     mod prompt {
         use std::io::{BufRead, Write};
+
+        /// Read a line from the console, echoed.
+        pub fn line(label: &str) -> std::io::Result<String> {
+            print!("{label}");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+        }
 
         /// Read a line from the console without echoing it where the platform allows.
         pub fn secret(label: &str) -> std::io::Result<String> {

@@ -224,6 +224,29 @@ impl Vault {
         Ok(())
     }
 
+    /// Replace the recovery passphrase without the current one, for one that was lost. It needs the
+    /// key this process already holds through the local wrap, so it gives nothing that a local
+    /// administrator of this host did not already have.
+    pub fn replace_recovery(&self, store: &Store, new: &str) -> Result<()> {
+        let key = self.key()?;
+        check_strength(new)?;
+        store.meta_set(META_RECOVERY, &wrap_recovery(&key, new)?)?;
+        Ok(())
+    }
+
+    /// Start the credential store over, for a store nothing can open: a new master key wrapped for
+    /// this host, no recovery passphrase, and every saved credential and each of `also_forget`
+    /// deleted, since they were sealed under the old key. Returns how many saved credentials went.
+    pub fn reset(&self, store: &Store, also_forget: &[&str]) -> Result<usize> {
+        let key = random_key()?;
+        let wrapped = self.protector.protect(&key)?;
+        let mut forget = vec![META_RECOVERY];
+        forget.extend_from_slice(also_forget);
+        let removed = store.replace_secrets(&forget, (META_LOCAL, &wrapped))?;
+        self.install(key);
+        Ok(removed)
+    }
+
     /// Confirm a passphrase opens this database's recovery wrap.
     pub fn verify_recovery(store: &Store, passphrase: &str) -> Result<[u8; KEY_LEN]> {
         let blob = store
@@ -559,6 +582,77 @@ mod tests {
             .unwrap();
         assert!(Vault::verify_recovery(&store, "second passphrase").is_ok());
         assert_eq!(v.open(b"a", &nonce, &ct).unwrap(), b"secret");
+    }
+
+    /// A lost passphrase is replaced with the key this host holds, and the credentials stay
+    /// readable; a locked store has no key to do it with.
+    #[test]
+    fn a_lost_passphrase_is_replaced_without_the_old_one() {
+        let store = Store::open_in_memory().unwrap();
+        let v = vault_with(&store, [7; KEY_LEN]);
+        let (nonce, ct) = v.seal(b"a", b"secret").unwrap();
+        v.set_recovery(&store, None, "a passphrase nobody wrote down")
+            .unwrap();
+        v.replace_recovery(&store, "the replacement passphrase")
+            .unwrap();
+        assert!(Vault::verify_recovery(&store, "the replacement passphrase").is_ok());
+        assert!(Vault::verify_recovery(&store, "a passphrase nobody wrote down").is_err());
+        assert_eq!(v.open(b"a", &nonce, &ct).unwrap(), b"secret");
+        assert!(matches!(
+            v.replace_recovery(&store, "short"),
+            Err(VaultError::Weak)
+        ));
+
+        let elsewhere = vault_with(&store, [9; KEY_LEN]);
+        assert!(!elsewhere.is_unlocked());
+        assert!(matches!(
+            elsewhere.replace_recovery(&store, "another replacement"),
+            Err(VaultError::Locked)
+        ));
+    }
+
+    /// A store nothing can open starts over: unlocked under a new key, no recovery passphrase, its
+    /// saved credentials and the named secrets gone, and it stays unlocked on the next start.
+    #[test]
+    fn a_locked_store_with_no_way_in_starts_over() {
+        let store = Store::open_in_memory().unwrap();
+        let first = vault_with(&store, [1; KEY_LEN]);
+        first
+            .set_recovery(&store, None, "a lost passphrase!!")
+            .unwrap();
+        store.meta_set("directory_password", b"sealed").unwrap();
+        let user = store.user_create("alice", None).unwrap();
+        let server = store.server_create("hist-01", "h", 3389, None).unwrap();
+        let (nonce, ct) = first.seal(b"aad", b"pw").unwrap();
+        store
+            .credential_put(
+                user,
+                server,
+                &crate::store::StoredCredential {
+                    username: "alice".into(),
+                    domain: None,
+                    nonce,
+                    secret: ct,
+                },
+            )
+            .unwrap();
+
+        let here = vault_with(&store, [2; KEY_LEN]);
+        assert!(!here.is_unlocked());
+        assert_eq!(here.reset(&store, &["directory_password"]).unwrap(), 1);
+        assert!(here.is_unlocked());
+        assert!(!Vault::recovery_set(&store).unwrap());
+        assert!(store.meta_get("directory_password").unwrap().is_none());
+        assert_eq!(store.counts().unwrap().credentials, 0);
+        assert_eq!(
+            store.counts().unwrap().users,
+            1,
+            "a user went with the credentials"
+        );
+        assert!(
+            vault_with(&store, [2; KEY_LEN]).is_unlocked(),
+            "the new key was not kept"
+        );
     }
 
     #[test]
