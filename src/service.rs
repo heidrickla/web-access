@@ -123,3 +123,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     outcome
 }
+
+#[cfg(all(test, target_env = "msvc"))]
+mod tests {
+    /// A server without the Visual C++ Redistributable cannot load a binary that imports its
+    /// runtime: the service times out at start and `--version` exits 0xC0000135. The test binary
+    /// is built with the same flags as the proxy, so its imports stand for the proxy's.
+    #[test]
+    fn the_c_runtime_is_linked_statically() {
+        let exe = std::fs::read(std::env::current_exe().expect("the test binary's path"))
+            .expect("the test binary");
+        let dlls = imported_dlls(&exe);
+        assert!(
+            dlls.iter().any(|d| d == "kernel32.dll"),
+            "the import table was not read: {dlls:?}"
+        );
+        for dll in &dlls {
+            let runtime = dll.starts_with("vcruntime")
+                || dll.starts_with("msvcp")
+                || dll.starts_with("api-ms-win-crt-");
+            assert!(!runtime, "the binary imports {dll}");
+        }
+    }
+
+    /// The DLL names in a PE32+ image's import directory, lowercased. The runtime linked in
+    /// carries the string "vcruntime140.dll" as data, so only the import table answers this.
+    fn imported_dlls(pe: &[u8]) -> Vec<String> {
+        let u16_at = |o: usize| u16::from_le_bytes([pe[o], pe[o + 1]]) as usize;
+        let u32_at = |o: usize| u32::from_le_bytes(pe[o..o + 4].try_into().unwrap()) as usize;
+        let header = u32_at(0x3c);
+        let sections = u16_at(header + 6);
+        let optional = header + 24;
+        assert_eq!(u16_at(optional), 0x20b, "not a PE32+ image");
+        let imports = u32_at(optional + 120);
+        let table = optional + u16_at(header + 20);
+        let offset = |rva: usize| {
+            (0..sections)
+                .map(|i| table + i * 40)
+                .find(|&s| (u32_at(s + 12)..u32_at(s + 12) + u32_at(s + 16)).contains(&rva))
+                .map(|s| rva - u32_at(s + 12) + u32_at(s + 20))
+                .expect("an RVA inside a section")
+        };
+        let mut dlls = Vec::new();
+        let mut descriptor = offset(imports);
+        while u32_at(descriptor + 12) != 0 {
+            let name = &pe[offset(u32_at(descriptor + 12))..];
+            let end = name
+                .iter()
+                .position(|&b| b == 0)
+                .expect("a terminated name");
+            dlls.push(String::from_utf8_lossy(&name[..end]).to_ascii_lowercase());
+            descriptor += 20;
+        }
+        dlls
+    }
+}

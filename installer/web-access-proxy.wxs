@@ -58,7 +58,10 @@
     </StandardDirectory>
 
     <ComponentGroup Id="Payload">
-      <Component Id="ProxyExe" Directory="INSTALLFOLDER" Guid="a1d2f3b4-5c6d-4e7f-8a90-b1c2d3e4f501">
+      <!-- 32-bit, as 0.2.0 registered this GUID. A 64-bit component with the same GUID counts as
+           installed elsewhere, so removing 0.2.0 after the upgrade deleted the new exe and its
+           firewall rule. Shared, the old product's removal leaves both in place. -->
+      <Component Id="ProxyExe" Directory="INSTALLFOLDER" Guid="a1d2f3b4-5c6d-4e7f-8a90-b1c2d3e4f501" Bitness="always32">
         <File Id="web_access_proxy.exe" Source="payload\web-access-proxy.exe" KeyPath="yes" />
 
         <!-- LocalService, not LocalSystem. The proxy opens sockets and reads and writes its data

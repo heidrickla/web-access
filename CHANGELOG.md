@@ -36,6 +36,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - A command-line export is written beside its target, read back and renamed over it.
 - The newest five import backups are kept; temporary files an interrupted export or import left are removed at service start.
 - The installer builds the proxy itself and takes its version from `Cargo.toml`.
+- The MSI is a 64-bit package, and the proxy is built with the MSVC toolchain with the C runtime linked in, so no Visual C++ Redistributable is needed.
 - The page names why a server could not be reached (unknown name, refused, timed out, unreachable) or why its certificate was refused (untrusted issuer, expired, revoked).
 - Active Directory refusals are named once the password is proven: password expired or must change, restricted hours or workstation, disabled, expired. A lockout is logged and reported as an ordinary refusal.
 - Shortcuts reach the remote by key position, so Ctrl+C is Ctrl+C whatever the layouts. Lock keys are synchronised when the desktop takes focus, and fullscreen captures Esc and Windows-key shortcuts.
@@ -58,7 +59,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 
 ### Fixed
 
-- From 0.3.0 on, an upgrade or an uninstall does not delete `config.toml`: the old version is removed after the new one is installed, and the config is kept on uninstall. Upgrading from 0.2 or earlier needs it copied aside first (README).
+- An upgrade or an uninstall does not delete `config.toml`, including the upgrade from 0.2: the old version is removed after the new one is installed, and the config is kept on uninstall.
 - The firewall exception is scoped to `web-access-proxy.exe`; it had no program, so it admitted every inbound TCP port from its remote addresses.
 - A failed service start during an upgrade no longer fails the upgrade, a failed upgrade leaves the old version installed, and a rebuild of the same version upgrades in place.
 - `REMOTE_ADDRESSES` is kept on uninstall, so a reinstall or a rollback keeps the same firewall scope.
