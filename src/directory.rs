@@ -189,6 +189,29 @@ pub fn sid_to_string(bytes: &[u8]) -> Option<String> {
     Some(s)
 }
 
+/// An LDAP filter value matching a `S-1-5-21-...` SID in its binary form, each byte escaped;
+/// None for anything that is not one.
+pub fn sid_filter(sid: &str) -> Option<String> {
+    let mut parts = sid.strip_prefix("S-")?.split('-');
+    let revision: u8 = parts.next()?.parse().ok()?;
+    let authority: u64 = parts.next()?.parse().ok()?;
+    if authority >= 1 << 48 {
+        return None;
+    }
+    let subs = parts
+        .map(|p| p.parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    if subs.is_empty() || subs.len() > 15 {
+        return None;
+    }
+    let mut bytes = vec![revision, subs.len() as u8];
+    bytes.extend_from_slice(&authority.to_be_bytes()[2..]);
+    for s in subs {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    Some(bytes.iter().map(|b| format!("\\{b:02x}")).collect())
+}
+
 /// `accountExpires` is a FILETIME: 100 ns ticks since 1601. Zero and the maximum mean never.
 fn expired(account_expires: Option<i64>, now_unix: i64) -> bool {
     match account_expires {
@@ -279,14 +302,17 @@ impl Directory {
     }
 
     /// The name a sign-in binds as: exactly what was typed when it names a domain, so an
-    /// email-style sign-in name reaches its own account, and otherwise the configured form.
+    /// email-style sign-in name reaches its own account, and otherwise the configured form. As
+    /// typed only with `netbios` set: that is what the domain WhoAmI reports is checked against,
+    /// and without the check another domain's `jsmith` would sign in as this domain's.
     fn sign_in_name(&self, typed: &str) -> Option<String> {
         let typed = typed.trim();
         let short = normalize_username(typed)?;
         if typed.len() > 256 || typed.chars().any(char::is_control) {
             return None;
         }
-        Some(if typed.contains('@') || typed.contains('\\') {
+        let names_a_domain = typed.contains('@') || typed.contains('\\');
+        Some(if names_a_domain && self.cfg.netbios.is_some() {
             typed.to_owned()
         } else {
             self.bind_name(&short)
@@ -368,12 +394,35 @@ impl Directory {
             "(&(objectCategory=person)(objectClass=user)(sAMAccountName={}))",
             escape_filter(username)
         );
+        self.find_by(ldap, &filter, username).await
+    }
+
+    /// The account with this SID, whatever it is called now: a rename in the directory keeps
+    /// the SID, so an account checked by SID is not mistaken for a deleted one.
+    async fn find_sid(
+        &self,
+        ldap: &mut Ldap,
+        sid: &str,
+        username: &str,
+    ) -> Result<Option<Account>> {
+        let value =
+            sid_filter(sid).ok_or_else(|| DirError::Protocol(format!("{sid} is not a SID")))?;
+        let filter = format!("(&(objectCategory=person)(objectClass=user)(objectSid={value}))");
+        self.find_by(ldap, &filter, username).await
+    }
+
+    async fn find_by(
+        &self,
+        ldap: &mut Ldap,
+        filter: &str,
+        username: &str,
+    ) -> Result<Option<Account>> {
         let (entries, _) = ldap
             .with_timeout(self.timeout())
             .search(
                 &self.base_dn,
                 Scope::Subtree,
-                &filter,
+                filter,
                 vec![
                     "objectSid",
                     "sAMAccountName",
@@ -449,19 +498,22 @@ impl Directory {
         service_password: &str,
         usernames: &[String],
     ) -> Result<Vec<(String, Option<Account>)>> {
-        self.lookup_each(service_password, usernames)
+        let by_name: Vec<(String, Option<String>)> =
+            usernames.iter().map(|n| (n.clone(), None)).collect();
+        self.lookup_each(service_password, &by_name)
             .await?
             .into_iter()
             .map(|(name, found)| found.map(|a| (name, a)))
             .collect()
     }
 
-    /// As `lookup_many`, but a lookup that fails fails only its own account: one unreadable entry
+    /// As `lookup_many`, for `(username, SID)` pairs: an account with a SID is found by it, one
+    /// without by name. A lookup that fails fails only its own account: one unreadable entry
     /// does not stop the checks of everyone else. Connecting and binding still fail the call.
     pub async fn lookup_each(
         &self,
         service_password: &str,
-        usernames: &[String],
+        accounts: &[(String, Option<String>)],
     ) -> Result<Vec<(String, Result<Option<Account>>)>> {
         let service = self
             .cfg
@@ -483,9 +535,13 @@ impl Directory {
                     )),
                     other => other,
                 })?;
-            let mut out = Vec::with_capacity(usernames.len());
-            for name in usernames {
-                out.push((name.clone(), self.find(&mut ldap, name).await));
+            let mut out = Vec::with_capacity(accounts.len());
+            for (name, sid) in accounts {
+                let found = match sid {
+                    Some(sid) => self.find_sid(&mut ldap, sid, name).await,
+                    None => self.find(&mut ldap, name).await,
+                };
+                out.push((name.clone(), found));
             }
             Ok(out)
         }
@@ -552,6 +608,22 @@ mod tests {
             text.push_str(&format!("netbios = \"{nb}\"\n"));
         }
         toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn a_sid_becomes_the_filter_for_its_binary_form() {
+        let sid = "S-1-5-21-3623811015-3361044348-30300820-1013";
+        let filter = sid_filter(sid).unwrap();
+        let bytes: Vec<u8> = filter
+            .split('\\')
+            .skip(1)
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        assert_eq!(sid_to_string(&bytes).as_deref(), Some(sid));
+        assert!(filter.starts_with("\\01\\05\\00\\00\\00\\00\\00\\05\\15\\00\\00\\00"));
+        for bad in ["local:abc", "S-1-5", "S-1-x-21", "S-1-5-21-99999999999", ""] {
+            assert_eq!(sid_filter(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -622,6 +694,16 @@ mod tests {
         let bare = Directory::unconnected(&config(None));
         assert_eq!(
             bare.sign_in_name("jdoe").as_deref(),
+            Some("jdoe@corp.example.com")
+        );
+        // Without netbios nothing checks the domain WhoAmI reports, so a name from another
+        // domain is bound in this one.
+        assert_eq!(
+            bare.sign_in_name("EMEA\\jdoe").as_deref(),
+            Some("jdoe@corp.example.com")
+        );
+        assert_eq!(
+            bare.sign_in_name("jdoe@emea.example.com").as_deref(),
             Some("jdoe@corp.example.com")
         );
     }

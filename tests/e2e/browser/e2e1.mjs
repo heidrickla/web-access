@@ -160,7 +160,11 @@ try {
     await route.continue();
   });
   await admin.page.fill('#new-username', 'gone');
+  // Adding asks first, because the pane will move to the new user; the administrator discards.
+  let asked = '';
+  admin.page.once('dialog', d => { asked = d.message(); d.accept(); });
   await admin.page.click('#add-user button[type=submit]');
+  check('Add User asks before discarding the unsaved change', asked.includes('Discard the unsaved changes to jdoe'), `asked=${asked}`);
   await admin.page.waitForFunction(() => document.querySelector('#status')?.textContent.includes('user added'), null, { timeout: 5000 }).catch(() => {});
   check('Save is unusable while the list refreshes after Add User', await admin.page.isDisabled('#ud-save'));
   await admin.page.waitForFunction(() => document.querySelector('#ud-title')?.textContent.includes('gone'), null, { timeout: 5000 }).catch(() => {});

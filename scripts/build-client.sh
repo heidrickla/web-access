@@ -25,7 +25,7 @@ sed 's/^targets = .*/targets = ["wasm32-unknown-unknown"]/' "$repo/about.toml" >
 cargo about generate --manifest-path Cargo.toml -c "$work/about-client.toml" "$repo/about.hbs" > "$work/notices.part"
 sed -e "s|@TITLE@|Third-party licences: the browser client|" \
     -e "s|@INTRO@|The crates the RDP client in the page is built from: IronRDP $IRONRDP_COMMIT.|" \
-    -e "s|@OTHER_HREF@|./notices|" \
+    -e "s|@OTHER_HREF@|./notices.html|" \
     -e "s|@OTHER_LABEL@|The proxy's licences|" \
     "$work/notices.part" | tr -d '\r' > "$repo/web/notices-client.html"
 

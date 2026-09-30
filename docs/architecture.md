@@ -30,13 +30,14 @@ Their feature limits (no audio, a 500 KB text-only clipboard, PDF-only printing,
 
 ## What is reused
 
-Upstream is `Devolutions/IronRDP`, Apache-2.0.
+Upstream is `Devolutions/IronRDP`, MIT OR Apache-2.0.
 
 | Crate | Role |
 |---|---|
 | `ironrdp-web` | the WASM browser build; the client half, served by the proxy |
 | `ironrdp-rdcleanpath` | the protocol between browser and proxy; the only IronRDP crate the proxy links |
-| `ironrdp-rdpsnd`, `ironrdp-rdpdr`, `ironrdp-cliprdr` | audio, drives, clipboard in the client, available if wanted |
+| `ironrdp-cliprdr` | clipboard text and files in the client, in use |
+| `ironrdp-rdpsnd`, `ironrdp-rdpdr` | audio and drives in the client, available if wanted |
 
 The proxy's own transport is tokio, `tokio-rustls` for TLS to the target and on the listener, and `tokio-tungstenite` for the WebSocket. Devolutions Gateway is the reference implementation of the proxy half.
 
@@ -86,13 +87,13 @@ With no agents, nothing outside the proxy constrains which hosts it opens a sock
 
 ### Sign-in and sessions
 
-- A password sign-in is an LDAPS simple bind as the user. A name with a domain in it (`CORP\jdoe`, `john.doe@example.com`) is bound exactly as typed; a bare name binds as `NETBIOS\name`, or `name@domain` without `netbios`. An empty password is refused before the bind: LDAP treats it as an anonymous bind.
+- A password sign-in is an LDAPS simple bind as the user. With `netbios` set, a name with a domain in it (`CORP\jdoe`, `john.doe@example.com`) is bound exactly as typed and a bare name as `NETBIOS\name`. Without `netbios`, every name binds as `name@domain`: nothing would check the domain of a name bound as typed, so another domain's `jdoe` could sign in as this one's. An empty password is refused before the bind: LDAP treats it as an anonymous bind.
 - After the bind, LDAP WhoAmI names the account the password was checked for, and that account is the one signed in. With `netbios` set, an account in another domain is refused.
 - Active Directory refuses the bind for a disabled, expired, locked or restricted account, or one whose password must change. The `data <code>` in its answer is read: codes it returns only for the right password (532, 773, 530, 531, 533, 701) are named to the user; a lockout (775) is returned whatever password was typed, so it is logged and reported as an ordinary refusal.
 - A sign-in finds its row by username, then by SID, so an account renamed in the directory keeps its row, servers and saved credentials. The SID is bound at first sign-in; a different account arriving under a bound username is refused and flagged to administrators, so a reused username inherits nothing.
 - The session is a random token in an `HttpOnly; SameSite=Strict` cookie, persistent for 24 hours. The database keeps its SHA-256, so sessions survive a service restart and move with an export. `/api/me` reports the seconds left, counted on the proxy.
 - With a service account configured, signed-in accounts are re-checked every `check_interval_secs`. An account that is disabled, expired, gone or re-created loses its sessions and its live RDP connections. A lookup that fails skips that account only; a pass that cannot run revokes nothing. The last pass's outcome is kept for the Migration tab, and the Activity log records when checks start failing and when they recover. The domain controller that last answered is tried first.
-- A click mints a connect ticket: 60 seconds, single use, bound to the user and the server. The WebSocket must also carry the session cookie of the same user and a same-origin `Origin`. The browser takes its ticket after the credentials dialog closes, immediately before connecting.
+- A click mints a connect ticket: 60 seconds, single use, bound to the user and the server. The WebSocket must carry the session cookie of the same user and a same-origin `Origin`; the ticket travels in the RDCleanPath request and is checked with the cookie and the assignment at admission. The browser takes its ticket after the credentials dialog closes, immediately before connecting.
 - A connection is registered at upgrade, before anything is read, and belongs to the sign-in it was opened under. Admission re-checks that sign-in, the ticket and the assignment. Revocation, sign-out, the sign-in expiring, the assignment or server being removed, or an import ends it at any stage, setting up or established. Each setup stage has a deadline.
 
 ### Imports and freezes
@@ -109,7 +110,7 @@ Requests hold a shared gate; an import and a freezing export hold it exclusively
 | Exports run one at a time. One that fails, or whose archive is not delivered, lifts only a freeze it set, and only in the database it set it in | a failed export cannot undo another export's freeze |
 | A connection records the database generation it was admitted under. Its opening and its end are recorded only in that database | identities from a replaced database never land on another user's history |
 | User, server and group ids are never reused (`AUTOINCREMENT`, schemas 4 and 5) | an id kept anywhere, in a session, a live connection or an admin page, names that row or nothing |
-| Every response carries `X-Data-Instance`, a value an import changes. A change must carry the instance the page loaded from, except sign-out and the routes under `/api/admin/migration/` (recovery passphrase, unlock, reset, export, freeze, import), which act on the database as a whole rather than on rows by id. A page that sees another instance reloads | an import brings back the ids its archive had, so a page loaded before it cannot act on rows that took them since |
+| Every response from a handler carries `X-Data-Instance`, a value an import changes; the refusals before one (cross-origin, too large, too slow) do not. A change must carry the instance the page loaded from, except sign-out, sign-in, Add User and the directory password, which name no row by id, and the routes under `/api/admin/migration/` (recovery passphrase, unlock, reset, export, unfreeze, import), which act on the database as a whole. A page that sees another instance reloads | an import brings back the ids its archive had, so a page loaded before it cannot act on rows that took them since |
 | An account is bound to the directory SID of its first sign-in, and the binding is written only if the row is unbound or bound to that SID | two first sign-ins from different directory accounts cannot share one row |
 | Each user and server row carries a random incarnation set on insert. A sign-in records its login and creates its session only on the row it authenticated, by id and incarnation; a connection's end is written only if its user and server rows still carry the incarnations seen at admission | a row that ever arrived on an old id would still be told apart |
 | The serving process reads its configuration once, locks `serving.lock` in that data directory before it builds its runtime or opens the database, and releases it after the runtime has shut down and its blocking work has finished. A second serving process on the same data directory is refused; command-line tools do not take the lock | one database has one server, the directory locked is the directory served, and no second process settles state the first is still using |
@@ -169,7 +170,7 @@ An export is a zip holding `manifest.json` (format, schema, source host, time, c
 
 Import checks the manifest and checksum, decrypts, opens the result (migrating an older schema forward, refusing a newer one), runs SQLite's integrity check, re-wraps the master key for this host, backs up the current database, and swaps the file in while running. A host holding data needs its own name typed to confirm.
 
-"Export and freeze" leaves the old host carrying sign-ins and sessions while refusing saves and admin edits, so nothing made after the export is lost at cutover.
+"Export and freeze" leaves the old host signing users in and carrying sessions while refusing saved credentials and admin edits, so none of those made after the export is lost at cutover. Sign-ins and activity on the old host after the export stay in its database.
 
 ### What pass-through makes true, for credentials that are not saved
 

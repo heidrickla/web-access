@@ -1,7 +1,7 @@
 name: checks
 
-# Runs on the forge's shared runner (capacity 1) and on GitHub. The forge has no Windows runner, so
-# the Windows job runs on GitHub only; on the forge the Windows cfg is covered by the local gates.
+# GitHub's copy. The forge runs .gitea/workflows/ci.yml, the Linux job alone, since it has no
+# Windows runner; there the Windows cfg is covered by the local gates.
 
 on:
   push:
@@ -50,7 +50,6 @@ jobs:
         run: cargo deny check
 
   windows:
-    if: github.server_url == 'https://github.com'
     runs-on: windows-latest
     env:
       CARGO_TERM_COLOR: never

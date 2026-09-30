@@ -12,7 +12,7 @@ Design record: `docs/architecture.md`.
 
 | Piece | Source | Notes |
 |---|---|---|
-| RDP client in the browser | `ironrdp-web`, Apache-2.0 | built to WASM and embedded in the proxy binary |
+| RDP client in the browser | `ironrdp-web`, MIT OR Apache-2.0 | built to WASM and embedded in the proxy binary |
 | RDCleanPath, both ends | `ironrdp-rdcleanpath` | reused |
 | Sign-in | `src/directory.rs` | LDAPS simple bind as the user; the proxy host need not be domain-joined |
 | Sessions and connect tickets | `src/auth.rs` | 24-hour persistent sign-in; single-use ticket per connection |
@@ -50,11 +50,11 @@ The account checks run every `check_interval_secs`. When they cannot run (no dom
 
 ## Moving to new hardware
 
-Everything moves in one zip: users, groups, servers, assignments, saved credentials and sign-in sessions. Users stay signed in across the cutover and keep their saved credentials.
+Everything moves in one zip: users, groups, servers, assignments, saved credentials and sign-in sessions. Users signed in before the export stay signed in across the cutover and keep their saved credentials.
 
 1. Install the MSI on the new host. Copy `config.toml`, the HTTPS certificate and key, and every CA bundle the config names (`[tls] ca_bundle`, `[directory] ca_bundle`), to the same paths.
 2. `Start-Service WebAccessProxy` on the new host and sign in there as one of the `admins`.
-3. Old host, Migration tab: enter the recovery passphrase, tick "Freeze", Export. The zip downloads. Frozen, the old host keeps carrying sessions but refuses changes, so nothing made after the export is lost.
+3. Old host, Migration tab: enter the recovery passphrase, tick "Freeze", Export. The zip downloads. Frozen, the old host keeps signing users in and carrying sessions but refuses saved credentials and admin changes, so none of those made after the export is lost. Sign-ins after the export exist only on the old host.
 4. New host, Migration tab: upload the zip, check the counts it shows, enter the passphrase, Import. A host that already holds data asks for its own name first, and keeps its database as a backup.
 5. Move the DNS name.
 
@@ -62,13 +62,13 @@ Everything moves in one zip: users, groups, servers, assignments, saved credenti
 
 An export is also the backup: importing last night's export restores a host. Each export opens only with the recovery passphrase that was set when it was made, so keep the passphrase history with the exports.
 
-For a scheduled backup, a task running as SYSTEM with the passphrase in a file only SYSTEM and Administrators can read:
+For a scheduled backup, a task running as SYSTEM with the passphrase in a file SYSTEM and Administrators can read (in the data directory, as below, LocalService can read it too):
 
     web-access-proxy.exe export C:\ProgramData\web-access\config.toml D:\Backups\web-access-nightly.zip --passphrase-file C:\ProgramData\web-access\backup-passphrase.txt
 
 The export is written beside the target, read back, and only then renamed over it, so a full disk or a dropped share keeps the previous night's file. Rotate the files with the task, for example by putting the date in the file name.
 
-An import keeps the database it replaces as `backup-<time>.db` in the data directory; the newest five are kept. A schema upgrade keeps the database as it was as `backup-schema<N>-<time>.db`. To restore either: stop the service, delete `web-access.db-wal` and `web-access.db-shm` if they are there, rename the backup to `web-access.db`, start the service. It carries this host's key, so it opens unlocked. The two files are the write-ahead log of the database being replaced; left beside a restored copy, they would be applied to it.
+An import keeps the database it replaces as `backup-<time>.db` in the data directory; the newest five are kept. A schema upgrade keeps the database as it was as `backup-schema<N>-<time>.db`. To restore either: stop the service, move `web-access.db`, `web-access.db-wal` and `web-access.db-shm` out of the data directory together, rename the backup to `web-access.db`, start the service. It carries this host's key, so it opens unlocked. The `-wal` and `-shm` files are the write-ahead log of the database being replaced; left beside a restored copy, they would be applied to it.
 
 ## The recovery passphrase
 
@@ -121,9 +121,9 @@ With `allow_local_accounts = true`, the `[directory]` section may be left out en
 | `audit_days` | days the activity log keeps an entry, default 400 |
 | `[https]` | `cert` (PEM, the server certificate first, then its chain) and `key` (PEM, unencrypted) |
 | `[tls]` | how RDP servers' certificates are checked: `verify = "ca"` with `ca_bundle`, or `"insecure"`. No default |
-| `[directory]` | `domain`; `netbios`; `urls` (ldaps only); optional `ca_bundle` (the Windows certificate store when omitted), `base_dn` (derived from `domain` when omitted), `service_account`, `check_interval_secs` (default 600) and `timeout_secs` (default 10). Optional when local accounts are allowed |
+| `[directory]` | `domain`; `urls` (ldaps only); optional `netbios`, `ca_bundle` (the Windows certificate store when omitted), `base_dn` (derived from `domain` when omitted), `service_account`, `check_interval_secs` (default 600) and `timeout_secs` (default 10). Optional when local accounts are allowed |
 
-Set `netbios` to the domain's NetBIOS name: the proxy then refuses a password accepted for an account in another domain. A sign-in name with a domain in it (`CORP\jdoe`, `john.doe@example.com`) is checked exactly as typed, and the account signed in is the one Active Directory says the password was checked for.
+Set `netbios` to the domain's NetBIOS name. A sign-in name with a domain in it (`CORP\jdoe`, `john.doe@example.com`) is then checked exactly as typed, a password accepted for an account in another domain is refused, and the account signed in is the one Active Directory says the password was checked for. Without `netbios`, every sign-in name binds as `name@domain`.
 
 ## HTTPS certificate
 
@@ -133,7 +133,7 @@ Set `netbios` to the domain's NetBIOS name: the proxy then refuses a password ac
     openssl pkcs12 -in proxy.pfx -cacerts -nokeys -out chain.pem
     openssl pkcs12 -in proxy.pfx -nocerts -nodes -out proxy-key.pem
 
-Append `chain.pem` to `proxy-cert.pem`. Keep the key file in the data directory, whose permissions admit only SYSTEM, Administrators and the service.
+Append `chain.pem` to `proxy-cert.pem`. Keep the key file in the data directory, whose permissions admit only SYSTEM, Administrators and LocalService, the account the service runs as.
 
 A renewal needs no restart: the files are read again within a minute of changing, and new connections get the new certificate. A pair that does not load (a key that does not match, a half-written file) is refused with an error in the log and the previous certificate stays in use. The log gives the certificate's expiry at start and at each reload, and warns once a day from 30 days before it. A browser that refuses the certificate shows in the log as `TLS handshake failed`, at most one line a minute.
 
@@ -185,7 +185,7 @@ CI (`.github/workflows/ci.yml`) runs format, lint, test, page scripts and depend
 - Users sign in with their Active Directory accounts; the proxy host is not domain-joined.
 - Each user's server list is maintained by hand on the proxy, per user.
 - Credentials pass through to the server unless the user saves them; saved ones are kept encrypted on the proxy, per user and per server, and move with an export.
-- Apache-2.0 upstream, so the licence question is closed.
+- MIT OR Apache-2.0 upstream, so the licence question is closed.
 
 ## Roadmap
 
@@ -212,13 +212,13 @@ It builds the proxy, takes the version from `Cargo.toml`, stamps the source revi
 | | |
 |---|---|
 | Installs | `%ProgramFiles%\web-access\web-access-proxy.exe`, config to `%ProgramData%\web-access\config.toml` |
-| Data directory | `%ProgramData%\web-access`: SYSTEM and Administrators full control, the service modify, no one else. Each install applies this list again. Kept on uninstall |
-| Config | never replaced by an install or an upgrade, and kept on uninstall |
+| Data directory | `%ProgramData%\web-access`: SYSTEM and Administrators full control, LocalService (the account the service runs as) modify, inherited by the files in it. Each install applies this list again. Kept on uninstall |
+| Config | never replaced by an install or an upgrade from 0.3.0 on, and kept on uninstall; from 0.2 or earlier, see Upgrading |
 | Service | `WebAccessProxy`, auto-start, running as `NT AUTHORITY\LocalService`, restarted a minute after the process ends unexpectedly |
 | Service arguments | `--service "[ProgramData]\web-access\config.toml"` |
 | First install | the service is not started: the config has to be written first |
-| Upgrade | the service is stopped, replaced and started again |
-| Firewall | one exception for the program, not a port, because the port comes from the config. Remote addresses from `REMOTE_ADDRESSES`: any by default, or a comma-separated list of addresses and subnets; remembered for upgrades |
+| Upgrade | the new version is installed, then the old one removed; the service is stopped, replaced and started again. A start that fails (a config still to be edited) is in the service log and does not fail the upgrade; an upgrade that fails leaves the old version installed |
+| Firewall | one exception for `web-access-proxy.exe`, not a port, because the port comes from the config. Remote addresses from `REMOTE_ADDRESSES`: any by default, or a comma-separated list of addresses and subnets; remembered for upgrades and kept on uninstall, so a reinstall uses it too |
 
 ### Installing
 
@@ -242,12 +242,12 @@ The service reports running only once it has read the config, opened the databas
 ### Upgrading
 
 1. On the Migration tab, export (or stop the service and copy `C:\ProgramData\web-access`).
-2. `msiexec /i web-access-proxy-<new version>.msi /qn /l*v upgrade.log`. The service is stopped, replaced and started again. A newer schema is applied at its first start, and the database as it was is kept as `backup-schema<N>-<time>.db`.
+2. `msiexec /i web-access-proxy-<new version>.msi /qn /l*v upgrade.log`. The new version is installed, the old one removed, and the service started again. A newer schema is applied at its first start, and the database as it was is kept as `backup-schema<N>-<time>.db`.
 3. Check the log for the `listening` line and the version on the Migration tab.
 
-To go back: uninstall, install the previous MSI, stop the service, delete `web-access.db-wal` and `web-access.db-shm` if they are there, rename the `backup-schema<N>-<time>.db` copy to `web-access.db`, and start the service. A database migrated by a newer version is refused by an older one.
+To go back: uninstall, install the previous MSI, stop the service, move `web-access.db`, `web-access.db-wal` and `web-access.db-shm` out of the data directory together, rename the `backup-schema<N>-<time>.db` copy to `web-access.db`, and start the service. A database migrated by a newer version is refused by an older one.
 
-Upgrading from 0.1: the `[[target]]` entries are imported once into an "Imported" group; `[[policy]]` is no longer read. Add `[directory]`, `admins` and `[https]` before starting the service.
+Upgrading from 0.2 or earlier: copy `config.toml` out of `C:\ProgramData\web-access` first, because those versions' packages delete it when the upgrade removes them. Put it back after the upgrade, then `Start-Service WebAccessProxy`. From 0.1, add `[directory]`, `admins` and `[https]` to the copy; its `[[target]]` entries are imported once into an "Imported" group, and `[[policy]]` is no longer read.
 
 WiX v5 specifically. v6 and v7 require accepting the Open Source Maintenance Fee EULA, which is a licensing decision with a fee attached for commercial use. v5 is the last version without that gate and uses the same schema. The Firewall and Util extensions must be version-pinned to match the toolset.
 
@@ -274,7 +274,7 @@ The client is built from a pinned IronRDP commit, and the build is reproducible:
 | `ironrdp_web_bg.wasm` | sha256 `e34898c6ba5cbc72bf4b313e5d8085b55ddb60bf65b55177b4f6632f2f090996` |
 | `ironrdp_web.js` | sha256 `00544efdca030a0284d66ba021743deb49c9277260034f80da7f7aeda89bde3f` |
 
-`scripts/build-client.sh` (Linux, with cargo-deny and cargo-about) clones that commit, checks the client's dependency graph against `deny.toml`, builds it, copies it into `web/`, and writes `web/notices-client.html`. `scripts/notices.sh` writes `web/notices.html` from this crate's graph; run it after changing dependencies.
+`scripts/build-client.sh` (Linux, with cargo-deny and cargo-about) clones that commit, checks the client's wasm32 dependency graph against `deny-client.toml`, builds it, copies it into `web/`, and writes `web/notices-client.html`. `scripts/notices.sh` writes `web/notices.html` from this crate's graph; run it after changing dependencies.
 
 Every page asset is a separate file: the proxy sends `default-src 'self'`, which forbids inline `<style>`, `<script>`, style attributes and event handlers. A test asserts no page carries one. All are embedded with `include_bytes!`, so a deployment is one MSI and one service, and the served client cannot drift from the proxy it talks to.
 
@@ -289,7 +289,7 @@ Errors: the proxy reports a server it could not reach as the Windows socket erro
 ## Conventions
 
 - No credential, host address or site detail belongs in this repository. It is a general tool and the network it might be deployed into is not described here.
-- Upstream is `Devolutions/IronRDP`, Apache-2.0. Reuse the crates. Do not vendor a fork without writing down why, in `docs/architecture.md`.
+- Upstream is `Devolutions/IronRDP`, MIT OR Apache-2.0. Reuse the crates. Do not vendor a fork without writing down why, in `docs/architecture.md`.
 - Commit subjects are declarative sentences, no prefixes.
 - LF only.
 - Docs describe design, build and use. What is broken, missing, untested or weak goes stale within hours on a moving project, so it does not go in these files.

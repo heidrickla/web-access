@@ -126,6 +126,8 @@ async function showList() {
   $('who').textContent = me.display_name || me.username;
   $('admin-link').hidden = !me.is_admin;
   show('list');
+  // What was said before the list (signing in, the proxy unreachable) no longer applies.
+  saidAt = 0;
   await loadServers();
 }
 
@@ -366,6 +368,13 @@ function describe(err) {
   const kind = errorKind(err);
   if (kind === undefined) return err.message || String(err);
   const parts = [KIND_WORDS[kind] || 'the connection failed'];
+  if (KIND_WORDS[kind] === undefined) {
+    // The client names no kind for this one, so its own message is the reason.
+    try {
+      const first = String(err.backtrace()).split('\n')[0].trim();
+      if (first) parts.push(first.slice(0, 200));
+    } catch { /* no message */ }
+  }
   try {
     const d = typeof err.rdcleanpathDetails === 'function' ? err.rdcleanpathDetails() : null;
     if (d) {
@@ -422,6 +431,8 @@ function keyRoute(e) {
   if (SCANCODE[e.code] !== undefined) return ['scan', SCANCODE[e.code]];
   const altGr = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
   const shortcut = (e.ctrlKey || e.altKey || e.metaKey) && !altGr;
+  // A dead key composes the next character locally, and that character goes across as text.
+  if (!shortcut && e.key === 'Dead') return null;
   if ((shortcut || e.key.length !== 1) && POSITION[e.code] !== undefined) return ['scan', POSITION[e.code]];
   if (e.key.length === 1) return ['char', e.key];
   return null;
@@ -443,38 +454,33 @@ function setCursorStyle(kind, data, hotspotX, hotspotY) {
   }
 }
 
-// The remote is asked for a desktop the size of the viewport in device pixels, so every remote pixel
-// is one screen pixel. At 125 % or 150 % display scaling that is more pixels than CSS pixels, and
-// the remote is told the scale so its text stays the size the user expects.
+// A session starts at the viewport's CSS size, which every server honours. Once it runs, the remote
+// is asked for the viewport in device pixels with this display's scale, so at 125 % or 150 % every
+// remote pixel is one screen pixel and text keeps the size the user expects. The canvas has no size
+// of its own in CSS: it shows its bitmap at natural size, capped to the viewport (app.css), so a
+// bitmap in device pixels lands one to one, and a remote resize needs no callback.
 const scale = () => Math.max(1, window.devicePixelRatio || 1);
 
-function viewportSize() {
-  return new DesktopSize(
-    Math.max(640, Math.floor(window.innerWidth * scale())),
-    Math.max(480, Math.floor(window.innerHeight * scale())),
-  );
+function cssViewportSize() {
+  return new DesktopSize(Math.max(640, window.innerWidth), Math.max(480, window.innerHeight));
 }
 
-/// Ask the remote for the viewport's size and this display's scale.
+/// Ask the remote for the viewport in device pixels and this display's scale, 100 included, so a
+/// window moved from a scaled display back to an unscaled one is set back too.
 function fitRemote() {
   if (!session) return;
-  const size = viewportSize();
   const factor = Math.round(scale() * 100);
   try {
-    if (factor === 100) session.resize(size.width, size.height);
-    else session.resize(size.width, size.height, factor);
+    session.resize(
+      Math.max(640, Math.floor(window.innerWidth * scale())),
+      Math.max(480, Math.floor(window.innerHeight * scale())),
+      factor,
+    );
   } catch { /* the session may be closing */ }
 }
 
-/// Draw the canvas at its CSS size, so its device pixels land one to one on the screen's.
-function sizeCanvas(width, height) {
-  canvas.width = width;
-  canvas.height = height;
-  canvas.style.width = width / scale() + 'px';
-  canvas.style.height = height / scale() + 'px';
-}
-
 let resizeTimer = null;
+let fitTimers = [];
 function followWindowSize() {
   clearTimeout(resizeTimer);
   // Debounced: a drag-resize fires continuously and each call is a protocol round trip.
@@ -505,7 +511,10 @@ function sendCtrlAltDel() {
 function openRail(open) {
   $('rail').classList.toggle('open', open);
   $('rail-toggle').setAttribute('aria-expanded', String(open));
-  if (open) $('rail-toggle').classList.remove('attention');
+  if (open) {
+    $('rail-toggle').classList.remove('attention');
+    $('panel-info').textContent = $('panel-target').textContent + ' — ' + canvas.width + '×' + canvas.height;
+  }
 }
 
 $('rail-toggle').addEventListener('click', () => openRail(true));
@@ -520,6 +529,9 @@ $('send-cad').addEventListener('click', () => { sendCtrlAltDel(); openRail(false
 $('fullscreen').addEventListener('click', () => {
   if (document.fullscreenElement) document.exitFullscreen();
   else document.documentElement.requestFullscreen().catch(() => {});
+  // Or the next keystrokes land on this button, and Space turns fullscreen off again.
+  openRail(false);
+  canvas.focus();
 });
 $('panel-disconnect').addEventListener('click', () => endSession());
 window.addEventListener('resize', followWindowSize);
@@ -858,6 +870,8 @@ function renewSignIn() {
       $('renew-form').removeEventListener('submit', submit);
       $('renew-skip').removeEventListener('click', skip);
       dialog.removeEventListener('cancel', skip);
+      // A directory password typed and then skipped is never left sitting in the page.
+      $('renew-pass').value = '';
       if (dialog.open) dialog.close();
       resolve(renewed);
     };
@@ -956,7 +970,7 @@ async function runSession(server, ticket, creds) {
       .authToken(ticket)                // single use, minted for this user and this server
       .username(creds.username)
       .password(creds.password)
-      .desktopSize(viewportSize())
+      .desktopSize(cssViewportSize())
       .renderCanvas(canvas)
       .remoteClipboardChangedCallback(data => {
         try {
@@ -986,22 +1000,19 @@ async function runSession(server, ticket, creds) {
       // destination, proxyAddress, authToken, renderCanvas, setCursorStyleCallback and
       // setCursorStyleCallbackContext.
       .setCursorStyleCallback(setCursorStyle)
-      .setCursorStyleCallbackContext(window)
-      .canvasResizedCallback(() => {
-        if (!session) return;
-        const size = session.desktopSize();
-        if (!size) return;
-        sizeCanvas(size.width, size.height);
-        $('panel-info').textContent = server.name + ' — ' + size.width + '×' + size.height;
-      });
+      .setCursorStyleCallbackContext(window);
     if (creds.domain) builder.serverDomain(creds.domain);
 
     mine = await builder.connect();
     session = mine;
     outcome.connected = true;
-    const size = mine.desktopSize();
-    if (size) sizeCanvas(size.width, size.height);
-    if (scale() !== 1) fitRemote();
+    // A resize sent before the display channel is open is dropped, so the scale waits until the
+    // session has run a moment, and is asked once more if the bitmap has not changed by then.
+    if (scale() !== 1) {
+      const asked = canvas.width;
+      fitTimers.push(setTimeout(() => { if (session === mine) fitRemote(); }, 2000));
+      fitTimers.push(setTimeout(() => { if (session === mine && canvas.width === asked) fitRemote(); }, 6000));
+    }
 
     // Saved only once the server has accepted them, so a mistyped password is never kept.
     if (creds.save) {
@@ -1015,7 +1026,6 @@ async function runSession(server, ticket, creds) {
     document.body.classList.add('connected');
     $('rail').hidden = false;
     $('panel-target').textContent = server.name;
-    $('panel-info').textContent = server.name + ' — ' + canvas.width + '×' + canvas.height;
     canvas.focus();
     say('connected to ' + server.name);
 
@@ -1030,9 +1040,14 @@ async function runSession(server, ticket, creds) {
   } finally {
     creds.password = '';
     if (session === mine) {
+      for (const t of fitTimers.splice(0)) clearTimeout(t);
       document.body.classList.remove('connected');
       $('rail').hidden = true;
       openRail(false);
+      $('rail-toggle').classList.remove('attention');
+      // Fullscreen and its keyboard lock belong to the session.
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      else if (navigator.keyboard && typeof navigator.keyboard.unlock === 'function') navigator.keyboard.unlock();
       session = null;
       // Transfer state and clipboard text belong to the session.
       $('clip').value = '';

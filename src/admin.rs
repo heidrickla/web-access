@@ -1042,7 +1042,8 @@ async fn cancel_import(
     AdminToken(token): AdminToken,
     Path(upload): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let _shared = app.gate.read().await;
+    // The request already holds the gate shared (gate_requests); taking it again here would wait
+    // behind any writer queued meanwhile, which waits for this request.
     revalidate_admin(&app, &token)?;
     migrate::cancel(&app, &upload);
     Ok(StatusCode::NO_CONTENT)
@@ -1350,6 +1351,33 @@ mod tests {
         let (upload, _) = migrate::stage(&new, &exported.bytes).unwrap();
         let (_, cookie) = signed_in(&new, "boss");
         (new, upload, token_of(&cookie))
+    }
+
+    /// With a writer queued behind the request's own shared hold, a handler that took the gate
+    /// again would wait for a hold that waits for it, and every request after it would queue.
+    #[tokio::test]
+    async fn cancelling_an_upload_does_not_wait_on_the_gate_its_request_holds() {
+        let (app, upload, token) = staged_import();
+        let request_hold = app.gate.read().await;
+        let writer = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let _exclusive = app.gate.write().await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cancel_import(State(app.clone()), AdminToken(token), Path(upload.clone())),
+        )
+        .await;
+        assert!(
+            matches!(done, Ok(Ok(StatusCode::NO_CONTENT))),
+            "cancel waited on the gate"
+        );
+        assert!(!app.imports.lock().unwrap().contains_key(&upload));
+        drop(request_hold);
+        writer.await.unwrap();
     }
 
     /// An import must wait for requests in flight, so none straddles the database swap.
