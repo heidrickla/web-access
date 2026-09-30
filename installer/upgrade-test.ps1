@@ -24,8 +24,10 @@ function Products {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' |
         Get-ItemProperty | Where-Object { $_.DisplayName -like 'web-access*' })
 }
-function RuleFacts {
-    $r = @(Get-NetFirewallRule -DisplayName 'web-access proxy' -ErrorAction SilentlyContinue)
+# This version's rule, or with -Name '0.2' the rule 0.2 and earlier wrote.
+function RuleFacts([string]$Name = 'web-access RDP proxy') {
+    if ($Name -eq '0.2') { $Name = 'web-access proxy' }
+    $r = @(Get-NetFirewallRule -DisplayName $Name -ErrorAction SilentlyContinue)
     if ($r.Count -eq 0) { return 'no rule' }
     $a = $r[0] | Get-NetFirewallApplicationFilter
     $p = $r[0] | Get-NetFirewallPortFilter
@@ -66,7 +68,7 @@ Set-Content -Path $cfg -Value $good -Encoding ascii
 Start-Service WebAccessProxy -ErrorAction SilentlyContinue
 Check '0.2.0 runs with the test config' (Running 30)
 Check '0.2.0 answers on 8443' (Answers)
-Write-Output "INFO 0.2.0 rule: $(RuleFacts)"
+Write-Output "INFO 0.2.0 rule: $(RuleFacts 0.2)"
 
 # 2. The upgrade.
 $e = Msi '/i C:\wa\web-access-proxy-new-a.msi /qn /l*v C:\wa\02-upgrade.log'
@@ -81,6 +83,7 @@ Check 'one product is installed' ($pr.Count -eq 1) (($pr | ForEach-Object { $_.D
 $facts = RuleFacts
 Check 'one firewall rule, naming the exe' (($facts -like 'count=1 *') -and ($facts -like "*program=$exe *")) $facts
 Check 'the rule has no port and admits any address' (($facts -like '*localport=Any*') -and ($facts -like '*remote=Any*')) $facts
+Check "0.2.0's rule is gone" ((RuleFacts 0.2) -eq 'no rule') (RuleFacts 0.2)
 Check 'the notices and licence are installed' ((Test-Path 'C:\Program Files\web-access\notices.html') -and (Test-Path 'C:\Program Files\web-access\notices-client.html') -and (Test-Path 'C:\Program Files\web-access\LICENSE.txt'))
 
 # 3. A rebuild of the same version, over a config that no longer loads.
@@ -89,6 +92,8 @@ $e = Msi '/i C:\wa\web-access-proxy-new-b.msi /qn /l*v C:\wa\03-same-version.log
 Check 'a rebuild of the same version upgrades in place' ($e -eq 0) "exit $e"
 $pr = Products
 Check 'still one product' ($pr.Count -eq 1) (($pr | ForEach-Object { $_.PSChildName }) -join ',')
+$facts = RuleFacts
+Check 'the rule survives the removal of the version it replaced' (($facts -like 'count=1 *') -and ($facts -like "*program=$exe *")) $facts
 Check 'a failed start does not fail the upgrade' (($e -eq 0) -and -not (Running 15))
 Set-Content -Path $cfg -Value $good -Encoding ascii
 Start-Service WebAccessProxy -ErrorAction SilentlyContinue

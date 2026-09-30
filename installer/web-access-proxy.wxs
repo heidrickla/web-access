@@ -36,6 +36,15 @@
                   DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- The firewall extension deletes a rule by name whenever its component is removed, shared or
+         not, so an older version removed after the upgrade would delete the rule the new one had
+         just written. This version skips that while an upgrade removes it; a plain uninstall still
+         deletes the rule. 0.2 and earlier cannot skip it, so the rule has a name of its own. -->
+    <InstallExecuteSequence>
+      <Custom Action="override Wix5SchedFirewallExceptionsUninstall_$(sys.BUILDARCHSHORT)" Before="RemoveFiles"
+              Condition="VersionNT &gt;= 600 AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
     <!-- The firewall rule's remote addresses: given on the command line, else the value the last
          install recorded, else any. -->
     <Property Id="REMOTE_ADDRESSES" Secure="yes" />
@@ -59,8 +68,8 @@
 
     <ComponentGroup Id="Payload">
       <!-- 32-bit, as 0.2.0 registered this GUID. A 64-bit component with the same GUID counts as
-           installed elsewhere, so removing 0.2.0 after the upgrade deleted the new exe and its
-           firewall rule. Shared, the old product's removal leaves both in place. -->
+           installed elsewhere, so removing 0.2.0 after the upgrade deleted the new exe. Shared,
+           the old product's removal leaves it in place. -->
       <Component Id="ProxyExe" Directory="INSTALLFOLDER" Guid="a1d2f3b4-5c6d-4e7f-8a90-b1c2d3e4f501" Bitness="always32">
         <File Id="web_access_proxy.exe" Source="payload\web-access-proxy.exe" KeyPath="yes" />
 
@@ -102,7 +111,7 @@
              no program and admits every port. The remote addresses come from REMOTE_ADDRESSES, any
              by default, since users reach the proxy from other subnets. -->
         <fw:FirewallException Id="InboundWebSocket"
-                              Name="web-access proxy"
+                              Name="web-access RDP proxy"
                               Description="Inbound connections to the web-access RDP proxy"
                               File="web_access_proxy.exe"
                               Profile="all"
