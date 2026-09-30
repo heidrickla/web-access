@@ -1,9 +1,17 @@
 // The management plane. Served as a file: the CSP allows `script-src 'self'` only.
 
 const $ = id => document.getElementById(id);
+let saidAt = 0;
 const say = (text, bad = false) => {
   $('status').textContent = text;
   $('status').classList.toggle('bad', bad);
+  saidAt = Date.now();
+};
+// A loader's count. It does not replace a result or an error said in the last few seconds.
+const note = text => {
+  if (Date.now() - saidAt < 8000) return;
+  $('status').textContent = text;
+  $('status').classList.remove('bad');
 };
 
 /* ---- helpers ------------------------------------------------------------------------------ */
@@ -152,7 +160,7 @@ loaders.users = async () => {
     const [u] = await Promise.all([api('GET', '/api/admin/users'), loadCatalogue()]);
     users = u.users;
     renderUsers();
-    say(users.length + ' users');
+    note(users.length + ' users');
   } finally {
     if (mine === selection) detailBusy(false);
   }
@@ -165,6 +173,8 @@ loaders.users = async () => {
 function renderUsers() {
   const q = $('user-filter').value.trim().toLowerCase();
   const body = $('user-table').tBodies[0];
+  // A row had keyboard focus: give it back to the selected row once the rows are rebuilt.
+  const hadFocus = body.contains(document.activeElement);
   body.innerHTML = '';
   for (const u of users) {
     if (q && !(u.username + ' ' + (u.display_name || '')).toLowerCase().includes(q)) continue;
@@ -172,12 +182,24 @@ function renderUsers() {
     if (u.is_admin || u.bootstrap_admin) name.append(el('span', { class: 'tag good', text: 'admin' }));
     if (u.local) name.append(el('span', { class: 'tag', text: 'local' }));
     if (u.sid_mismatch) name.append(el('span', { class: 'tag warn', text: 'check account' }));
-    const tr = el('tr', { class: 'pick' + (u.id === selected ? ' selected' : ''), onclick: () => selectUser(u.id).catch(fail) },
+    const pick = () => selectUser(u.id).catch(fail);
+    const tr = el('tr', {
+      class: 'pick' + (u.id === selected ? ' selected' : ''),
+      tabindex: '0',
+      'aria-selected': String(u.id === selected),
+      onclick: pick,
+      onkeydown: e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        pick();
+      },
+    },
       name,
       el('td', { text: u.display_name || '' }),
       el('td', { class: 'num', text: String(u.servers) }),
       el('td', { text: when(u.last_login) }));
     body.append(tr);
+    if (hadFocus && u.id === selected) tr.focus();
   }
 }
 
@@ -360,7 +382,7 @@ loaders.servers = async () => {
   for (const g of groupList) sel.append(el('option', { value: String(g.id), text: g.name }));
   sel.value = keep;
   renderServers();
-  say(serverList.length + ' servers');
+  note(serverList.length + ' servers');
 };
 
 function groupName(id) {
@@ -466,7 +488,7 @@ $('csv-go').addEventListener('click', async () => {
 loaders.groups = async () => {
   await loadCatalogue();
   renderGroups();
-  say(groupList.length + ' groups');
+  note(groupList.length + ' groups');
 };
 
 function renderGroups() {
@@ -549,7 +571,7 @@ async function loadAudit() {
     oldest = e.id;
   }
   $('audit-more').disabled = r.entries.length < 100;
-  say(body.rows.length + ' entries');
+  note(body.rows.length + ' entries');
 }
 
 $('audit-more').addEventListener('click', () => loadAudit().catch(fail));
@@ -591,7 +613,7 @@ loaders.migration = async () => {
   $('directory-note').textContent = dir.service_account
     ? `Account ${dir.service_account}. Password ${password}. It lets the proxy check accounts when they are added, and end the sessions of accounts disabled in the directory.`
     : '';
-  say('migration');
+  note('migration');
 };
 
 $('recovery-form').addEventListener('submit', async ev => {
@@ -747,11 +769,15 @@ $('import-confirm').addEventListener('submit', async ev => {
 
 /* ---- start -------------------------------------------------------------------------------- */
 
-(async () => {
+async function start() {
   let me;
   try {
     me = await api('GET', '/api/me');
-  } catch {
+  } catch (err) {
+    // A 401 has already sent the page to the sign-in.
+    if (err.message === 'signed out') return;
+    say('the proxy could not be reached: ' + err.message + '; trying again', true);
+    setTimeout(start, 10000);
     return;
   }
   $('who').textContent = me.display_name || me.username;
@@ -764,4 +790,6 @@ $('import-confirm').addEventListener('submit', async ev => {
   try { await refreshBanner(); } catch (err) { fail(err); }
   const first = location.hash.slice(1);
   showTab(loaders[first] ? first : 'users');
-})();
+}
+
+start();

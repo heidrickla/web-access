@@ -229,15 +229,29 @@ impl Session<'_> {
             }
         };
 
+        // From here the user is admitted to this server, so a failure is told as it is.
         let addr = match timeout(NAME_RESOLUTION, resolve_one(&target.host, target.port)).await {
             Ok(Ok(a)) => a,
             Ok(Err(e)) => {
                 warn!(%peer, %subject, target = %target.name, error = %e, "resolution failed, failing closed");
-                return self.refuse(ws).await;
+                let pdu = match e {
+                    crate::resolve::ResolveError::Ambiguous { .. } => {
+                        RDCleanPathPdu::new_general_error()
+                    }
+                    _ => RDCleanPathPdu::new_wsa_error(WSAHOST_NOT_FOUND),
+                };
+                return self.fail(ws, pdu, SessionError::Refused).await;
             }
             Err(_) => {
                 warn!(%peer, %subject, target = %target.name, "resolution timed out, failing closed");
-                return self.refuse(ws).await;
+                let pdu = RDCleanPathPdu::new_wsa_error(WSAHOST_NOT_FOUND);
+                return self
+                    .fail(
+                        ws,
+                        pdu,
+                        SessionError::Timeout("resolving the server's name"),
+                    )
+                    .await;
             }
         };
 
@@ -252,28 +266,17 @@ impl Session<'_> {
             "opening session"
         );
 
-        // 3. X.224, in the clear, exactly as the client sent it.
-        let mut tcp = timeout(SERVER_CONNECT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| SessionError::Timeout("connecting to the server"))??;
-        let confirm = timeout(SERVER_HANDSHAKE, async {
-            tcp.write_all(x224.as_bytes()).await?;
-            read_tpkt(&mut tcp).await
-        })
-        .await
-        .map_err(|_| SessionError::Timeout("waiting for the server's X.224 confirm"))??;
-
-        // 4. TLS, performed here so the client does not have to. RDCleanPath exists to remove this
-        //    second encapsulation; the chain goes back to the client so it can still judge identity.
-        let server_name = rustls_pki_types::ServerName::try_from(target.host.clone())
-            .map_err(|e| SessionError::Tls(e.to_string()))?;
-        let tls = timeout(
-            SERVER_HANDSHAKE,
-            self.app.target_tls.connector.connect(server_name, tcp),
-        )
-        .await
-        .map_err(|_| SessionError::Timeout("in the TLS handshake with the server"))?
-        .map_err(|e| SessionError::Tls(e.to_string()))?;
+        // 3 and 4. X.224 in the clear, then TLS. A network failure goes back to the client as its
+        //    Windows socket error and a certificate refusal as its TLS alert, so the page can say
+        //    "server unreachable" instead of asking for a password again.
+        let (tls, confirm) = match self.reach(addr, x224.as_bytes(), &target.host).await {
+            Ok(reached) => reached,
+            Err(unreached) => {
+                let (pdu, e) = *unreached;
+                warn!(%peer, %subject, target = %target.name, %addr, error = %e, "could not reach the server");
+                return self.fail(ws, pdu, e).await;
+            }
+        };
 
         let chain: Vec<Vec<u8>> = tls
             .get_ref()
@@ -329,17 +332,142 @@ impl Session<'_> {
         }
     }
 
+    /// X.224, exactly as the client sent it, then TLS performed here so the client does not have
+    /// to: RDCleanPath exists to remove this second encapsulation, and the chain goes back to the
+    /// client so it can still judge identity. On failure, the error PDU the client should get.
+    async fn reach(
+        &self,
+        addr: SocketAddr,
+        x224: &[u8],
+        host: &str,
+    ) -> Result<(ServerTls, Vec<u8>), Unreached> {
+        let timed_out = |what| {
+            Box::new((
+                RDCleanPathPdu::new_wsa_error(WSAETIMEDOUT),
+                SessionError::Timeout(what),
+            ))
+        };
+        let mut tcp = match timeout(SERVER_CONNECT, TcpStream::connect(addr)).await {
+            Ok(Ok(tcp)) => tcp,
+            Ok(Err(e)) => return Err(Box::new((wsa_error(&e), e.into()))),
+            Err(_) => return Err(timed_out("connecting to the server")),
+        };
+        // Interactive traffic: an input event waits for nothing.
+        let _ = tcp.set_nodelay(true);
+        let confirm = match timeout(SERVER_HANDSHAKE, async {
+            tcp.write_all(x224).await?;
+            read_tpkt(&mut tcp).await
+        })
+        .await
+        {
+            Ok(Ok(confirm)) => confirm,
+            Ok(Err(e)) => return Err(Box::new((wsa_error(&e), e.into()))),
+            Err(_) => return Err(timed_out("waiting for the server's X.224 confirm")),
+        };
+        let server_name = rustls_pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
+            Box::new((
+                RDCleanPathPdu::new_general_error(),
+                SessionError::Tls(e.to_string()),
+            ))
+        })?;
+        match timeout(
+            SERVER_HANDSHAKE,
+            self.app.target_tls.connector.connect(server_name, tcp),
+        )
+        .await
+        {
+            Ok(Ok(tls)) => Ok((tls, confirm)),
+            Ok(Err(e)) => Err(Box::new((
+                RDCleanPathPdu::new_tls_error(tls_alert(&e)),
+                SessionError::Tls(e.to_string()),
+            ))),
+            Err(_) => Err(timed_out("in the TLS handshake with the server")),
+        }
+    }
+
     /// One refusal shape for every denial, so the client learns nothing from which one it hit.
-    async fn refuse<S>(&self, mut ws: WebSocketStream<S>) -> Result<(), SessionError>
+    async fn refuse<S>(&self, ws: WebSocketStream<S>) -> Result<(), SessionError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let err = RDCleanPathPdu::new_general_error();
-        if let Ok(der) = err.to_der() {
+        self.fail(
+            ws,
+            RDCleanPathPdu::new_general_error(),
+            SessionError::Refused,
+        )
+        .await
+    }
+
+    /// Tell the client why, close, and end with `error`.
+    async fn fail<S>(
+        &self,
+        mut ws: WebSocketStream<S>,
+        pdu: RDCleanPathPdu,
+        error: SessionError,
+    ) -> Result<(), SessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        if let Ok(der) = pdu.to_der() {
             let _ = ws.send(Message::Binary(der)).await;
         }
         let _ = ws.close(None).await;
-        Err(SessionError::Refused)
+        Err(error)
+    }
+}
+
+type ServerTls = tokio_rustls::client::TlsStream<TcpStream>;
+/// Why a server could not be reached: the PDU for the client and the error for the log.
+type Unreached = Box<(RDCleanPathPdu, SessionError)>;
+
+/// Windows socket error codes, which RDCleanPath carries and the browser client names.
+const WSAETIMEDOUT: u16 = 10060;
+const WSAECONNREFUSED: u16 = 10061;
+const WSAEHOSTUNREACH: u16 = 10065;
+const WSAENETUNREACH: u16 = 10051;
+const WSAECONNRESET: u16 = 10054;
+const WSAECONNABORTED: u16 = 10053;
+const WSAHOST_NOT_FOUND: u16 = 11001;
+
+/// The Windows socket error for a failure reaching a server; a general error for one that has no
+/// socket meaning.
+fn wsa_error(e: &std::io::Error) -> RDCleanPathPdu {
+    use std::io::ErrorKind;
+    let code = match e.kind() {
+        ErrorKind::ConnectionRefused => WSAECONNREFUSED,
+        ErrorKind::TimedOut => WSAETIMEDOUT,
+        ErrorKind::HostUnreachable => WSAEHOSTUNREACH,
+        ErrorKind::NetworkUnreachable => WSAENETUNREACH,
+        ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof => WSAECONNRESET,
+        ErrorKind::ConnectionAborted => WSAECONNABORTED,
+        _ => return RDCleanPathPdu::new_general_error(),
+    };
+    RDCleanPathPdu::new_wsa_error(code)
+}
+
+/// The TLS alert that names why the server's certificate or handshake was refused.
+fn tls_alert(e: &std::io::Error) -> u8 {
+    use rustls::CertificateError as C;
+    const HANDSHAKE_FAILURE: u8 = 40;
+    const BAD_CERTIFICATE: u8 = 42;
+    const CERTIFICATE_REVOKED: u8 = 44;
+    const CERTIFICATE_EXPIRED: u8 = 45;
+    const UNKNOWN_CA: u8 = 48;
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::InvalidCertificate(c)) => match c {
+            C::Expired
+            | C::ExpiredContext { .. }
+            | C::NotValidYet
+            | C::NotValidYetContext { .. } => CERTIFICATE_EXPIRED,
+            C::UnknownIssuer => UNKNOWN_CA,
+            C::Revoked => CERTIFICATE_REVOKED,
+            _ => BAD_CERTIFICATE,
+        },
+        Some(rustls::Error::AlertReceived(alert)) => u8::from(*alert),
+        _ => HANDSHAKE_FAILURE,
     }
 }
 
@@ -820,5 +948,76 @@ mod tests {
         let finished = timeout(Duration::from_secs(5), session.run(ws, ended)).await;
         assert!(finished.is_ok(), "the pending connection was not ended");
         assert_eq!(app.live.count(), 0);
+    }
+
+    fn wsa_of(pdu: &RDCleanPathPdu) -> Option<u16> {
+        pdu.error.as_ref().and_then(|e| e.wsa_last_error)
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_reported_as_wsaeconnrefused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let e = TcpStream::connect(addr).await.unwrap_err();
+        assert_eq!(wsa_of(&wsa_error(&e)), Some(WSAECONNREFUSED));
+        let other = std::io::Error::other("no socket meaning");
+        assert_eq!(wsa_of(&wsa_error(&other)), None);
+    }
+
+    /// A real handshake through tokio-rustls, so the test also proves the rustls error survives
+    /// the io::Error wrapping that `tls_alert` looks inside. The fixture is shaped like an RDP
+    /// server's self-signed certificate: CA:FALSE, server authentication.
+    #[tokio::test]
+    async fn a_certificate_from_an_unknown_issuer_is_reported_as_unknown_ca() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certs = CertificateDer::pem_slice_iter(
+            include_str!("../tests/fixtures/server-cert.pem").as_bytes(),
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(
+            include_str!("../tests/fixtures/server-key.pem").as_bytes(),
+        )
+        .unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(s).await;
+        });
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let Err(e) = TlsConnector::from(Arc::new(client))
+            .connect(name, tcp)
+            .await
+        else {
+            panic!("an untrusted certificate was accepted");
+        };
+        assert_eq!(tls_alert(&e), 48, "{e:?}");
+    }
+
+    #[test]
+    fn certificate_faults_and_server_alerts_keep_their_alert_codes() {
+        use rustls::{AlertDescription, CertificateError};
+        let wrap = |r: rustls::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, r);
+        let cert = |c| wrap(rustls::Error::InvalidCertificate(c));
+        assert_eq!(tls_alert(&cert(CertificateError::Expired)), 45);
+        assert_eq!(tls_alert(&cert(CertificateError::NotValidYet)), 45);
+        assert_eq!(tls_alert(&cert(CertificateError::Revoked)), 44);
+        assert_eq!(tls_alert(&cert(CertificateError::NotValidForName)), 42);
+        let alert = wrap(rustls::Error::AlertReceived(
+            AlertDescription::ProtocolVersion,
+        ));
+        assert_eq!(tls_alert(&alert), 70);
+        assert_eq!(tls_alert(&std::io::Error::other("reset")), 40);
     }
 }

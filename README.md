@@ -24,10 +24,10 @@ Design record: `docs/architecture.md`.
 
 ## Using it
 
-1. Browse to the proxy and sign in with a network account: `jdoe`, `CORP\jdoe` or the account's sign-in name such as `john.doe@example.com`. Closing the browser does not sign out; the sign-in lasts 24 hours.
+1. Browse to the proxy and sign in with a network account: `jdoe`, `CORP\jdoe` or the account's sign-in name such as `john.doe@example.com`. Closing the browser does not sign out; the sign-in lasts 24 hours. Opening a server with less than 18 hours left asks for the password again first.
 2. The server list shows the servers assigned to you, in the administrator's groups. Groups collapse and expand; the filter matches names and hosts.
 3. Click a server. Enter its credentials, and tick "Save credentials" to be connected in one click next time. Credentials are saved only after the server accepts them.
-4. The desktop fills the window. The rail at the left edge carries clipboard, file transfer, Ctrl+Alt+Del, fullscreen and Disconnect.
+4. The desktop fills the window. The rail at the left edge carries clipboard, file transfer, Ctrl+Alt+Del, fullscreen and Disconnect. Files dropped on the desktop go to the remote clipboard.
 5. Disconnecting, or closing the browser, leaves the desktop running on the server. The list marks it Reconnect; clicking the server again returns to the same desktop.
 
 The pages are dark by default; the button beside Sign out switches to a light theme, remembered per browser.
@@ -261,7 +261,9 @@ Every page asset is a separate file: the proxy sends `default-src 'self'`, which
 
 The client's API maps onto the proxy's design: `SessionBuilder.destination()` carries the server id, never an address, and `authToken()` carries the single-use connect ticket.
 
-Keyboard: printable keys go through `unicodePressed`, non-printable ones through a scancode table. A key in neither is dropped rather than guessed at.
+Keyboard: a character typed alone goes through `unicodePressed`, so the remote's layout does not matter. A shortcut (Ctrl, Alt or Meta held, without AltGr) and every non-printable key go by scancode from the key's position, and a key is released by the route that pressed it. Lock keys are synchronised on the first key after the desktop takes focus. Fullscreen requests keyboard lock, so Esc and Windows-key shortcuts reach the remote. A key in no table is dropped rather than guessed at.
+
+Errors: the proxy reports a server it could not reach as the Windows socket error and a refused certificate as its TLS alert, over RDCleanPath; the page names both. The proxy log carries the full reason.
 
 ## Conventions
 

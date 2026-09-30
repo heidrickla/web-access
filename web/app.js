@@ -1,13 +1,33 @@
 // Served as a file, not inlined: the proxy's Content-Security-Policy allows `script-src 'self'`.
 
-import init, { setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction, ClipboardData, Extension }
-  from './ironrdp_web.js';
+import init, {
+  setup, SessionBuilder, DesktopSize, DeviceEvent, InputTransaction, ClipboardData, Extension,
+  IronErrorKind, RotationUnit,
+} from './ironrdp_web.js';
 
 const $ = id => document.getElementById(id);
 const canvas = $('screen');
+
+// The status line, in the header; during a session the header is hidden, so the same message goes to
+// the line at the top of the session panel, and the panel's toggle is marked until it is opened.
+let saidAt = 0;
 const say = (text, bad = false) => {
+  saidAt = Date.now();
   $('status').textContent = text;
   $('status').classList.toggle('bad', bad);
+  const line = $('panel-msg');
+  line.textContent = text;
+  line.classList.toggle('bad', bad);
+  line.hidden = false;
+  if (document.body.classList.contains('connected') && !$('rail').classList.contains('open')) {
+    $('rail-toggle').classList.add('attention');
+  }
+};
+// Ambient state, such as a server count after a refresh: never replaces a message said moments ago.
+const note = text => {
+  if (Date.now() - saidAt < 8000) return;
+  $('status').textContent = text;
+  $('status').classList.remove('bad');
 };
 
 // Same origin as the page, so there is nothing to configure and no way to point the client elsewhere.
@@ -58,6 +78,7 @@ async function api(method, path, body) {
 function show(view) {
   $('login').hidden = view !== 'login';
   $('list').hidden = view !== 'list';
+  $('offline').hidden = view !== 'offline';
   const signedIn = view === 'list';
   $('signout').hidden = !signedIn;
   if (!signedIn) {
@@ -76,19 +97,39 @@ function showLogin(message) {
   ($('lu').value ? $('lp') : $('lu')).focus();
 }
 
+// Who is signed in, and until when, from the last /api/me or sign-in.
+let me = null;
+let meAt = 0;
+
+/// Seconds left on the sign-in, counted from what the proxy said and the time since.
+function signInRemaining() {
+  if (!me || me.remaining_secs == null) return Infinity;
+  return me.remaining_secs - (Date.now() - meAt) / 1000;
+}
+
+let retryTimer = null;
+
 async function showList() {
-  let me;
+  clearTimeout(retryTimer);
   try {
     me = await api('GET', '/api/me');
+    meAt = Date.now();
   } catch (err) {
     if (err instanceof SignedOut) return showLogin();
-    return say('could not reach the proxy: ' + describe(err), true);
+    // Unreachable, restarting or failing: say so where the page would be, and try again.
+    show('offline');
+    $('offline-why').textContent = describe(err);
+    say('could not reach the proxy', true);
+    retryTimer = setTimeout(showList, 10000);
+    return;
   }
   $('who').textContent = me.display_name || me.username;
   $('admin-link').hidden = !me.is_admin;
   show('list');
   await loadServers();
 }
+
+$('retry').addEventListener('click', showList);
 
 $('login-form').addEventListener('submit', async ev => {
   ev.preventDefault();
@@ -97,7 +138,8 @@ $('login-form').addEventListener('submit', async ev => {
   $('login-error').hidden = true;
   say('signing in');
   try {
-    await api('POST', '/api/login', { username: $('lu').value, password: $('lp').value });
+    me = await api('POST', '/api/login', { username: $('lu').value, password: $('lp').value });
+    meAt = Date.now();
     $('lp').value = '';
     await showList();
   } catch (err) {
@@ -107,9 +149,11 @@ $('login-form').addEventListener('submit', async ev => {
   }
 });
 
+// A reload after signing out leaves nothing of the last user in the page: no username in the form,
+// no clipboard text, no half-typed server password. Workstations here are shared at shift change.
 $('signout').addEventListener('click', async () => {
   try { await api('POST', '/api/logout'); } catch { /* signed out either way */ }
-  showLogin();
+  location.reload();
 });
 
 /* ---- the server list ---------------------------------------------------------------------- */
@@ -150,7 +194,7 @@ async function loadServers() {
   try {
     data = await api('GET', '/api/me/servers');
   } catch (err) {
-    if (err instanceof SignedOut) return showLogin();
+    if (err instanceof SignedOut) return showLogin('Your sign-in has ended. Sign in again.');
     return say('could not load your servers: ' + describe(err), true);
   }
   renderServers(data.groups || []);
@@ -235,7 +279,7 @@ function renderServers(groups) {
   $('empty').hidden = total > 0;
   $('list').querySelector('.toolbar').hidden = total === 0;
   applyFilter();
-  say(total === 1 ? '1 server' : total + ' servers');
+  note(total === 1 ? '1 server' : total + ' servers');
 }
 
 function applyFilter() {
@@ -277,28 +321,61 @@ async function forgetCredential(id) {
   loadServers();
 }
 
-// IronError exposes backtrace(), kind() and rdcleanpathDetails() as METHODS. Reading `err.backtrace`
-// without calling it is truthy, so stringifying it printed the function's source instead of the
-// failure.
+// What the client's error kinds mean to someone at the keyboard.
+const KIND_WORDS = {
+  [IronErrorKind.WrongPassword]: 'the server did not accept the password',
+  [IronErrorKind.LogonFailure]: 'the server refused the sign-in',
+  [IronErrorKind.AccessDenied]: 'the account may not sign in to this server',
+  [IronErrorKind.RDCleanPath]: 'the proxy could not open the server',
+  [IronErrorKind.ProxyConnect]: 'the proxy could not be reached',
+  [IronErrorKind.NegotiationFailure]: 'the server and the client could not agree on a connection',
+};
+// Windows socket errors the proxy reports for a server it could not reach.
+const WSA_WORDS = {
+  10051: 'the network to the server is unreachable',
+  10053: 'the server dropped the connection',
+  10054: 'the server reset the connection',
+  10060: 'the server did not answer',
+  10061: 'the server refused the connection; is remote desktop running on it?',
+  10065: 'the server is unreachable',
+  11001: 'the server\'s name is not known to DNS',
+};
+// TLS alerts the proxy reports for a server certificate it refused.
+const TLS_WORDS = {
+  42: 'the proxy does not accept the server\'s certificate; the proxy log says why',
+  44: 'the server\'s certificate has been revoked',
+  45: 'the server\'s certificate has expired or is not yet valid',
+  48: 'the server\'s certificate was issued by an authority this proxy does not trust',
+};
+
+/// Credential problems, for which asking for the password again can help.
+function isCredentialError(err) {
+  const kind = errorKind(err);
+  return kind === IronErrorKind.WrongPassword || kind === IronErrorKind.LogonFailure
+    || kind === IronErrorKind.AccessDenied;
+}
+
+// IronError exposes backtrace(), kind() and rdcleanpathDetails() as METHODS, and the detail's fields
+// are getters on its prototype, so none of them show up by enumerating the object.
+function errorKind(err) {
+  try { return err && typeof err.kind === 'function' ? err.kind() : undefined; } catch { return undefined; }
+}
+
 function describe(err) {
   if (!err) return 'unknown error';
-  const parts = [];
-  for (const name of ['kind', 'backtrace']) {
-    if (typeof err[name] === 'function') {
-      try {
-        const value = err[name]();
-        if (value !== undefined && value !== null && String(value) !== '') parts.push(String(value));
-      } catch { /* an accessor that throws must not replace the error with its own */ }
+  const kind = errorKind(err);
+  if (kind === undefined) return err.message || String(err);
+  const parts = [KIND_WORDS[kind] || 'the connection failed'];
+  try {
+    const d = typeof err.rdcleanpathDetails === 'function' ? err.rdcleanpathDetails() : null;
+    if (d) {
+      if (d.wsaErrorCode != null) parts.push(WSA_WORDS[d.wsaErrorCode] || `socket error ${d.wsaErrorCode}`);
+      if (d.tlsAlertCode != null) parts.push(TLS_WORDS[d.tlsAlertCode] || `TLS alert ${d.tlsAlertCode}`);
+      if (d.httpStatusCode != null) parts.push(`HTTP ${d.httpStatusCode}`);
     }
-  }
-  if (typeof err.rdcleanpathDetails === 'function') {
-    try {
-      const d = err.rdcleanpathDetails();
-      if (d) parts.push('rdcleanpath: ' + JSON.stringify(d, Object.keys(d)));
-    } catch { /* optional detail */ }
-  }
-  if (!parts.length && err.message) return err.message;
-  return parts.length ? parts.join(' — ') : String(err);
+  } catch { /* the detail is optional */ }
+  try { console.error(err.backtrace()); } catch { /* for a support call, not the page */ }
+  return parts.join(': ');
 }
 
 /* ---- input -------------------------------------------------------------------------------- */
@@ -310,16 +387,45 @@ const send = event => {
   session.applyInputs(tx);
 };
 
-// Printable keys go through unicode; the rest need scancodes. Anything outside both is dropped
-// rather than guessed at.
+// Keys that never type a character: always sent as their scancode (set 1, by physical position).
 const SCANCODE = {
   Escape:0x01, Backspace:0x0E, Tab:0x0F, Enter:0x1C, ControlLeft:0x1D, ShiftLeft:0x2A,
   ShiftRight:0x36, AltLeft:0x38, Space:0x39, CapsLock:0x3A, F1:0x3B, F2:0x3C, F3:0x3D, F4:0x3E,
-  F5:0x3F, F6:0x40, F7:0x41, F8:0x42, F9:0x43, F10:0x44, F11:0x57, F12:0x58,
+  F5:0x3F, F6:0x40, F7:0x41, F8:0x42, F9:0x43, F10:0x44, NumLock:0x45, ScrollLock:0x46,
+  F11:0x57, F12:0x58, NumpadEnter:0xE01C, NumpadDivide:0xE035, PrintScreen:0xE037,
   Home:0xE047, ArrowUp:0xE048, PageUp:0xE049, ArrowLeft:0xE04B, ArrowRight:0xE04D,
   End:0xE04F, ArrowDown:0xE050, PageDown:0xE051, Insert:0xE052, Delete:0xE053,
-  ControlRight:0xE01D, AltRight:0xE038, MetaLeft:0xE05B, MetaRight:0xE05C,
+  ControlRight:0xE01D, AltRight:0xE038, MetaLeft:0xE05B, MetaRight:0xE05C, ContextMenu:0xE05D,
 };
+
+// Keys that type a character, by physical position. Typing sends the character itself, so the
+// remote's keyboard layout does not matter; with Ctrl, Alt or the Windows key held, the position
+// goes instead, because Windows matches shortcuts on keys, not characters. Numpad keys go by
+// position whenever NumLock is off and they act as arrows.
+const POSITION = {
+  Backquote:0x29, Digit1:0x02, Digit2:0x03, Digit3:0x04, Digit4:0x05, Digit5:0x06, Digit6:0x07,
+  Digit7:0x08, Digit8:0x09, Digit9:0x0A, Digit0:0x0B, Minus:0x0C, Equal:0x0D,
+  KeyQ:0x10, KeyW:0x11, KeyE:0x12, KeyR:0x13, KeyT:0x14, KeyY:0x15, KeyU:0x16, KeyI:0x17,
+  KeyO:0x18, KeyP:0x19, BracketLeft:0x1A, BracketRight:0x1B, Backslash:0x2B,
+  KeyA:0x1E, KeyS:0x1F, KeyD:0x20, KeyF:0x21, KeyG:0x22, KeyH:0x23, KeyJ:0x24, KeyK:0x25,
+  KeyL:0x26, Semicolon:0x27, Quote:0x28, IntlBackslash:0x56,
+  KeyZ:0x2C, KeyX:0x2D, KeyC:0x2E, KeyV:0x2F, KeyB:0x30, KeyN:0x31, KeyM:0x32, Comma:0x33,
+  Period:0x34, Slash:0x35,
+  NumpadMultiply:0x37, Numpad7:0x47, Numpad8:0x48, Numpad9:0x49, NumpadSubtract:0x4A,
+  Numpad4:0x4B, Numpad5:0x4C, Numpad6:0x4D, NumpadAdd:0x4E, Numpad1:0x4F, Numpad2:0x50,
+  Numpad3:0x51, Numpad0:0x52, NumpadDecimal:0x53,
+};
+
+/// How a key goes to the remote: ['scan', code], ['char', character], or null for a key with no
+/// meaning there, which is dropped rather than guessed at.
+function keyRoute(e) {
+  if (SCANCODE[e.code] !== undefined) return ['scan', SCANCODE[e.code]];
+  const altGr = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+  const shortcut = (e.ctrlKey || e.altKey || e.metaKey) && !altGr;
+  if ((shortcut || e.key.length !== 1) && POSITION[e.code] !== undefined) return ['scan', POSITION[e.code]];
+  if (e.key.length === 1) return ['char', e.key];
+  return null;
+}
 
 // Invoked by the client as (kind, data, hotspotX, hotspotY); kind is "default", "hidden" or "url".
 function setCursorStyle(kind, data, hotspotX, hotspotY) {
@@ -337,23 +443,42 @@ function setCursorStyle(kind, data, hotspotX, hotspotY) {
   }
 }
 
-// The remote is asked for a desktop the size of the viewport, so every pixel is 1:1.
+// The remote is asked for a desktop the size of the viewport in device pixels, so every remote pixel
+// is one screen pixel. At 125 % or 150 % display scaling that is more pixels than CSS pixels, and
+// the remote is told the scale so its text stays the size the user expects.
+const scale = () => Math.max(1, window.devicePixelRatio || 1);
+
 function viewportSize() {
   return new DesktopSize(
-    Math.max(640, Math.floor(window.innerWidth)),
-    Math.max(480, Math.floor(window.innerHeight)),
+    Math.max(640, Math.floor(window.innerWidth * scale())),
+    Math.max(480, Math.floor(window.innerHeight * scale())),
   );
+}
+
+/// Ask the remote for the viewport's size and this display's scale.
+function fitRemote() {
+  if (!session) return;
+  const size = viewportSize();
+  const factor = Math.round(scale() * 100);
+  try {
+    if (factor === 100) session.resize(size.width, size.height);
+    else session.resize(size.width, size.height, factor);
+  } catch { /* the session may be closing */ }
+}
+
+/// Draw the canvas at its CSS size, so its device pixels land one to one on the screen's.
+function sizeCanvas(width, height) {
+  canvas.width = width;
+  canvas.height = height;
+  canvas.style.width = width / scale() + 'px';
+  canvas.style.height = height / scale() + 'px';
 }
 
 let resizeTimer = null;
 function followWindowSize() {
   clearTimeout(resizeTimer);
   // Debounced: a drag-resize fires continuously and each call is a protocol round trip.
-  resizeTimer = setTimeout(() => {
-    if (!session) return;
-    const size = viewportSize();
-    try { session.resize(size.width, size.height); } catch { /* the session may be closing */ }
-  }, 250);
+  resizeTimer = setTimeout(fitRemote, 250);
 }
 
 function sendClipboard() {
@@ -380,10 +505,12 @@ function sendCtrlAltDel() {
 function openRail(open) {
   $('rail').classList.toggle('open', open);
   $('rail-toggle').setAttribute('aria-expanded', String(open));
+  if (open) $('rail-toggle').classList.remove('attention');
 }
 
 $('rail-toggle').addEventListener('click', () => openRail(true));
-$('panel-close').addEventListener('click', () => openRail(false));
+// Focus goes back to the desktop, or the next keystrokes land on a hidden button.
+$('panel-close').addEventListener('click', () => { openRail(false); canvas.focus(); });
 $('clip-send').addEventListener('click', sendClipboard);
 $('clip-copy').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText($('clip').value); say('copied to this machine'); }
@@ -410,22 +537,77 @@ window.addEventListener('resize', followWindowSize);
   canvas.addEventListener('mousedown', e => { e.preventDefault(); canvas.focus(); send(DeviceEvent.mouseButtonPressed(e.button)); });
   canvas.addEventListener('mouseup', e => { e.preventDefault(); send(DeviceEvent.mouseButtonReleased(e.button)); });
   canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  // A key is released the way it was pressed: Ctrl let go before C must not turn C's release into a
+  // character the remote never saw pressed.
+  const down = new Map();   // e.code -> route
+  let syncLocks = true;     // Caps, Num and Scroll Lock are read from the next key after focus
   canvas.addEventListener('keydown', e => {
     if (!session) return;
     e.preventDefault();
-    const c = SCANCODE[e.code];
-    if (c !== undefined) send(DeviceEvent.keyPressed(c));
-    else if (e.key.length === 1) send(DeviceEvent.unicodePressed(e.key));
+    if (syncLocks && typeof e.getModifierState === 'function') {
+      syncLocks = false;
+      try {
+        session.synchronizeLockKeys(e.getModifierState('ScrollLock'), e.getModifierState('NumLock'),
+          e.getModifierState('CapsLock'), false);
+      } catch { /* an older server ignores it */ }
+    }
+    const route = down.get(e.code) || keyRoute(e);
+    if (!route) return;
+    down.set(e.code, route);
+    send(route[0] === 'scan' ? DeviceEvent.keyPressed(route[1]) : DeviceEvent.unicodePressed(route[1]));
   });
   canvas.addEventListener('keyup', e => {
     if (!session) return;
     e.preventDefault();
-    const c = SCANCODE[e.code];
-    if (c !== undefined) send(DeviceEvent.keyReleased(c));
-    else if (e.key.length === 1) send(DeviceEvent.unicodeReleased(e.key));
+    const route = down.get(e.code) || keyRoute(e);
+    down.delete(e.code);
+    if (!route) return;
+    send(route[0] === 'scan' ? DeviceEvent.keyReleased(route[1]) : DeviceEvent.unicodeReleased(route[1]));
   });
-  canvas.addEventListener('blur', () => { if (session) session.releaseAllInputs(); });
+  canvas.addEventListener('focus', () => { syncLocks = true; });
+  canvas.addEventListener('blur', () => {
+    down.clear();
+    if (session) session.releaseAllInputs();
+  });
+
+  // The wheel scrolls the remote. The browser's delta counts down the page; the remote's wheel
+  // counts away from the user, so the vertical sign flips.
+  canvas.addEventListener('wheel', e => {
+    if (!session) return;
+    e.preventDefault();
+    const unit = e.deltaMode === 1 ? RotationUnit.Line : e.deltaMode === 2 ? RotationUnit.Page : RotationUnit.Pixel;
+    const tx = new InputTransaction();
+    if (e.deltaY) tx.addEvent(DeviceEvent.wheelRotations(true, -Math.round(e.deltaY), unit));
+    if (e.deltaX) tx.addEvent(DeviceEvent.wheelRotations(false, Math.round(e.deltaX), unit));
+    session.applyInputs(tx);
+  }, { passive: false });
+
+  // A file dropped anywhere on the page goes to the remote clipboard instead of replacing the page,
+  // which would end the session.
+  for (const type of ['dragover', 'drop']) {
+    document.addEventListener(type, e => { if (session) e.preventDefault(); });
+  }
+  canvas.addEventListener('drop', e => {
+    if (!session || !e.dataTransfer || !e.dataTransfer.files.length) return;
+    offerFiles(e.dataTransfer.files);
+    openRail(true);
+  });
 })();
+
+// Leaving the page ends the session; ask first.
+window.addEventListener('beforeunload', e => {
+  if (!session) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+
+// In fullscreen, Chromium lets the page take the Windows key, Alt+Tab and Escape for the remote.
+document.addEventListener('fullscreenchange', () => {
+  if (!navigator.keyboard || typeof navigator.keyboard.lock !== 'function') return;
+  if (document.fullscreenElement) navigator.keyboard.lock().catch(() => {});
+  else navigator.keyboard.unlock();
+});
 
 /* ---- file transfer over the clipboard channel (RDPECLIP) ----------------------------------
  *
@@ -615,15 +797,15 @@ function askCredentials(server, prefill = {}) {
 
     const done = () => {
       dialog.removeEventListener('close', done);
+      const password = $('p').value;
+      $('p').value = '';   // never left sitting in the DOM, however the dialog closed
       if (dialog.returnValue !== 'go' || !$('u').value) return resolve(null);
-      const creds = {
+      resolve({
         username: $('u').value.trim(),
-        password: $('p').value,
+        password,
         domain: $('d').value.trim(),
         save: $('save').checked,
-      };
-      $('p').value = '';   // never leave it sitting in the DOM
-      resolve(creds);
+      });
     };
 
     dialog.returnValue = '';
@@ -631,6 +813,59 @@ function askCredentials(server, prefill = {}) {
     dialog.showModal();
     if (!$('u').value) $('u').focus();
     else $('p').focus();
+  });
+}
+
+// Cancel is an ordinary button, so Enter in the dialog submits it with Connect.
+$('signin-cancel').addEventListener('click', () => $('signin').close('cancel'));
+
+// A session lives only as long as the sign-in it opens under. With less than the longest shift left,
+// the page offers to renew the sign-in before connecting, so the desktop is not cut mid-shift.
+const LONGEST_SHIFT = 18 * 60 * 60;
+
+/// "3 hours", or minutes under the last hour.
+function lasting(secs) {
+  const plural = (n, unit) => n + ' ' + unit + (n === 1 ? '' : 's');
+  const minutes = Math.max(1, Math.ceil(secs / 60));
+  if (minutes >= 60) return plural(Math.floor(minutes / 60), 'hour');
+  return plural(minutes, 'minute');
+}
+
+/// Ask for the password to renew the sign-in. True once renewed, false to go on without.
+function renewSignIn() {
+  return new Promise(resolve => {
+    const dialog = $('renew');
+    $('renew-left').textContent = lasting(signInRemaining());
+    $('renew-error').hidden = true;
+    $('renew-pass').value = '';
+    const submit = async ev => {
+      ev.preventDefault();
+      $('renew-go').disabled = true;
+      try {
+        me = await api('POST', '/api/login', { username: me.username, password: $('renew-pass').value });
+        meAt = Date.now();
+        finish(true);
+      } catch (err) {
+        $('renew-error').textContent = err.message;
+        $('renew-error').hidden = false;
+      } finally {
+        $('renew-go').disabled = false;
+        $('renew-pass').value = '';
+      }
+    };
+    const skip = () => finish(false);
+    const finish = renewed => {
+      $('renew-form').removeEventListener('submit', submit);
+      $('renew-skip').removeEventListener('click', skip);
+      dialog.removeEventListener('cancel', skip);
+      if (dialog.open) dialog.close();
+      resolve(renewed);
+    };
+    $('renew-form').addEventListener('submit', submit);
+    $('renew-skip').addEventListener('click', skip);
+    dialog.addEventListener('cancel', skip);
+    dialog.showModal();
+    $('renew-pass').focus();
   });
 }
 
@@ -645,6 +880,7 @@ async function openServer(id) {
   opening = server;
   say('opening ' + server.name);   // the client may still be loading; say so rather than nothing
   try {
+    if (signInRemaining() < LONGEST_SHIFT) await renewSignIn();
     await connectTo(server, id);
   } finally {
     opening = null;
@@ -691,8 +927,9 @@ async function connectTo(server, id) {
       setTimeout(loadServers, 1500);
       return;
     }
-    // Refused before a desktop appeared. With a saved credential, ask once for a new one.
-    if (fromSaved) {
+    // Refused before a desktop appeared. A saved credential the server refused is asked for once
+    // more; a server that could not be reached is not a password problem, and is only reported.
+    if (fromSaved && outcome.credentials) {
       prefill = {
         username: creds.username,
         domain: creds.domain,
@@ -707,7 +944,8 @@ async function connectTo(server, id) {
 
 /// Connect, run until the session ends, and report whether a desktop was ever reached.
 async function runSession(server, ticket, creds) {
-  const outcome = { connected: false };
+  // connected: a desktop was reached. credentials: refused for the credentials, not the network.
+  const outcome = { connected: false, credentials: false };
   let mine = null;   // this attempt's session; the page's state is cleared only while it is current
   say('connecting to ' + server.name);
   try {
@@ -753,8 +991,7 @@ async function runSession(server, ticket, creds) {
         if (!session) return;
         const size = session.desktopSize();
         if (!size) return;
-        canvas.width = size.width;
-        canvas.height = size.height;
+        sizeCanvas(size.width, size.height);
         $('panel-info').textContent = server.name + ' — ' + size.width + '×' + size.height;
       });
     if (creds.domain) builder.serverDomain(creds.domain);
@@ -762,6 +999,9 @@ async function runSession(server, ticket, creds) {
     mine = await builder.connect();
     session = mine;
     outcome.connected = true;
+    const size = mine.desktopSize();
+    if (size) sizeCanvas(size.width, size.height);
+    if (scale() !== 1) fitRemote();
 
     // Saved only once the server has accepted them, so a mistyped password is never kept.
     if (creds.save) {
@@ -779,11 +1019,14 @@ async function runSession(server, ticket, creds) {
     canvas.focus();
     say('connected to ' + server.name);
 
-    await mine.run();
-    say('disconnected from ' + server.name);
+    const info = await mine.run();
+    let why = '';
+    try { why = info && typeof info.reason === 'function' ? String(info.reason() || '') : ''; } catch { /* optional */ }
+    say('disconnected from ' + server.name + (why ? ': ' + why : ''));
   } catch (err) {
+    outcome.credentials = !outcome.connected && isCredentialError(err);
     const text = describe(err);
-    say((outcome.connected ? 'session ended: ' : 'could not connect to ' + server.name + ': ') + text, true);
+    say((outcome.connected ? 'session with ' + server.name + ' ended: ' : 'could not connect to ' + server.name + ': ') + text, true);
   } finally {
     creds.password = '';
     if (session === mine) {
@@ -791,7 +1034,8 @@ async function runSession(server, ticket, creds) {
       $('rail').hidden = true;
       openRail(false);
       session = null;
-      // Transfer state belongs to the session.
+      // Transfer state and clipboard text belong to the session.
+      $('clip').value = '';
       outgoing = [];
       remoteFiles = [];
       for (const { reject } of pending.values()) reject(new Error('session ended'));
