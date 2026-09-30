@@ -374,6 +374,31 @@ impl Store {
         })
     }
 
+    /// Open the database a proxy serves. Before a schema migration changes it, a copy of the file
+    /// as it was is kept beside it, so an upgrade can be rolled back: the previous build refuses
+    /// the migrated schema, and the copy is what it can open.
+    pub fn open_serving(path: &Path) -> Result<Self> {
+        if path.exists() {
+            let conn = Connection::open(path)?;
+            configure(&conn)?;
+            let found = schema_version(&conn)?;
+            if (1..SCHEMA_VERSION).contains(&found) {
+                let backup = path.with_file_name(format!(
+                    "backup-schema{found}-{}.db",
+                    crate::migrate::utc_stamp(now())
+                ));
+                conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+                tracing::info!(
+                    backup = %backup.display(),
+                    from = found,
+                    to = SCHEMA_VERSION,
+                    "kept a copy of the database before migrating its schema"
+                );
+            }
+        }
+        Self::open(path)
+    }
+
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
@@ -416,6 +441,24 @@ impl Store {
         Ok(())
     }
 
+    /// In one transaction: every saved credential and the meta values in `forget` deleted, and
+    /// `set` written. Returns how many saved credentials went.
+    pub fn replace_secrets(&self, forget: &[&str], set: (&str, &[u8])) -> Result<usize> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let removed = tx.execute("DELETE FROM credentials", [])?;
+        for key in forget {
+            tx.execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        }
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![set.0, set.1],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn flag(&self, key: &str) -> Result<bool> {
         Ok(self.meta_get(key)?.is_some_and(|v| v == b"1"))
     }
@@ -450,6 +493,40 @@ impl Store {
                 user_from,
             )
             .optional()?)
+    }
+
+    /// The directory account bound to `sid`, whatever it is called now. Oldest first when an
+    /// administrator reset a binding and the account signed in under both names.
+    pub fn directory_user_by_sid(&self, sid: &str) -> Result<Option<User>> {
+        Ok(self
+            .c()
+            .query_row(
+                &format!(
+                    "SELECT {USER_COLS} FROM users u
+                     WHERE u.sid = ?1 AND u.local_hash IS NULL ORDER BY u.id LIMIT 1"
+                ),
+                [sid],
+                user_from,
+            )
+            .optional()?)
+    }
+
+    /// Rename a directory account after the directory renamed it, only on the row that was read:
+    /// same id, same incarnation, still bound to `sid`, and only while the new name is free.
+    pub fn user_rename(
+        &self,
+        id: i64,
+        incarnation: i64,
+        sid: &str,
+        new_name: &str,
+    ) -> Result<bool> {
+        let n = self.c().execute(
+            "UPDATE users SET username = ?4
+             WHERE id = ?1 AND incarnation = ?2 AND sid = ?3 AND local_hash IS NULL
+               AND NOT EXISTS (SELECT 1 FROM users WHERE username = ?4)",
+            params![id, incarnation, sid, new_name],
+        )?;
+        Ok(n == 1)
     }
 
     pub fn users_list(&self) -> Result<Vec<UserRow>> {
@@ -1206,9 +1283,30 @@ impl Store {
         let old = std::mem::replace(&mut *c, placeholder);
         drop(old);
         let installed = std::fs::rename(new_file, &self.path);
-        // Reopen whichever file is now in place, so a failed rename leaves the old data serving.
-        *c = open_connection(&self.path)?;
-        installed?;
+        // Reopen whichever file is now in place, so a failed rename leaves the old data serving. A
+        // scanner can hold a just-renamed file for a moment, so a failed open is retried; one that
+        // never opens stops the process rather than serve the empty placeholder, and the service's
+        // recovery actions restart it on the file in place.
+        let mut attempt = 0;
+        *c = loop {
+            match open_connection(&self.path) {
+                Ok(conn) => break conn,
+                Err(e) if attempt < 10 => {
+                    attempt += 1;
+                    tracing::warn!(error = %e, attempt, "the database did not reopen after the swap; retrying");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, path = %self.path.display(), "the database cannot be reopened; stopping");
+                    std::process::exit(1);
+                }
+            }
+        };
+        installed.map_err(|e| {
+            StoreError::Invalid(format!(
+                "the database file is in use and could not be replaced; stop other tools using it and retry ({e})"
+            ))
+        })?;
         Ok(())
     }
 }
@@ -1416,6 +1514,58 @@ mod tests {
         assert!(h > g, "group id {g} was given to a new row");
         let created = s.user_create_returning("carol", None).unwrap();
         assert_eq!(Some(created.clone()), s.user_by_id(created.id).unwrap());
+    }
+
+    /// The served database keeps a copy of itself, as it was, before its schema is migrated; a
+    /// current one is opened without a copy.
+    #[test]
+    fn a_schema_migration_keeps_a_copy_of_the_old_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "web-access-premigrate-{}",
+            &crate::auth::random_token()[..12]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("web-access.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;
+                 INSERT INTO users (id, username, created) VALUES (1, 'alice', 1);"
+            ))
+            .unwrap();
+        }
+        let backups = || -> Vec<PathBuf> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("backup-schema")
+                })
+                .collect()
+        };
+
+        let s = Store::open_serving(&path).unwrap();
+        assert_eq!(s.user_by_name("alice").unwrap().unwrap().id, 1);
+        let kept = backups();
+        assert_eq!(kept.len(), 1, "no copy was kept before migrating");
+        let old = Connection::open(&kept[0]).unwrap();
+        assert_eq!(
+            schema_version(&old).unwrap(),
+            3,
+            "the copy was migrated too"
+        );
+        let users: i64 = old
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(users, 1);
+        drop((s, old));
+
+        Store::open_serving(&path).unwrap();
+        assert_eq!(backups().len(), 1, "a current database was copied again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A version 3 database keeps every row and every reference through the rebuild, its cascades

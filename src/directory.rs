@@ -19,6 +19,9 @@ const UAC_ACCOUNT_DISABLE: i64 = 0x2;
 pub enum DirError {
     #[error("the username or password is not correct")]
     InvalidCredentials,
+    /// The password was accepted for an account outside the configured domain.
+    #[error("the account {0} is not in the configured domain")]
+    OtherDomain(String),
     #[error("no domain controller could be reached: {0}")]
     Unreachable(String),
     #[error("directory: {0}")]
@@ -51,8 +54,9 @@ pub struct Directory {
     base_dn: String,
 }
 
-/// `DOMAIN\user`, `user@domain` and `user` all name the same account. Returns the lowercase
-/// sAMAccountName, or None for something that cannot be one.
+/// The account name part of `DOMAIN\user`, `user@domain` or `user`, lowercased, or None for
+/// something that cannot be one. For a local account and for the proxy's own lists; a directory
+/// sign-in checks the password under the name as typed and takes the account from the directory.
 pub fn normalize_username(input: &str) -> Option<String> {
     let s = input.trim();
     let s = s.rsplit('\\').next().unwrap_or(s);
@@ -68,6 +72,17 @@ pub fn normalize_username(input: &str) -> Option<String> {
         return None;
     }
     Some(s.to_lowercase())
+}
+
+/// The account in a WhoAmI answer: `u:DOMAIN\user` (Active Directory, Samba) gives the domain
+/// and the lowercase short name, `u:user` the short name alone. Anything else names no account.
+fn parse_authzid(authzid: &str) -> Option<(Option<String>, String)> {
+    let id = authzid.strip_prefix("u:")?;
+    let (domain, name) = match id.rsplit_once('\\') {
+        Some((d, n)) => (Some(d.to_owned()).filter(|d| !d.is_empty()), n),
+        None => (None, id),
+    };
+    Some((domain, normalize_username(name)?))
 }
 
 /// RFC 4515 escaping for a value placed in a search filter.
@@ -196,6 +211,40 @@ impl Directory {
         }
     }
 
+    /// The name a sign-in binds as: exactly what was typed when it names a domain, so an
+    /// email-style sign-in name reaches its own account, and otherwise the configured form.
+    fn sign_in_name(&self, typed: &str) -> Option<String> {
+        let typed = typed.trim();
+        let short = normalize_username(typed)?;
+        if typed.len() > 256 || typed.chars().any(char::is_control) {
+            return None;
+        }
+        Some(if typed.contains('@') || typed.contains('\\') {
+            typed.to_owned()
+        } else {
+            self.bind_name(&short)
+        })
+    }
+
+    /// Who the directory says this connection is bound as, from the WhoAmI operation (RFC 4532):
+    /// the account's short name, and its NetBIOS domain where the answer carries one.
+    async fn whoami(&self, ldap: &mut Ldap) -> Result<(Option<String>, String)> {
+        let (exop, _) = ldap
+            .with_timeout(self.timeout())
+            .extended(ldap3::exop::WhoAmI)
+            .await
+            .map_err(|e| DirError::Protocol(e.to_string()))?
+            .success()
+            .map_err(|e| DirError::Protocol(format!("who-am-i: {e}")))?;
+        let authzid = exop
+            .val
+            .as_deref()
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .unwrap_or("");
+        parse_authzid(authzid)
+            .ok_or_else(|| DirError::Protocol(format!("who-am-i named no account: {authzid:?}")))
+    }
+
     fn timeout(&self) -> Duration {
         Duration::from_secs(self.cfg.timeout_secs.max(1))
     }
@@ -221,14 +270,14 @@ impl Directory {
         Err(DirError::Unreachable(last))
     }
 
-    async fn bind(&self, ldap: &mut Ldap, username: &str, password: &str) -> Result<()> {
+    async fn bind(&self, ldap: &mut Ldap, bind_name: &str, password: &str) -> Result<()> {
         // An empty password is an UNAUTHENTICATED bind, which LDAP reports as success.
         if password.is_empty() {
             return Err(DirError::InvalidCredentials);
         }
         let result = ldap
             .with_timeout(self.timeout())
-            .simple_bind(&self.bind_name(username), password)
+            .simple_bind(bind_name, password)
             .await
             .map_err(|e| DirError::Protocol(e.to_string()))?;
         match result.rc {
@@ -290,13 +339,24 @@ impl Directory {
         }))
     }
 
-    /// Password sign-in. `username` is already normalised.
-    pub async fn authenticate(&self, username: &str, password: &str) -> Result<Account> {
+    /// Password sign-in with the name as typed. The account signed in is the one the directory
+    /// says the password was checked for, never one looked up by the typed name: AD resolves a
+    /// sign-in name before a short name, so the two can be different people.
+    pub async fn authenticate(&self, typed: &str, password: &str) -> Result<Account> {
+        let bind_name = self
+            .sign_in_name(typed)
+            .ok_or(DirError::InvalidCredentials)?;
         let mut ldap = self.connect().await?;
         let outcome = async {
-            self.bind(&mut ldap, username, password).await?;
+            self.bind(&mut ldap, &bind_name, password).await?;
+            let (domain, short) = self.whoami(&mut ldap).await?;
+            if let (Some(nb), Some(domain)) = (&self.cfg.netbios, &domain) {
+                if !nb.eq_ignore_ascii_case(domain) {
+                    return Err(DirError::OtherDomain(format!("{domain}\\{short}")));
+                }
+            }
             // An account may read its own entry, so no service account is needed here.
-            let account = self.find(&mut ldap, username).await?.ok_or_else(|| {
+            let account = self.find(&mut ldap, &short).await?.ok_or_else(|| {
                 DirError::Protocol("bound, but the account's entry was not found".into())
             })?;
             if !account.usable() {
@@ -323,7 +383,7 @@ impl Directory {
             .ok_or_else(|| DirError::Config("no service_account configured".into()))?;
         let mut ldap = self.connect().await?;
         let outcome = async {
-            self.bind(&mut ldap, &service, service_password)
+            self.bind(&mut ldap, &self.bind_name(&service), service_password)
                 .await
                 .map_err(|e| match e {
                     DirError::InvalidCredentials => {
@@ -358,6 +418,49 @@ mod tests {
         assert_eq!(normalize_username(""), None);
         assert_eq!(normalize_username("a*b"), None);
         assert_eq!(normalize_username("x(y)"), None);
+    }
+
+    #[test]
+    fn a_whoami_answer_names_the_account_signed_in() {
+        assert_eq!(
+            parse_authzid("u:CORP\\JDoe"),
+            Some((Some("CORP".into()), "jdoe".into()))
+        );
+        assert_eq!(parse_authzid("u:jdoe"), Some((None, "jdoe".into())));
+        assert_eq!(parse_authzid("dn:CN=John,DC=corp"), None);
+        assert_eq!(parse_authzid(""), None);
+        assert_eq!(parse_authzid("u:CORP\\"), None);
+    }
+
+    fn config(netbios: Option<&str>) -> DirectoryConfig {
+        let mut text = String::from(
+            "domain = \"corp.example.com\"\nurls = [\"ldaps://dc1.corp.example.com\"]\n",
+        );
+        if let Some(nb) = netbios {
+            text.push_str(&format!("netbios = \"{nb}\"\n"));
+        }
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn a_sign_in_binds_as_typed_when_it_names_a_domain() {
+        let d = Directory::unconnected(&config(Some("CORP")));
+        assert_eq!(d.sign_in_name("JDoe").as_deref(), Some("CORP\\jdoe"));
+        assert_eq!(
+            d.sign_in_name(" john.doe@company.com ").as_deref(),
+            Some("john.doe@company.com")
+        );
+        assert_eq!(
+            d.sign_in_name("OTHER\\jdoe").as_deref(),
+            Some("OTHER\\jdoe")
+        );
+        assert_eq!(d.sign_in_name("a*b"), None);
+        assert_eq!(d.sign_in_name(""), None);
+        let bare = Directory::unconnected(&config(None));
+        assert_eq!(
+            bare.sign_in_name("jdoe").as_deref(),
+            Some("jdoe@corp.example.com")
+        );
     }
 
     #[test]

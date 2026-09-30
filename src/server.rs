@@ -21,18 +21,25 @@ use tracing::{debug, error, info, warn};
 
 /// Serve until `shutdown` resolves, on a runtime of its own. The serving lock is taken before the
 /// runtime is built and released after the runtime has shut down; the shutdown waits for blocking
-/// work still running, an import's swap among it, so that work is covered too.
+/// work still running, an import's swap among it, so that work is covered too. `ready` is called
+/// once the listener is bound, so a service reports running only when it is.
 pub fn serve_blocking(
     config_path: &str,
     shutdown: impl Future<Output = ()>,
+    ready: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build = option_env!("WEB_ACCESS_BUILD").unwrap_or("unrecorded"),
+        "web-access proxy starting"
+    );
     // Read once: the directory locked is the directory served, whatever happens to the file.
     let cfg = Config::load(config_path)?;
     let lock = ServingLock::acquire(&cfg)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let outcome = runtime.block_on(async {
         install_crypto_provider()?;
-        run(config_path, cfg, &lock, shutdown).await
+        run(config_path, cfg, &lock, shutdown, ready).await
     });
     drop(runtime);
     drop(lock);
@@ -61,6 +68,7 @@ pub async fn run(
     cfg: Config,
     serving: &ServingLock,
     shutdown: impl Future<Output = ()>,
+    ready: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     if cfg.data_dir() != serving.data_dir {
         return Err(format!(
@@ -96,8 +104,11 @@ pub async fn run(
         tls_handshake: TLS_HANDSHAKE,
     };
     let router = crate::web::router(Arc::clone(&app));
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .map_err(|e| format!("listening on {listen}: {e}"))?;
     info!(%listen, https = acceptor.is_some(), max_connections = limits.max_connections, "listening");
+    ready();
     accept_loop(listener, acceptor, router, limits, shutdown).await;
     Ok(())
 }
@@ -516,6 +527,30 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// Ready is reported once the port is bound and not before: a port already taken fails the
+    /// start with the address named, and never reports ready.
+    #[test]
+    fn ready_is_reported_only_once_the_port_is_bound() {
+        let path = scratch_config();
+        let ready = std::cell::Cell::new(false);
+        serve_blocking(&path, async {}, || ready.set(true)).unwrap();
+        assert!(ready.get(), "a bound listener was not reported ready");
+
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("127.0.0.1:0", &addr);
+        std::fs::write(&path, text).unwrap();
+        let ready = std::cell::Cell::new(false);
+        let err = serve_blocking(&path, async {}, || ready.set(true)).unwrap_err();
+        assert!(!ready.get(), "a start that could not bind reported ready");
+        assert!(
+            err.to_string().contains(&addr),
+            "the bind failure does not name {addr}: {err}"
+        );
+    }
+
     /// The service's start lifts a freeze an unfinished export left behind.
     #[tokio::test]
     async fn the_service_start_lifts_a_stranded_freeze() {
@@ -528,7 +563,7 @@ mod tests {
         drop(app);
         let cfg = Config::load(&path).unwrap();
         let lock = ServingLock::acquire(&cfg).unwrap();
-        run(&path, cfg, &lock, async {}).await.unwrap();
+        run(&path, cfg, &lock, async {}, || {}).await.unwrap();
         let app = App::new(Config::load(&path).unwrap()).unwrap();
         assert!(
             !app.frozen(),
@@ -555,14 +590,20 @@ mod tests {
             .unwrap();
         b.store.set_flag(crate::app::META_FROZEN, true).unwrap();
         assert!(
-            run(&other, Config::load(&other).unwrap(), &lock, async {})
-                .await
-                .is_err(),
+            run(
+                &other,
+                Config::load(&other).unwrap(),
+                &lock,
+                async {},
+                || {}
+            )
+            .await
+            .is_err(),
             "a directory was served under another directory's lock"
         );
         // The config file now names the other directory.
         std::fs::copy(&other, &path).unwrap();
-        run(&path, cfg, &lock, async {}).await.unwrap();
+        run(&path, cfg, &lock, async {}, || {}).await.unwrap();
         assert!(b.frozen(), "a directory that was never locked was served");
     }
 
@@ -579,7 +620,7 @@ mod tests {
         // The first process, mid-export.
         let first = lock_for(&path).unwrap();
         assert!(
-            serve_blocking(&path, async {}).is_err(),
+            serve_blocking(&path, async {}, || {}).is_err(),
             "a second serving process started"
         );
         assert!(
@@ -588,7 +629,7 @@ mod tests {
         );
         assert!(app.store.flag(crate::app::META_FREEZE_PENDING).unwrap());
         drop(first);
-        serve_blocking(&path, async {}).unwrap();
+        serve_blocking(&path, async {}, || {}).unwrap();
         assert!(
             !app.frozen(),
             "with the first process gone, the stranded freeze stayed"
@@ -602,12 +643,16 @@ mod tests {
         let path = scratch_config();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let (path2, seen2) = (path.clone(), Arc::clone(&seen));
-        serve_blocking(&path, async move {
-            tokio::task::spawn_blocking(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                *seen2.lock().unwrap() = Some(lock_for(&path2).is_err());
-            });
-        })
+        serve_blocking(
+            &path,
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    *seen2.lock().unwrap() = Some(lock_for(&path2).is_err());
+                });
+            },
+            || {},
+        )
         .unwrap();
         assert_eq!(
             *seen.lock().unwrap(),

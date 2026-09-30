@@ -149,6 +149,14 @@
             <button type="submit" class="primary">Unlock</button>
           </form>
         </div>
+        <div class="card" id="reset-card" hidden>
+          <h2>Reset the credential store</h2>
+          <p class="note">When nobody has the recovery passphrase, the store can only be started over. Every saved credential and the directory service account's password are deleted; users enter their server credentials again, and the service account's password is set again below. Users, servers and assignments are kept.</p>
+          <form id="reset-form" class="form-row">
+            <label>Type this proxy's host name to confirm<input id="reset-host" autocomplete="off" spellcheck="false" required></label>
+            <button type="submit" class="danger">Reset</button>
+          </form>
+        </div>
         <div class="card">
           <h2 id="recovery-title">Recovery passphrase</h2>
           <p class="note">Encrypts exports and lets saved credentials move to a new host. Keep it with the proxy's documentation: without it an export cannot be imported. At least 12 characters.</p>

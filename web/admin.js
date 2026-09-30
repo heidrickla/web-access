@@ -566,6 +566,7 @@ loaders.migration = async () => {
   facts.innerHTML = '';
   for (const [k, v] of [
     ['Host name', m.host],
+    ['Version', m.build ? `${m.version} (${m.build})` : m.version],
     ['Users', String(m.counts.users)],
     ['Servers', String(m.counts.servers)],
     ['Assignments', String(m.counts.assignments)],
@@ -577,6 +578,7 @@ loaders.migration = async () => {
   ]) facts.append(el('dt', { text: k }), el('dd', { text: v }));
 
   $('unlock-card').hidden = m.unlocked;
+  $('reset-card').hidden = m.unlocked;
   $('rec-current-label').hidden = !m.recovery_set;
   $('recovery-title').textContent = m.recovery_set ? 'Change the recovery passphrase' : 'Set a recovery passphrase';
   $('rec-go').textContent = m.recovery_set ? 'Change passphrase' : 'Set passphrase';
@@ -584,8 +586,10 @@ loaders.migration = async () => {
 
   const dir = m.directory;
   $('directory-card').hidden = !dir.service_account;
+  const password = !dir.password_set ? 'is not set'
+    : dir.password_readable ? 'is set' : 'is set but cannot be read while the credential store is locked, so accounts are not being checked';
   $('directory-note').textContent = dir.service_account
-    ? `Account ${dir.service_account}. Password ${dir.password_set ? 'is set' : 'is not set'}. It lets the proxy check accounts when they are added, and end the sessions of accounts disabled in the directory.`
+    ? `Account ${dir.service_account}. Password ${password}. It lets the proxy check accounts when they are added, and end the sessions of accounts disabled in the directory.`
     : '';
   say('migration');
 };
@@ -611,6 +615,17 @@ $('unlock-form').addEventListener('submit', async ev => {
     $('unlock-pass').value = '';
     say('credential store unlocked');
     await loaders.migration();
+  } catch (err) { fail(err); }
+});
+
+$('reset-form').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (!confirm('Delete every saved credential and the directory service account password, and start the credential store over?')) return;
+  try {
+    const r = await api('POST', '/api/admin/migration/reset', { confirm_host: $('reset-host').value });
+    $('reset-host').value = '';
+    await loaders.migration();
+    say(`credential store reset; ${r.removed} saved credential(s) deleted`);
   } catch (err) { fail(err); }
 });
 

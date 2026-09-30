@@ -185,14 +185,23 @@ pub fn build_zip(manifest: &Manifest, blob: &[u8]) -> Result<Vec<u8>> {
 
 /// Open an archive and check everything that can be checked without the passphrase.
 pub fn read_zip(bytes: &[u8]) -> Result<(Manifest, Vec<u8>)> {
-    let bad = |e: zip::result::ZipError| MigrateError::BadArchive(e.to_string());
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(bad)?;
+    // A truncated file has no central directory, which is where this fails.
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
+        MigrateError::BadArchive(format!(
+            "this is not a complete export; the file is damaged or incomplete: {e}"
+        ))
+    })?;
     let mut read = |name: &str| -> Result<Vec<u8>> {
         let mut entry = archive
             .by_name(name)
             .map_err(|_| MigrateError::BadArchive(format!("{name} is missing")))?;
         let mut out = Vec::new();
-        entry.read_to_end(&mut out)?;
+        // A damaged copy fails zip's own checksum here, before the SHA-256 below.
+        entry.read_to_end(&mut out).map_err(|e| {
+            MigrateError::BadArchive(format!(
+                "{name} could not be read; the file is damaged or incomplete: {e}"
+            ))
+        })?;
         Ok(out)
     };
     let manifest: Manifest = serde_json::from_slice(&read(MANIFEST)?)
@@ -272,6 +281,58 @@ pub fn confirm(
     Ok(counts)
 }
 
+/// Import backups kept in the data directory; older ones are deleted by the next import.
+pub const KEEP_BACKUPS: usize = 5;
+
+/// Keep the newest `keep` import backups (`backup-<stamp>.db`) in `dir` and delete the rest. The
+/// stamp sorts in time order. Copies kept before a schema migration are named differently and are
+/// left alone.
+pub fn prune_backups(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut backups: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("backup-2") && n.ends_with(".db"))
+        })
+        .collect();
+    backups.sort();
+    let excess = backups.len().saturating_sub(keep);
+    for old in &backups[..excess] {
+        match std::fs::remove_file(old) {
+            Ok(()) => tracing::info!(removed = %old.display(), "deleted an old import backup"),
+            Err(e) => {
+                tracing::warn!(file = %old.display(), error = %e, "could not delete an old import backup")
+            }
+        }
+    }
+}
+
+/// Delete temporary files an export or import left behind when a process stopped partway: at
+/// service start, and only files older than `min_age`, so a command-line export running meanwhile
+/// keeps its own.
+pub fn sweep_temp_files(dir: &Path, min_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+        let named = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            (n.starts_with("export-") || n.starts_with("import-")) && n.ends_with(".tmp")
+        });
+        let old = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if named && old && std::fs::remove_file(&path).is_ok() {
+            tracing::info!(removed = %path.display(), "deleted a temporary file left by an interrupted export or import");
+        }
+    }
+}
+
 /// Decrypt, validate, back up the current database, and swap the import in.
 pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
     let db = vault::decrypt_with_passphrase(passphrase, AAD_EXPORT, blob)?;
@@ -296,6 +357,7 @@ pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
 
     let backup = dir.join(format!("backup-{}.db", utc_stamp(now())));
     app.store.snapshot_to(&backup)?;
+    prune_backups(&dir, KEEP_BACKUPS);
     app.store.replace_with(&staged_path)?;
     std::mem::forget(guard); // renamed into place; nothing left to remove
     app.bump_generation();
@@ -305,6 +367,19 @@ pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
     app.live.end_all();
     tracing::info!(backup = %backup.display(), ?counts, "database imported");
     Ok(counts)
+}
+
+/// A manifest that matches `blob`, for tests elsewhere that need a readable archive.
+#[cfg(test)]
+pub fn test_manifest(blob: &[u8]) -> Manifest {
+    Manifest {
+        format: FORMAT,
+        schema: SCHEMA_VERSION,
+        source_host: "old".into(),
+        exported_at: 1,
+        data_sha256: hex(digest(&SHA256, blob).as_ref()),
+        counts: Counts::default(),
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +435,89 @@ mod tests {
             read_zip(b"not a zip"),
             Err(MigrateError::BadArchive(_))
         ));
+    }
+
+    /// A truncated copy and a copy with a flipped byte are both reported as damaged, never as a
+    /// server fault.
+    #[test]
+    fn a_damaged_copy_is_reported_as_damaged() {
+        let blob = vec![7u8; 4096];
+        let zip = build_zip(&manifest_for(&blob), &blob).unwrap();
+        let truncated = &zip[..zip.len() - 40];
+        assert!(matches!(
+            read_zip(truncated),
+            Err(MigrateError::BadArchive(_))
+        ));
+        let mut flipped = zip.clone();
+        // Inside the stored data, which zip's own checksum covers.
+        let at = zip.windows(64).position(|w| w == &blob[..64]).unwrap() + 100;
+        flipped[at] ^= 0xff;
+        assert!(matches!(
+            read_zip(&flipped),
+            Err(MigrateError::BadArchive(_))
+        ));
+    }
+
+    /// Only the newest import backups stay; copies kept before a schema migration and other files
+    /// are left alone.
+    #[test]
+    fn old_import_backups_are_pruned() {
+        let dir = std::env::temp_dir().join(format!(
+            "web-access-prune-{}",
+            &crate::auth::random_token()[..12]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for day in 1..=7 {
+            std::fs::write(dir.join(format!("backup-202609{day:02}T000000Z.db")), b"x").unwrap();
+        }
+        std::fs::write(dir.join("backup-schema3-20260901T000000Z.db"), b"x").unwrap();
+        std::fs::write(dir.join("web-access.db"), b"x").unwrap();
+        prune_backups(&dir, 5);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "backup-20260903T000000Z.db",
+                "backup-20260904T000000Z.db",
+                "backup-20260905T000000Z.db",
+                "backup-20260906T000000Z.db",
+                "backup-20260907T000000Z.db",
+                "backup-schema3-20260901T000000Z.db",
+                "web-access.db",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Leftover temporary files go at service start, but not one younger than the cut-off, which a
+    /// command-line export may still be writing.
+    #[test]
+    fn stale_temporary_files_are_swept_and_fresh_ones_kept() {
+        let dir = std::env::temp_dir().join(format!(
+            "web-access-sweep-{}",
+            &crate::auth::random_token()[..12]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("export-abc.tmp"), b"x").unwrap();
+        std::fs::write(dir.join("import-def.tmp"), b"x").unwrap();
+        std::fs::write(dir.join("other.tmp"), b"x").unwrap();
+        sweep_temp_files(&dir, std::time::Duration::from_secs(3600));
+        assert!(
+            dir.join("export-abc.tmp").exists(),
+            "a fresh temp file was swept"
+        );
+        sweep_temp_files(&dir, std::time::Duration::ZERO);
+        assert!(!dir.join("export-abc.tmp").exists());
+        assert!(!dir.join("import-def.tmp").exists());
+        assert!(
+            dir.join("other.tmp").exists(),
+            "an unrelated file was swept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     use crate::web::tests::{call, signed_in, test_app_keyed};
