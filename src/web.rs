@@ -10,6 +10,7 @@ use crate::directory::{normalize_username, DirError};
 use crate::migrate::MigrateError;
 use crate::policy::{self, PolicyError};
 use crate::proxy::Session;
+use crate::settings;
 use crate::store::{now, StoreError, StoredCredential, User};
 use crate::vault::{credential_aad, Vault, VaultError};
 
@@ -591,15 +592,22 @@ struct Me {
     /// Seconds the sign-in has left, so the page can renew it before a session it opens would be
     /// cut mid-shift. Counted here, so the browser's clock does not matter.
     remaining_secs: Option<i64>,
+    /// Opening a server with less than this left asks for the password first; 0 never asks.
+    renew_below_secs: i64,
+    /// The largest file the page sends or fetches over the clipboard channel; none is no limit.
+    max_file_bytes: Option<u64>,
 }
 
-fn me_of(app: &App, user: &User, expires: Option<i64>) -> Me {
-    Me {
+fn me_of(app: &App, user: &User, expires: Option<i64>) -> ApiResult<Me> {
+    let settings = settings::read(&app.store)?;
+    Ok(Me {
         username: user.username.clone(),
         display_name: user.display_name.clone(),
         is_admin: app.is_admin(user),
         remaining_secs: expires.map(|e| (e - now()).max(0)),
-    }
+        renew_below_secs: settings.renew_below_secs(),
+        max_file_bytes: settings.max_file_bytes(),
+    })
 }
 
 const REFUSED: &str = "the username or password is not correct, or the account cannot sign in";
@@ -686,7 +694,7 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
         Checked::Directory(account) => finish_directory(&app, &account)?,
     };
 
-    let (token, expires) = start_session(&app, &user)?;
+    let (token, expires, lasts) = start_session(&app, &user)?;
     let _ = app.store.sessions_purge(now());
     app.store.audit(
         &user.username,
@@ -701,9 +709,9 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
     Ok((
         [(
             header::SET_COOKIE,
-            auth::session_cookie(&token, app.secure_cookies),
+            auth::session_cookie(&token, lasts, app.secure_cookies),
         )],
-        Json(me_of(&app, &user, Some(expires))),
+        Json(me_of(&app, &user, Some(expires))?),
     )
         .into_response())
 }
@@ -711,10 +719,11 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
 const CHANGED: &str = "the account changed during sign-in";
 
 /// A sign-in session for the row that was authenticated, and only that row: refused when its id
-/// has since been given to another row.
-fn start_session(app: &App, user: &User) -> ApiResult<(String, i64)> {
+/// has since been given to another row. Lasts as long as the Settings tab says at this moment.
+fn start_session(app: &App, user: &User) -> ApiResult<(String, i64, i64)> {
     let token = auth::random_token();
-    let expires = now() + auth::SESSION_TTL.as_secs() as i64;
+    let lasts = settings::read(&app.store)?.signin_secs();
+    let expires = now() + lasts;
     if !app.store.session_create(
         &auth::token_hash(&token),
         user.id,
@@ -723,7 +732,7 @@ fn start_session(app: &App, user: &User) -> ApiResult<(String, i64)> {
     )? {
         return Err(refused(app, &user.username, CHANGED));
     }
-    Ok((token, expires))
+    Ok((token, expires, lasts))
 }
 
 const THROTTLED: &str = "too many failed sign-ins; refused without checking the password";
@@ -943,7 +952,7 @@ async fn logout(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Re
 
 async fn me(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Json<Me>> {
     let expires = app.store.session_expires(&current.token_hash)?;
-    Ok(Json(me_of(&app, &current.user, expires)))
+    Ok(Json(me_of(&app, &current.user, expires)?))
 }
 
 // ---- the user's servers -----------------------------------------------------------------------
@@ -959,6 +968,8 @@ struct ListedServerJson {
     id: i64,
     name: String,
     host: String,
+    /// Filled into the server sign-in.
+    domain: Option<String>,
     saved: bool,
     connected: bool,
     reconnect: bool,
@@ -974,7 +985,7 @@ async fn my_servers(
     let connected = app.live.servers_for(user.id);
     let recent = app
         .store
-        .recent_ends(user.id, now() - auth::SESSION_TTL.as_secs() as i64)?;
+        .recent_ends(user.id, now() - settings::read(&app.store)?.signin_secs())?;
 
     // Already ordered by group order, group name, server name.
     let mut groups: Vec<ListedGroup> = Vec::new();
@@ -984,6 +995,7 @@ async fn my_servers(
             id: s.id,
             name: s.name.clone(),
             host: s.host.clone(),
+            domain: s.domain.clone(),
             saved: saved.contains(&s.id),
             connected: connected.contains(&s.id),
             reconnect: recent.contains_key(&s.id) && !connected.contains(&s.id),
@@ -1357,15 +1369,15 @@ pub mod tests {
         let g = app.store.group_create("Historians").unwrap();
         let a = app
             .store
-            .server_create("hist-01", "hist-01.example", 3389, Some(g))
+            .server_create("hist-01", "hist-01.example", 3389, Some(g), None)
             .unwrap();
         let _b = app
             .store
-            .server_create("dc-01", "dc-01.example", 3389, None)
+            .server_create("dc-01", "dc-01.example", 3389, None, None)
             .unwrap();
         let c = app
             .store
-            .server_create("eng-01", "eng-01.example", 3389, None)
+            .server_create("eng-01", "eng-01.example", 3389, None, None)
             .unwrap();
         app.store.set_assignments(uid, &[a, c]).unwrap();
         let (s, v) = call(&app, "GET", "/api/me/servers", Some(&cookie), None).await;
@@ -1384,7 +1396,7 @@ pub mod tests {
         let (_, cookie) = signed_in(&app, "jdoe");
         let other = app
             .store
-            .server_create("dc-01", "dc-01.example", 3389, None)
+            .server_create("dc-01", "dc-01.example", 3389, None, None)
             .unwrap();
         let (s1, v1) = call(
             &app,
@@ -1412,7 +1424,7 @@ pub mod tests {
         let (uid, cookie) = signed_in(&app, "jdoe");
         let a = app
             .store
-            .server_create("hist-01", "hist-01.example", 3389, None)
+            .server_create("hist-01", "hist-01.example", 3389, None, None)
             .unwrap();
         app.store.set_assignments(uid, &[a]).unwrap();
         let cred = json!({"username": "ops", "domain": "PLANT", "password": "p@ss"});
@@ -1481,7 +1493,10 @@ pub mod tests {
     async fn a_frozen_proxy_refuses_saves() {
         let app = test_app();
         let (uid, cookie) = signed_in(&app, "jdoe");
-        let a = app.store.server_create("hist-01", "h", 3389, None).unwrap();
+        let a = app
+            .store
+            .server_create("hist-01", "h", 3389, None, None)
+            .unwrap();
         app.store.set_assignments(uid, &[a]).unwrap();
         app.vault
             .set_recovery(&app.store, None, "a long recovery phrase")
@@ -1504,7 +1519,7 @@ pub mod tests {
         let app = test_app();
         let uid = app.store.user_create("jdoe", None).unwrap();
         let start = now();
-        let ttl = auth::SESSION_TTL.as_secs() as i64;
+        let ttl = crate::settings::Settings::default().signin_secs();
         let incarnation = app.store.user_by_id(uid).unwrap().unwrap().incarnation;
         app.store
             .session_create(b"h", uid, incarnation, start + ttl)
@@ -1569,6 +1584,60 @@ pub mod tests {
             .unwrap()
     }
 
+    /// The Set-Cookie header of a sign-in, whole.
+    async fn login_header(app: &Shared, username: &str, password: &str) -> String {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header(header::HOST, "proxy.test")
+            .header(header::ORIGIN, "https://proxy.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"username": username, "password": password}).to_string(),
+            ))
+            .unwrap();
+        let res = router(Arc::clone(app)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_lasts_as_long_as_the_settings_say_from_the_next_sign_in() {
+        let app = test_app_local(true, false);
+        local_account(&app, "devtest", "a dev test password");
+        let set = login_header(&app, "devtest", "a dev test password").await;
+        assert!(set.contains("Max-Age=86400"), "{set}");
+        let cookie = set.split(';').next().unwrap().to_owned();
+        let (_, me) = call(&app, "GET", "/api/me", Some(&cookie), None).await;
+        assert_eq!(me["renew_below_secs"], 18 * 3600);
+        assert!(me["max_file_bytes"].is_null(), "{me}");
+
+        crate::settings::write(
+            &app.store,
+            &crate::settings::Settings {
+                signin_hours: 2,
+                renew_below_hours: 1,
+                max_file_mb: 3,
+            },
+        )
+        .unwrap();
+        // The sign-in already made keeps its expiry; the page reads the rest at once.
+        let (_, me) = call(&app, "GET", "/api/me", Some(&cookie), None).await;
+        assert!(me["remaining_secs"].as_i64().unwrap() > 7200, "{me}");
+        assert_eq!(me["renew_below_secs"], 3600);
+        assert_eq!(me["max_file_bytes"], 3 * 1024 * 1024);
+
+        let set = login_header(&app, "devtest", "a dev test password").await;
+        assert!(set.contains("Max-Age=7200"), "{set}");
+        let cookie = set.split(';').next().unwrap().to_owned();
+        let (_, me) = call(&app, "GET", "/api/me", Some(&cookie), None).await;
+        let left = me["remaining_secs"].as_i64().unwrap();
+        assert!((7195..=7200).contains(&left), "remaining_secs {left}");
+    }
+
     #[tokio::test]
     async fn a_local_account_signs_in_with_no_directory_at_all() {
         let app = test_app_local(true, false);
@@ -1579,7 +1648,7 @@ pub mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(me["username"], "devtest");
         // A fresh sign-in reports its whole day, counted on the proxy.
-        let ttl = auth::SESSION_TTL.as_secs() as i64;
+        let ttl = crate::settings::Settings::default().signin_secs();
         let left = me["remaining_secs"].as_i64().unwrap();
         assert!((ttl - 5..=ttl).contains(&left), "remaining_secs {left}");
         let (s, _) = login_as(&app, "devtest", "not the password").await;
@@ -1717,7 +1786,10 @@ pub mod tests {
             expired: false,
         };
         let first = finish_directory(&app, &account("jsmith", "S-1-5-21-7")).unwrap();
-        let server = app.store.server_create("hist-01", "h", 3389, None).unwrap();
+        let server = app
+            .store
+            .server_create("hist-01", "h", 3389, None, None)
+            .unwrap();
         app.store.set_assignments(first.id, &[server]).unwrap();
 
         let renamed = finish_directory(&app, &account("jdoe", "S-1-5-21-7")).unwrap();

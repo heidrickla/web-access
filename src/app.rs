@@ -187,6 +187,7 @@ impl App {
                 host: t.host.clone(),
                 port: Some(t.port),
                 group: Some(Some("Imported".into())),
+                domain: None,
             })
             .collect();
         let (created, _) = self.store.servers_import(&rows)?;

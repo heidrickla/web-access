@@ -29,6 +29,7 @@ mod policy;
 mod proxy;
 mod resolve;
 mod server;
+mod settings;
 mod store;
 mod vault;
 mod web;

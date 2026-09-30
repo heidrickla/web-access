@@ -66,7 +66,7 @@ The proxy never decodes RDP. It decides who may reach which server, and relays.
 | Local accounts for testing: an Argon2id hash in the database, created on the command line, signing in only with `allow_local_accounts = true`; the directory section becomes optional | settled (Lewis, 2026-09-24) |
 | Saved credentials live in a proxy-side encrypted store, per user and per server | settled (Lewis, 2026-09-23); see below |
 | Server lists are maintained by hand on the proxy, per user; IT revokes access by disabling the account | settled (Lewis, 2026-09-23) |
-| A sign-in lasts 24 hours and survives a browser restart; opening a server with under 18 hours left asks for the password again | settled: shifts run 9 to 18 hours (Lewis, 2026-09-23 and 2026-09-29) |
+| A sign-in lasts 24 hours and survives a browser restart; opening a server with under 18 hours left asks for the password again. Both are defaults an administrator changes on the Settings tab | settled: shifts run 9 to 18 hours (Lewis, 2026-09-23 and 2026-09-29); configurable (Lewis, 2026-09-30) |
 | Migration: saved credentials move with the database, by export and import in the admin pages | settled: about 3000 users and 4 administrators, so re-entry is not an option (Lewis, 2026-09-23) |
 | The client sends a target id, never an address | settled by design. Cloudflare's `/rdp/<vnet>/<ip>/<port>` lets the browser name the destination, so the allowlist is all that stands between a crafted request and an unlisted host. An opaque id makes reaching an arbitrary host inexpressible rather than forbidden |
 | Resolve by name, not by address | settled (Lewis, 2026-09-23) |
@@ -91,7 +91,7 @@ With no agents, nothing outside the proxy constrains which hosts it opens a sock
 - After the bind, LDAP WhoAmI names the account the password was checked for, and that account is the one signed in. With `netbios` set, an account in another domain is refused.
 - Active Directory refuses the bind for a disabled, expired, locked or restricted account, or one whose password must change. The `data <code>` in its answer is read: codes it returns only for the right password (532, 773, 530, 531, 533, 701) are named to the user; a lockout (775) is returned whatever password was typed, so it is logged and reported as an ordinary refusal.
 - A sign-in finds its row by username, then by SID, so an account renamed in the directory keeps its row, servers and saved credentials. The SID is bound at first sign-in; a different account arriving under a bound username is refused and flagged to administrators, so a reused username inherits nothing.
-- The session is a random token in an `HttpOnly; SameSite=Strict` cookie, persistent for 24 hours. The database keeps its SHA-256, so sessions survive a service restart and move with an export. `/api/me` reports the seconds left, counted on the proxy.
+- The session is a random token in an `HttpOnly; SameSite=Strict` cookie, persistent for as long as the sign-in lasts. The length is read from the Settings tab at each sign-in or renewal; a sign-in already made keeps its expiry. The database keeps its SHA-256, so sessions survive a service restart and move with an export. `/api/me` reports the seconds left, counted on the proxy.
 - With a service account configured, signed-in accounts are re-checked every `check_interval_secs`. An account that is disabled, expired, gone or re-created loses its sessions and its live RDP connections. A lookup that fails skips that account only; a pass that cannot run revokes nothing. The last pass's outcome is kept for the Migration tab, and the Activity log records when checks start failing and when they recover. The domain controller that last answered is tried first.
 - A click mints a connect ticket: 60 seconds, single use, bound to the user and the server. The WebSocket must carry the session cookie of the same user and a same-origin `Origin`; the ticket travels in the RDCleanPath request and is checked with the cookie and the assignment at admission. The browser takes its ticket after the credentials dialog closes, immediately before connecting.
 - A connection is registered at upgrade, before anything is read, and belongs to the sign-in it was opened under. Admission re-checks that sign-in, the ticket and the assignment. Revocation, sign-out, the sign-in expiring, the assignment or server being removed, or an import ends it at any stage, setting up or established. Each setup stage has a deadline.
@@ -128,6 +128,7 @@ SQLite in WAL mode, one connection behind a mutex for requests. A reader and the
 | Service log | one file per UTC day, the newest 30 |
 | Import backups | the newest 5 |
 | Schema backup | one per upgrade that changes the schema |
+| Settings | one JSON value in `meta`, written whole; a stored value that fails the checks reads as the defaults. The file-size limit is kept by the page: its purpose is sparing the network |
 | Uploaded imports awaiting confirmation | at most 2, each for 30 minutes |
 | Sign-in sessions | until they expire, purged every 30 seconds |
 

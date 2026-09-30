@@ -705,7 +705,7 @@ mod tests {
         let (uid, cookie) = signed_in(&app, "jdoe");
         let s = app
             .store
-            .server_create("hist-01", "hist-01.example", 3389, None)
+            .server_create("hist-01", "hist-01.example", 3389, None, None)
             .unwrap();
         app.store.set_assignments(uid, &[s]).unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
@@ -730,7 +730,7 @@ mod tests {
         let (uid, cookie) = signed_in(&app, "jdoe");
         let s = app
             .store
-            .server_create("hist-01", "hist-01.example", 3389, None)
+            .server_create("hist-01", "hist-01.example", 3389, None, None)
             .unwrap();
         app.store.set_assignments(uid, &[s]).unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
@@ -759,7 +759,7 @@ mod tests {
         let (other, _) = signed_in(&app, "asmith");
         let s = app
             .store
-            .server_create("hist-01", "hist-01.example", 3389, None)
+            .server_create("hist-01", "hist-01.example", 3389, None, None)
             .unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
         let hash = hash_of(&cookie);
@@ -791,7 +791,7 @@ mod tests {
         let (uid, cookie) = signed_in(&app, "jdoe");
         let s = app
             .store
-            .server_create("hist-01", "hist-01.example", 3389, None)
+            .server_create("hist-01", "hist-01.example", 3389, None, None)
             .unwrap();
         app.store.set_assignments(uid, &[s]).unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();
@@ -818,7 +818,10 @@ mod tests {
     async fn a_session_ended_by_an_import_writes_nothing_into_the_new_database() {
         let app = test_app();
         let (uid, _) = signed_in(&app, "jdoe");
-        let s = app.store.server_create("hist-01", "h", 3389, None).unwrap();
+        let s = app
+            .store
+            .server_create("hist-01", "h", 3389, None, None)
+            .unwrap();
         let incarnations = app.store.incarnations(uid, s).unwrap();
         let ended = crate::live::Ended {
             user_id: uid,
@@ -844,7 +847,10 @@ mod tests {
     async fn a_late_session_end_never_lands_on_a_row_that_reused_its_id() {
         let app = test_app();
         let uid = app.store.user_create("jdoe", None).unwrap();
-        let s = app.store.server_create("hist-01", "h", 3389, None).unwrap();
+        let s = app
+            .store
+            .server_create("hist-01", "h", 3389, None, None)
+            .unwrap();
         let ended = crate::live::Ended {
             user_id: uid,
             server_id: Some(s),
@@ -892,7 +898,7 @@ mod tests {
         let (uid, cookie) = signed_in(&app, "jdoe");
         let s = app
             .store
-            .server_create("hist-01", "hist-01.example", 3389, None)
+            .server_create("hist-01", "hist-01.example", 3389, None, None)
             .unwrap();
         let server = app.store.server_by_id(s).unwrap().unwrap();
         let user = app.store.user_by_id(uid).unwrap().unwrap();

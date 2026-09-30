@@ -255,20 +255,29 @@ $('add-user').addEventListener('submit', async ev => {
 });
 
 /// Unsaved ticks on the selected user's servers.
-function hasUnsaved() {
+function ticksUnsaved() {
   if (selected === null) return false;
   if (assigned.size !== savedAssigned.size) return true;
   return [...assigned].some(x => !savedAssigned.has(x));
 }
 
+function hasUnsaved() {
+  return ticksUnsaved() || settingsUnsaved();
+}
+
 /// True when there is nothing unsaved, or the administrator agrees to lose it.
 function discardUnsaved() {
-  if (!hasUnsaved()) return true;
-  const u = users.find(x => x.id === selected);
-  if (!confirm(`Discard the unsaved changes to ${u ? u.username : 'this user'}'s servers?`)) return false;
-  assigned = new Set(savedAssigned);
-  // The ticks on screen match what is kept, whatever happens next.
-  renderChecklist();
+  if (ticksUnsaved()) {
+    const u = users.find(x => x.id === selected);
+    if (!confirm(`Discard the unsaved changes to ${u ? u.username : 'this user'}'s servers?`)) return false;
+    assigned = new Set(savedAssigned);
+    // The ticks on screen match what is kept, whatever happens next.
+    renderChecklist();
+  }
+  if (settingsUnsaved()) {
+    if (!confirm('Discard the unsaved settings?')) return false;
+    showSettings(savedSettings);
+  }
   return true;
 }
 
@@ -472,7 +481,7 @@ function renderServers() {
   let shown = 0;
   let hidden = 0;
   for (const s of [...serverList].sort((a, b) => a.name.localeCompare(b.name))) {
-    if (q && !(s.name + ' ' + s.host + ' ' + groupName(s.group_id)).toLowerCase().includes(q)) continue;
+    if (q && !(s.name + ' ' + s.host + ' ' + groupName(s.group_id) + ' ' + (s.domain || '')).toLowerCase().includes(q)) continue;
     if (shown >= MAX_ROWS) {
       hidden++;
       continue;
@@ -483,12 +492,13 @@ function renderServers() {
       el('td', { text: s.host }),
       el('td', { class: 'num', text: String(s.port) }),
       el('td', { text: groupName(s.group_id) }),
+      el('td', { text: s.domain || '' }),
       el('td', { class: 'num', text: String(s.assigned) }),
       el('td', { class: 'actions' },
         el('button', { class: 'ghost', text: 'Edit', onclick: () => editServer(s) }),
         el('button', { class: 'danger', text: 'Delete', onclick: () => deleteServer(s) }))));
   }
-  moreRow(body, hidden, 6);
+  moreRow(body, hidden, 7);
 }
 
 $('server-filter').addEventListener('input', debounced(renderServers));
@@ -500,6 +510,7 @@ function editServer(s) {
   $('sf-host').value = s.host;
   $('sf-port').value = s.port;
   $('sf-group').value = s.group_id === null ? '' : String(s.group_id);
+  $('sf-domain').value = s.domain || '';
   $('sf-go').textContent = 'Save changes';
   $('sf-cancel').hidden = false;
   $('sf-name').focus();
@@ -523,6 +534,7 @@ $('server-form').addEventListener('submit', async ev => {
     host: $('sf-host').value,
     port: Number($('sf-port').value) || 3389,
     group_id: $('sf-group').value ? Number($('sf-group').value) : null,
+    domain: $('sf-domain').value,
   };
   try {
     if (editing) await api('PATCH', `/api/admin/servers/${editing}`, body);
@@ -675,6 +687,46 @@ $('audit-filter').addEventListener('input', debounced(() => loaders.activity().c
 
 let migration = null;
 let upload = null;
+
+/* ---- settings ----------------------------------------------------------------------------- */
+
+let savedSettings = null;
+
+function settingsInputs() {
+  return {
+    signin_hours: Number($('set-signin').value),
+    renew_below_hours: Number($('set-renew').value),
+    max_file_mb: Number($('set-maxfile').value),
+  };
+}
+
+function showSettings(s) {
+  savedSettings = s;
+  $('set-signin').value = s.signin_hours;
+  $('set-renew').value = s.renew_below_hours;
+  $('set-maxfile').value = s.max_file_mb;
+}
+
+/// Values typed on the Settings tab and not saved.
+function settingsUnsaved() {
+  if (!savedSettings) return false;
+  const typed = settingsInputs();
+  return Object.keys(typed).some(k => typed[k] !== savedSettings[k]);
+}
+
+loaders.settings = async () => {
+  showSettings(await api('GET', '/api/admin/settings'));
+};
+
+$('settings-form').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const body = settingsInputs();
+  try {
+    await api('PUT', '/api/admin/settings', body);
+    showSettings(body);
+    say('settings saved');
+  } catch (err) { fail(err); }
+});
 
 loaders.migration = async () => {
   migration = await refreshBanner();

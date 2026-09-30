@@ -599,7 +599,7 @@ mod tests {
         let g = old.store.group_create("Historians").unwrap();
         let s = old
             .store
-            .server_create("hist-01", "hist-01.example", 3389, Some(g))
+            .server_create("hist-01", "hist-01.example", 3389, Some(g), None)
             .unwrap();
         old.store.set_assignments(uid, &[s]).unwrap();
         old.vault.set_recovery(&old.store, None, PASS).unwrap();
@@ -735,7 +735,7 @@ mod tests {
         old.vault.set_recovery(&old.store, None, PASS).unwrap();
         old.store.user_create("jdoe", None).unwrap();
         new.store
-            .server_create("existing", "e.example", 3389, None)
+            .server_create("existing", "e.example", 3389, None, None)
             .unwrap();
 
         let exported = export(&old, PASS).unwrap();
