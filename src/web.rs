@@ -96,6 +96,11 @@ pub const ASSETS: &[(&str, &str, &[u8])] = &[
         include_bytes!("../web/admin.js"),
     ),
     (
+        "/theme.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/theme.js"),
+    ),
+    (
         "/ironrdp_web.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../web/ironrdp_web.js"),
@@ -1726,8 +1731,8 @@ pub mod tests {
     #[test]
     fn everything_the_pages_reference_is_served() {
         for (path, needles) in [
-            ("/", vec!["./app.css", "./app.js"]),
-            ("/admin", vec!["./app.css", "./admin.js"]),
+            ("/", vec!["./app.css", "./app.js", "./theme.js"]),
+            ("/admin", vec!["./app.css", "./admin.js", "./theme.js"]),
         ] {
             let html = page(path);
             for needle in needles {

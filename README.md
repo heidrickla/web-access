@@ -235,7 +235,8 @@ client is `ironrdp-web` compiled to WebAssembly and delivered by the proxy itsel
 | `web/ironrdp_web.js` | wasm-bindgen glue |
 | `web/index.html`, `web/app.js` | sign-in, the server list, the session |
 | `web/admin.html`, `web/admin.js` | the admin pages |
-| `web/app.css` | both pages |
+| `web/app.css` | both pages; dark by default, with a light theme |
+| `web/theme.js` | both pages: applies the stored theme before the page paints, and the header's theme button |
 
 Every page asset is a separate file: the proxy sends `default-src 'self'`, which forbids inline
 `<style>`, `<script>`, style attributes and event handlers. A test asserts no page carries one. All
