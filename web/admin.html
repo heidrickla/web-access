@@ -32,6 +32,7 @@
     <button data-tab="servers">Servers</button>
     <button data-tab="groups">Groups</button>
     <button data-tab="activity">Activity</button>
+    <button data-tab="settings">Settings</button>
     <button data-tab="migration">Migration</button>
   </nav>
 
@@ -83,16 +84,17 @@
             <label class="narrow">Port<input id="sf-port" type="number" min="1" max="65535" value="3389"></label>
             <label>Group<select id="sf-group"></select></label>
           </div>
+          <label>Default domain <span class="hint">optional, filled into the server sign-in</span><input id="sf-domain" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
           <div class="form-row">
             <button type="submit" class="primary" id="sf-go">Add server</button>
             <button type="button" class="ghost" id="sf-cancel" hidden>Cancel edit</button>
           </div>
         </form>
         <h3>Import from CSV</h3>
-        <p class="note">One server per line: <code>name,host,port,group</code>. Port and group are optional. A server whose name already exists is updated. Nothing is imported unless every line is valid.</p>
+        <p class="note">One server per line: <code>name,host,port,group,domain</code>. Everything after the host is optional. A server whose name already exists is updated: a column left out keeps what it has, and an empty group or domain clears it. Nothing is imported unless every line is valid.</p>
         <div class="stack">
           <input id="csv-file" type="file" accept=".csv,text/csv,text/plain">
-          <textarea id="csv-text" rows="6" spellcheck="false" placeholder="hist-01,hist-01.plant.example,3389,Historians"></textarea>
+          <textarea id="csv-text" rows="6" spellcheck="false" placeholder="hist-01,hist-01.plant.example,3389,Historians,PLANT"></textarea>
           <div class="form-row"><button id="csv-go" class="primary">Import</button></div>
           <ul id="csv-errors" class="errors" hidden></ul>
         </div>
@@ -101,7 +103,7 @@
         <h2>Servers</h2>
         <input id="server-filter" type="search" placeholder="Filter servers" aria-label="Filter servers" autocomplete="off">
         <table class="grid" id="server-table">
-          <thead><tr><th>Name</th><th>Host</th><th>Port</th><th>Group</th><th>Users</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>Host</th><th>Port</th><th>Group</th><th>Domain</th><th>Users</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -134,6 +136,26 @@
         <tbody></tbody>
       </table>
       <div class="form-row"><button id="audit-more" class="ghost">Load older</button></div>
+    </div>
+  </section>
+
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <h2>Settings</h2>
+      <form id="settings-form" class="stack">
+        <h3>Sign-in</h3>
+        <div class="form-row">
+          <label>Sign-in lasts, hours<input id="set-signin" type="number" min="1" max="720" step="1" required></label>
+          <label>Ask for the password again under, hours<input id="set-renew" type="number" min="0" max="719" step="1" required></label>
+        </div>
+        <p class="note">A sign-in lasts this long from the sign-in or its renewal. Opening a server with less time left than the second number asks for the password first, so a desktop is not cut off when the sign-in ends; 0 never asks. A change applies to the next sign-in; sign-ins already made keep their end.</p>
+        <h3>File transfer</h3>
+        <div class="form-row">
+          <label>Largest file, MB<input id="set-maxfile" type="number" min="0" step="1" required></label>
+        </div>
+        <p class="note">Each file sent to or fetched from a desktop, both ways; 0 is no limit. Applies from each user's next page load or sign-in.</p>
+        <div class="form-row"><button type="submit" class="primary">Save settings</button></div>
+      </form>
     </div>
   </section>
 

@@ -6,6 +6,8 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 
 ### Added
 
+- A Settings tab: how long a sign-in lasts, when opening a server asks for the password again, and the largest file sent or fetched over the clipboard. A larger file is refused.
+- A default domain per server, set on the Servers tab or as the fifth CSV column, filled into the server sign-in.
 - A light theme beside the dark default, a phone layout, server tiles whose whole area opens the server, and a refreshed look on both pages.
 - `--version`, and the version with its source revision at the start of each run in the log and on the Migration tab.
 - Recovery without the passphrase: `set-secret recovery --replace` gives the key this host holds a new passphrase, and Reset the credential store (Migration tab, or `reset-credentials`) starts a store nothing can open over. `unlock` on the command line.

@@ -33,8 +33,14 @@ check "jdoe added and found in the directory" true "$(curl -s "${A[@]}" -d '{"us
 curl -s "${A[@]}" -d '{"username":"asmith"}' "$B/api/admin/users" >/dev/null
 gid=$(curl -s "${A[@]}" -d '{"name":"Test Targets"}' "$B/api/admin/groups" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 sid=$(curl -s "${A[@]}" -d "{\"name\":\"xrdp-01\",\"host\":\"127.0.0.1\",\"port\":13389,\"group_id\":$gid}" "$B/api/admin/servers" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
-csv='name,host,port,group\nhist-01,hist-01.plant.example,,Historians\neng-01,eng-01.plant.example,3389,Engineering'
+csv='name,host,port,group,domain\nhist-01,hist-01.plant.example,,Historians\neng-01,eng-01.plant.example,3389,Engineering,PLANT'
 check "CSV import" 200 "$(code "${A[@]}" -d "{\"csv\":\"$csv\"}" "$B/api/admin/servers/import")"
+check "CSV import sets a default domain" PLANT "$(curl -s -b boss.jar "$B/api/admin/servers" | python3 -c 'import sys,json;print([s["domain"] for s in json.load(sys.stdin)["servers"] if s["name"]=="eng-01"][0])')"
+check "settings start at the defaults" '{"signin_hours":24,"renew_below_hours":18,"max_file_mb":0}' "$(curl -s -b boss.jar "$B/api/admin/settings")"
+check "a renewal point at the sign-in length is refused" 400 "$(code -X PUT "${A[@]}" -d '{"signin_hours":8,"renew_below_hours":8,"max_file_mb":0}' "$B/api/admin/settings")"
+check "settings saved" 204 "$(code -X PUT "${A[@]}" -d '{"signin_hours":8,"renew_below_hours":4,"max_file_mb":2}' "$B/api/admin/settings")"
+check "the next sign-in lasts as long as the settings say" 'Max-Age=28800' "$(curl -s -D - -o /dev/null "${O[@]}" -d "{\"username\":\"asmith\",\"password\":\"$USER_PASS\"}" "$B/api/login" | tr -d '\r' | grep -o 'Max-Age=[0-9]*')"
+check "settings back to the defaults" 204 "$(code -X PUT "${A[@]}" -d '{"signin_hours":24,"renew_below_hours":18,"max_file_mb":0}' "$B/api/admin/settings")"
 jdoe_id=$(curl -s -b boss.jar "$B/api/admin/users" | python3 -c 'import sys,json;print([u["id"] for u in json.load(sys.stdin)["users"] if u["username"]=="jdoe"][0])')
 hist=$(curl -s -b boss.jar "$B/api/admin/servers" | python3 -c 'import sys,json;print([s["id"] for s in json.load(sys.stdin)["servers"] if s["name"]=="hist-01"][0])')
 check "a change carrying another data instance is refused" 409 "$(code -X PUT -b boss.jar "${O[@]}" -H 'X-Data-Instance: stale' -d "{\"server_ids\":[$sid]}" "$B/api/admin/users/$jdoe_id/servers")"

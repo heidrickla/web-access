@@ -715,6 +715,10 @@ async function downloadRemoteFile(index, li) {
       const view = new DataView(sized.buffer, sized.byteOffset, sized.byteLength);
       total = Number(view.getBigUint64(0, true));
     }
+    const limit = fileLimit();
+    if (tooLarge([{ size: total }], limit).length) {
+      throw new Error(meta.name + ' is larger than the ' + humanSize(limit) + ' limit');
+    }
     const parts = [];
     for (let at = 0; at < total; at += CHUNK) {
       const want = Math.min(CHUNK, total - at);
@@ -747,16 +751,34 @@ function fileRow(name, size) {
   return li;
 }
 
+/// The largest file sent or fetched, in bytes, or null for no limit (Settings tab).
+function fileLimit() {
+  return me && Number.isFinite(me.max_file_bytes) ? me.max_file_bytes : null;
+}
+
+/// The files larger than `limit`; none when there is no limit.
+function tooLarge(files, limit) {
+  return limit === null ? [] : files.filter(f => Number(f.size) > limit);
+}
+
 function renderIncoming() {
   const list = $('incoming');
   list.innerHTML = '';
   $('incoming-head').hidden = remoteFiles.length === 0;
   remoteFiles.forEach((f, i) => {
     const li = fileRow(f.name, Number(f.size) || 0);
-    const get = document.createElement('button');
-    get.textContent = 'Download';
-    get.addEventListener('click', () => downloadRemoteFile(i, li));
-    li.append(get);
+    const limit = fileLimit();
+    if (tooLarge([f], limit).length) {
+      const too = document.createElement('span');
+      too.className = 'fsize';
+      too.textContent = 'over the ' + humanSize(limit) + ' limit';
+      li.append(too);
+    } else {
+      const get = document.createElement('button');
+      get.textContent = 'Download';
+      get.addEventListener('click', () => downloadRemoteFile(i, li));
+      li.append(get);
+    }
     list.append(li);
   });
 }
@@ -769,6 +791,12 @@ function renderOutgoing() {
 
 function offerFiles(files) {
   if (!session || !files.length) return;
+  const limit = fileLimit();
+  const over = tooLarge(Array.from(files), limit);
+  if (over.length) {
+    say('nothing sent: ' + over.map(f => f.name).join(', ') + ' larger than the ' + humanSize(limit) + ' limit', true);
+    return;
+  }
   outgoing = Array.from(files);
   renderOutgoing();
   try {
@@ -793,6 +821,11 @@ $('files-note').textContent =
 
 /* ---- opening a server --------------------------------------------------------------------- */
 
+/// The domain the server sign-in starts with: the one just tried, else the server's default.
+function startDomain(prefill, server) {
+  return prefill.domain || server.domain || '';
+}
+
 /// Ask for the server's credentials. `prefill` carries a username and domain to start from, and a
 /// note when a saved credential was just refused.
 function askCredentials(server, prefill = {}) {
@@ -804,7 +837,7 @@ function askCredentials(server, prefill = {}) {
     note.textContent = prefill.note || '';
     $('u').value = prefill.username || '';
     $('p').value = '';
-    $('d').value = prefill.domain || '';
+    $('d').value = startDomain(prefill, server);
     $('save').checked = !!prefill.save;
 
     const done = () => {
@@ -831,9 +864,12 @@ function askCredentials(server, prefill = {}) {
 // Cancel is an ordinary button, so Enter in the dialog submits it with Connect.
 $('signin-cancel').addEventListener('click', () => $('signin').close('cancel'));
 
-// A session lives only as long as the sign-in it opens under. With less than the longest shift left,
-// the page offers to renew the sign-in before connecting, so the desktop is not cut mid-shift.
-const LONGEST_SHIFT = 18 * 60 * 60;
+// A session lives only as long as the sign-in it opens under. With less left than the renewal point
+// on the Settings tab, the page asks for the password before connecting, so the desktop is not cut
+// mid-shift. 0 never asks.
+function renewBelow() {
+  return me && Number.isFinite(me.renew_below_secs) ? me.renew_below_secs : 18 * 60 * 60;
+}
 
 /// "3 hours", or minutes under the last hour.
 function lasting(secs) {
@@ -894,7 +930,7 @@ async function openServer(id) {
   opening = server;
   say('opening ' + server.name);   // the client may still be loading; say so rather than nothing
   try {
-    if (signInRemaining() < LONGEST_SHIFT) await renewSignIn();
+    if (signInRemaining() < renewBelow()) await renewSignIn();
     await connectTo(server, id);
   } finally {
     opening = null;

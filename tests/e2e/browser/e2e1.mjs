@@ -173,6 +173,38 @@ try {
   check('after Add User the pane shows the new user with an empty list',
     added.includes('gone') && addedTicked === 0, `title=${added} ticked=${addedTicked}`);
   await admin.page.unroute('**/api/admin/users');
+
+  // The Settings tab: the defaults, a guard on unsaved values, a save that survives a reload.
+  const settingValues = () => admin.page.$$eval('#set-signin, #set-renew, #set-maxfile', els => els.map(e => e.value));
+  await admin.page.click('nav.tabs button[data-tab="settings"]');
+  await admin.page.waitForFunction(() => document.getElementById('set-signin').value !== '', null, { timeout: 5000 }).catch(() => {});
+  check('the Settings tab shows the defaults', JSON.stringify(await settingValues()) === '["24","18","0"]', JSON.stringify(await settingValues()));
+  await admin.page.fill('#set-signin', '12');
+  await admin.page.fill('#set-renew', '8');
+  await admin.page.fill('#set-maxfile', '5');
+  let settingsAsked = '';
+  admin.page.once('dialog', d => { settingsAsked = d.message(); d.dismiss(); });
+  await admin.page.click('nav.tabs button[data-tab="servers"]');
+  await admin.page.waitForTimeout(300);
+  check('leaving unsaved settings asks first and stays',
+    settingsAsked.includes('unsaved settings') && await admin.page.isVisible('#tab-settings'), `asked=${settingsAsked}`);
+  await admin.page.click('#settings-form button[type=submit]');
+  await admin.page.waitForFunction(() => document.querySelector('#status')?.textContent.includes('settings saved'), null, { timeout: 5000 }).catch(() => {});
+  await admin.page.reload();
+  await admin.page.waitForFunction(() => document.getElementById('set-signin')?.value === '12', null, { timeout: 5000 }).catch(() => {});
+  check('saved settings are kept across a reload', JSON.stringify(await settingValues()) === '["12","8","5"]', JSON.stringify(await settingValues()));
+  await shot(admin.page, '08-admin-settings');
+
+  // A default domain on hist-01, for the server sign-in below.
+  await admin.page.click('nav.tabs button[data-tab="servers"]');
+  await admin.page.waitForSelector('#server-table tbody tr:has-text("hist-01")');
+  await admin.page.click('#server-table tbody tr:has-text("hist-01") button:has-text("Edit")');
+  await admin.page.fill('#sf-domain', 'PLANT');
+  await admin.page.click('#sf-go');
+  const withDomain = '#server-table tbody tr:has-text("hist-01"):has-text("PLANT")';
+  await admin.page.waitForSelector(withDomain, { timeout: 5000 }).catch(() => {});
+  check('the server table shows the default domain', await admin.page.isVisible(withDomain));
+
   for (const tab of ['servers', 'groups', 'activity', 'migration']) {
     await admin.page.click(`nav.tabs button[data-tab="${tab}"]`);
     await admin.page.waitForTimeout(700);
@@ -181,6 +213,31 @@ try {
   const actions = await admin.page.$$eval('#audit-table tbody td:nth-child(3)', tds => tds.map(t => t.textContent));
   check('activity records the session and the saved credential',
     actions.includes('session.open') && actions.includes('credential.save'), JSON.stringify(actions.slice(0, 12)));
+  check('activity records the settings change', actions.includes('settings.change'), JSON.stringify(actions.slice(0, 12)));
+
+  // jdoe's page: the server sign-in starts with hist-01's domain, and the settings reach it.
+  const user = await newPage(browser, { storageState: '/work/jdoe-state.json' });
+  await user.page.goto(P1 + '/');
+  await user.page.waitForSelector('#list:not([hidden])');
+  await user.page.click('#expand-all');
+  await user.page.click('button.srv:has-text("hist-01")');
+  await user.page.waitForSelector('dialog#signin[open]', { timeout: 15000 }).catch(() => {});
+  const startedWith = await user.page.inputValue('#d');
+  check("the server sign-in starts with the server's default domain", startedWith === 'PLANT', `domain=${startedWith}`);
+  await user.page.click('#signin-cancel');
+  const told = await user.page.evaluate(() => fetch('/api/me').then(r => r.json()));
+  check('the page is told the file limit and the renewal point',
+    told.max_file_bytes === 5 * 1024 * 1024 && told.renew_below_secs === 8 * 3600, JSON.stringify(told));
+  await user.ctx.close();
+
+  // Back to the defaults, for the phases after this one.
+  await admin.page.click('nav.tabs button[data-tab="settings"]');
+  await admin.page.waitForFunction(() => document.getElementById('set-signin').value === '12', null, { timeout: 5000 }).catch(() => {});
+  await admin.page.fill('#set-signin', '24');
+  await admin.page.fill('#set-renew', '18');
+  await admin.page.fill('#set-maxfile', '0');
+  await admin.page.click('#settings-form button[type=submit]');
+  await admin.page.waitForFunction(() => document.querySelector('#status')?.textContent.includes('settings saved'), null, { timeout: 5000 }).catch(() => {});
   await admin.ctx.close();
 
   // A non-admin gets the denial page, not the tabs.

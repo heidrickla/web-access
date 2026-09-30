@@ -622,7 +622,9 @@ mod tests {
             .unwrap();
         store.meta_set("directory_password", b"sealed").unwrap();
         let user = store.user_create("alice", None).unwrap();
-        let server = store.server_create("hist-01", "h", 3389, None).unwrap();
+        let server = store
+            .server_create("hist-01", "h", 3389, None, None)
+            .unwrap();
         let (nonce, ct) = first.seal(b"aad", b"pw").unwrap();
         store
             .credential_put(

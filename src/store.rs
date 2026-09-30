@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// v2: local accounts. A user row with a password hash signs in against it, never the directory.
 const SCHEMA_V2: &str = "ALTER TABLE users ADD COLUMN local_hash TEXT;";
@@ -76,6 +76,9 @@ INSERT INTO server_groups_v5 (id, name, sort) SELECT id, name, sort FROM server_
 DROP TABLE server_groups;
 ALTER TABLE server_groups_v5 RENAME TO server_groups;
 ";
+
+/// v6: the domain the server sign-in starts with, set once per server by an administrator.
+const SCHEMA_V6: &str = "ALTER TABLE servers ADD COLUMN domain TEXT;";
 
 const SCHEMA_V1: &str = "
 CREATE TABLE meta (
@@ -205,6 +208,8 @@ pub struct Server {
     pub host: String,
     pub port: u16,
     pub group_id: Option<i64>,
+    /// Filled into the server sign-in; the user can change it.
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +260,8 @@ pub struct ImportRow {
     /// None when the column is absent: an update keeps the group, a new server has none.
     /// `Some(None)` for an empty cell: the server is ungrouped.
     pub group: Option<Option<String>>,
+    /// The same for the default domain: absent keeps it, an empty cell clears it.
+    pub domain: Option<Option<String>>,
 }
 
 pub struct Store {
@@ -349,6 +356,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     if found < 5 {
         rebuild_with_foreign_keys_off(conn, SCHEMA_V5, 5)?;
     }
+    if found < 6 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V6} PRAGMA user_version = 6; COMMIT;"
+        ))?;
+    }
     Ok(())
 }
 
@@ -376,10 +388,13 @@ fn server_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Server> {
         host: r.get(2)?,
         port: r.get::<_, i64>(3)? as u16,
         group_id: r.get(4)?,
+        domain: r.get(5)?,
     })
 }
 
-const SERVER_COLS: &str = "s.id, s.name, s.host, s.port, s.group_id";
+const SERVER_COLS: &str = "s.id, s.name, s.host, s.port, s.group_id, s.domain";
+/// The first column after `SERVER_COLS`.
+const AFTER_SERVER: usize = 6;
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -837,7 +852,7 @@ impl Store {
             .query_map([], |r| {
                 Ok(ServerRow {
                     server: server_from(r)?,
-                    assigned: r.get(5)?,
+                    assigned: r.get(AFTER_SERVER)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -861,13 +876,14 @@ impl Store {
         host: &str,
         port: u16,
         group_id: Option<i64>,
+        domain: Option<&str>,
     ) -> Result<i64> {
         let c = self.c();
         name_free(&c, name, None)?;
         group_exists(&c, group_id)?;
         c.execute(
-            "INSERT INTO servers (name, host, port, group_id) VALUES (?1, ?2, ?3, ?4)",
-            params![name, host, port as i64, group_id],
+            "INSERT INTO servers (name, host, port, group_id, domain) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, host, port as i64, group_id, domain],
         )?;
         Ok(c.last_insert_rowid())
     }
@@ -879,13 +895,15 @@ impl Store {
         host: &str,
         port: u16,
         group_id: Option<i64>,
+        domain: Option<&str>,
     ) -> Result<()> {
         let c = self.c();
         name_free(&c, name, Some(id))?;
         group_exists(&c, group_id)?;
         let n = c.execute(
-            "UPDATE servers SET name = ?2, host = ?3, port = ?4, group_id = ?5 WHERE id = ?1",
-            params![id, name, host, port as i64, group_id],
+            "UPDATE servers SET name = ?2, host = ?3, port = ?4, group_id = ?5, domain = ?6
+             WHERE id = ?1",
+            params![id, name, host, port as i64, group_id, domain],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound);
@@ -934,26 +952,31 @@ impl Store {
                 Some(id) => {
                     tx.execute(
                         "UPDATE servers SET host = ?2, port = COALESCE(?3, port),
-                           group_id = CASE WHEN ?5 THEN ?4 ELSE group_id END
+                           group_id = CASE WHEN ?5 THEN ?4 ELSE group_id END,
+                           domain = CASE WHEN ?7 THEN ?6 ELSE domain END
                          WHERE id = ?1",
                         params![
                             id,
                             row.host,
                             row.port.map(i64::from),
                             group_id,
-                            row.group.is_some()
+                            row.group.is_some(),
+                            row.domain.clone().flatten(),
+                            row.domain.is_some()
                         ],
                     )?;
                     updated += 1;
                 }
                 None => {
                     tx.execute(
-                        "INSERT INTO servers (name, host, port, group_id) VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT INTO servers (name, host, port, group_id, domain)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
                         params![
                             row.name,
                             row.host,
                             i64::from(row.port.unwrap_or(3389)),
-                            group_id
+                            group_id,
+                            row.domain.clone().flatten()
                         ],
                     )?;
                     created += 1;
@@ -1001,7 +1024,7 @@ impl Store {
             .query_map([user_id], |r| {
                 Ok(ListedServer {
                     server: server_from(r)?,
-                    group_name: r.get(5)?,
+                    group_name: r.get(AFTER_SERVER)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1491,10 +1514,10 @@ mod tests {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
         let a = s
-            .server_create("hist-01", "hist-01.example", 3389, None)
+            .server_create("hist-01", "hist-01.example", 3389, None, None)
             .unwrap();
         let b = s
-            .server_create("eng-02", "eng-02.example", 3389, None)
+            .server_create("eng-02", "eng-02.example", 3389, None, None)
             .unwrap();
         assert_eq!(s.set_assignments(u, &[a, b]).unwrap(), (2, 0));
         assert_eq!(s.set_assignments(u, &[b]).unwrap(), (0, 1));
@@ -1514,7 +1537,7 @@ mod tests {
     fn removing_an_assignment_removes_its_saved_credential() {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
-        let a = s.server_create("hist-01", "h", 3389, None).unwrap();
+        let a = s.server_create("hist-01", "h", 3389, None, None).unwrap();
         s.set_assignments(u, &[a]).unwrap();
         let cred = StoredCredential {
             username: "x".into(),
@@ -1531,7 +1554,9 @@ mod tests {
     fn a_group_with_servers_cannot_be_deleted() {
         let s = store();
         let g = s.group_create("Historians").unwrap();
-        let sv = s.server_create("hist-01", "h", 3389, Some(g)).unwrap();
+        let sv = s
+            .server_create("hist-01", "h", 3389, Some(g), None)
+            .unwrap();
         assert!(matches!(s.group_delete(g), Err(StoreError::Conflict(_))));
         s.server_delete(sv).unwrap();
         s.group_delete(g).unwrap();
@@ -1540,9 +1565,9 @@ mod tests {
     #[test]
     fn server_names_are_unique_regardless_of_case() {
         let s = store();
-        s.server_create("Hist-01", "h", 3389, None).unwrap();
+        s.server_create("Hist-01", "h", 3389, None, None).unwrap();
         assert!(matches!(
-            s.server_create("hist-01", "h2", 3389, None),
+            s.server_create("hist-01", "h2", 3389, None, None),
             Err(StoreError::Conflict(_))
         ));
     }
@@ -1556,12 +1581,14 @@ mod tests {
                 host: "a.example".into(),
                 port: Some(3390),
                 group: Some(Some("G1".into())),
+                domain: None,
             },
             ImportRow {
                 name: "b".into(),
                 host: "b.example".into(),
                 port: None,
                 group: None,
+                domain: None,
             },
         ];
         assert_eq!(s.servers_import(&rows).unwrap(), (2, 0));
@@ -1570,6 +1597,7 @@ mod tests {
             host: "a2.example".into(),
             port: None,
             group: None,
+            domain: None,
         }];
         assert_eq!(s.servers_import(&again).unwrap(), (0, 1));
         assert_eq!(s.groups_list().unwrap().len(), 1);
@@ -1593,6 +1621,7 @@ mod tests {
             host: "a2.example".into(),
             port: None,
             group: Some(None),
+            domain: None,
         }];
         s.servers_import(&ungroup).unwrap();
         assert!(find("a").group_id.is_none());
@@ -1620,9 +1649,9 @@ mod tests {
         s.user_delete(alice).unwrap();
         let bob = s.user_create("bob", None).unwrap();
         assert!(bob > alice, "user id {alice} was given to a new row");
-        let a = s.server_create("hist-01", "h", 3389, None).unwrap();
+        let a = s.server_create("hist-01", "h", 3389, None, None).unwrap();
         s.server_delete(a).unwrap();
-        let b = s.server_create("eng-01", "e", 3389, None).unwrap();
+        let b = s.server_create("eng-01", "e", 3389, None, None).unwrap();
         assert!(b > a, "server id {a} was given to a new row");
         let g = s.group_create("G").unwrap();
         s.group_delete(g).unwrap();
@@ -1817,6 +1846,34 @@ mod tests {
     /// A version 3 database keeps every row and every reference through the rebuild, its cascades
     /// still work, and from then on ids are not reused.
     #[test]
+    fn a_version_5_database_gains_an_empty_default_domain_and_keeps_its_servers() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "{SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = 3;"
+        ))
+        .unwrap();
+        rebuild_with_foreign_keys_off(&conn, SCHEMA_V4, 4).unwrap();
+        rebuild_with_foreign_keys_off(&conn, SCHEMA_V5, 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO server_groups (name) VALUES ('G');
+             INSERT INTO servers (name, host, port, group_id) VALUES ('hist-01', 'h', 3390, 1);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 6);
+        let server = conn
+            .query_row(
+                &format!("SELECT {SERVER_COLS} FROM servers s WHERE s.name = 'hist-01'"),
+                [],
+                server_from,
+            )
+            .unwrap();
+        assert_eq!((server.port, server.group_id), (3390, Some(1)));
+        assert_eq!(server.domain, None);
+    }
+
+    #[test]
     fn a_version_3_database_migrates_to_ids_that_are_never_reused() {
         let conn = Connection::open_in_memory().unwrap();
         configure(&conn).unwrap();
@@ -1976,7 +2033,7 @@ mod tests {
     fn clearing_the_sid_drops_credentials_and_sessions() {
         let s = store();
         let u = s.user_create("jdoe", None).unwrap();
-        let a = s.server_create("hist-01", "h", 3389, None).unwrap();
+        let a = s.server_create("hist-01", "h", 3389, None, None).unwrap();
         s.user_record_login(u, inc(&s, u), "S-1-5-21-1", None)
             .unwrap();
         s.credential_put(

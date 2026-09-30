@@ -2,10 +2,10 @@
 //!
 //! | Credential   | Carried by          | Lifetime | Stored                          |
 //! |--------------|---------------------|----------|---------------------------------|
-//! | session      | `wa_session` cookie | 24 h     | SHA-256 of the token, database  |
+//! | session      | `wa_session` cookie | 24 h, set on the Settings tab | SHA-256 of the token, database |
 //! | connect ticket | the RDP client's `authToken` | 60 s, one use | memory          |
 //!
-//! Sessions last a full shift (9 to 18 hours) and survive a browser restart and a service restart.
+//! Sessions last a full shift by default and survive a browser restart and a service restart.
 //! A connect ticket is minted when a user clicks a server, is bound to that user and that server,
 //! and is spent by the WebSocket that carries the session.
 
@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Sign-in session lifetime. Work shifts run 9 to 18 hours.
-pub const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a connect ticket may wait for its WebSocket.
 pub const TICKET_TTL: Duration = Duration::from_secs(60);
 pub const COOKIE: &str = "wa_session";
@@ -35,11 +33,11 @@ pub fn token_hash(token: &str) -> Vec<u8> {
     digest(&SHA256, token.as_bytes()).as_ref().to_vec()
 }
 
-/// A persistent cookie, so closing the browser does not sign the user out.
-pub fn session_cookie(token: &str, secure: bool) -> String {
+/// A persistent cookie, so closing the browser does not sign the user out. It lives as long as
+/// the sign-in it carries.
+pub fn session_cookie(token: &str, max_age_secs: i64, secure: bool) -> String {
     format!(
-        "{COOKIE}={token}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict{}",
-        SESSION_TTL.as_secs(),
+        "{COOKIE}={token}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite=Strict{}",
         if secure { "; Secure" } else { "" }
     )
 }
@@ -228,13 +226,13 @@ mod tests {
     }
 
     #[test]
-    fn the_session_cookie_is_persistent_for_a_day() {
-        let c = session_cookie("abc", true);
+    fn the_session_cookie_lives_as_long_as_the_sign_in() {
+        let c = session_cookie("abc", 86400, true);
         assert!(c.contains("Max-Age=86400"));
         assert!(c.contains("HttpOnly"));
         assert!(c.contains("SameSite=Strict"));
         assert!(c.ends_with("; Secure"));
-        assert!(!session_cookie("abc", false).contains("Secure"));
+        assert!(!session_cookie("abc", 86400, false).contains("Secure"));
     }
 
     #[test]

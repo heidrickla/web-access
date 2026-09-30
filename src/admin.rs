@@ -4,6 +4,7 @@
 use crate::app::{META_FREEZE_PENDING, META_FROZEN};
 use crate::directory::normalize_username;
 use crate::migrate;
+use crate::settings::{self, Settings};
 use crate::store::{ImportRow, User};
 use crate::vault::Vault;
 use crate::web::{revalidate_admin, AdminToken, AdminUser, ApiError, ApiResult, Shared};
@@ -54,6 +55,7 @@ pub fn router() -> Router<Shared> {
             "/migration/import/{upload}",
             post(confirm_import).delete(cancel_import),
         )
+        .route("/settings", get(get_settings).put(put_settings))
         .route("/settings/directory-password", post(set_directory_password))
 }
 
@@ -277,6 +279,24 @@ async fn clear_sid(
 
 // ---- servers ----------------------------------------------------------------------------------
 
+async fn get_settings(State(app): State<Shared>, _: AdminUser) -> ApiResult<Json<Settings>> {
+    Ok(Json(settings::read(&app.store)?))
+}
+
+/// Used from the next sign-in, renewal or page load. A sign-in already made keeps its expiry.
+async fn put_settings(
+    State(app): State<Shared>,
+    AdminUser(admin): AdminUser,
+    Json(req): Json<Settings>,
+) -> ApiResult<StatusCode> {
+    not_frozen(&app)?;
+    req.check().map_err(ApiError::bad_request)?;
+    settings::write(&app.store, &req)?;
+    app.store
+        .audit(&admin.username, "settings.change", &req.describe());
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn servers(State(app): State<Shared>, _: AdminUser) -> ApiResult<Json<Value>> {
     let list: Vec<Value> = app
         .store
@@ -289,6 +309,7 @@ async fn servers(State(app): State<Shared>, _: AdminUser) -> ApiResult<Json<Valu
                 "host": r.server.host,
                 "port": r.server.port,
                 "group_id": r.server.group_id,
+                "domain": r.server.domain,
                 "assigned": r.assigned,
             })
         })
@@ -304,6 +325,8 @@ struct ServerForm {
     port: Option<u16>,
     #[serde(default)]
     group_id: Option<i64>,
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 pub fn valid_name(name: &str) -> Result<String, String> {
@@ -335,6 +358,24 @@ pub fn valid_host(host: &str) -> Result<String, String> {
     }
 }
 
+/// A NetBIOS or DNS domain name, as typed on a Windows sign-in: no spaces, and none of the
+/// characters that would make it a user name (`\\` or `@`). Empty is no default.
+pub fn valid_domain(domain: &str) -> Result<Option<String>, String> {
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return Ok(None);
+    }
+    let ok = domain.len() <= 255
+        && domain
+            .chars()
+            .all(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '\\' | '@' | '/'));
+    if ok {
+        Ok(Some(domain.to_owned()))
+    } else {
+        Err(format!("{domain:?} is not a domain name"))
+    }
+}
+
 fn valid_port(port: Option<u16>) -> Result<u16, String> {
     match port.unwrap_or(3389) {
         0 => Err("port must be 1 to 65535".into()),
@@ -342,11 +383,14 @@ fn valid_port(port: Option<u16>) -> Result<u16, String> {
     }
 }
 
-fn server_fields(req: &ServerForm) -> ApiResult<(String, String, u16)> {
+type ServerFields = (String, String, u16, Option<String>);
+
+fn server_fields(req: &ServerForm) -> ApiResult<ServerFields> {
     Ok((
         valid_name(&req.name).map_err(ApiError::bad_request)?,
         valid_host(&req.host).map_err(ApiError::bad_request)?,
         valid_port(req.port).map_err(ApiError::bad_request)?,
+        valid_domain(req.domain.as_deref().unwrap_or("")).map_err(ApiError::bad_request)?,
     ))
 }
 
@@ -356,8 +400,10 @@ async fn add_server(
     Json(req): Json<ServerForm>,
 ) -> ApiResult<Json<Value>> {
     not_frozen(&app)?;
-    let (name, host, port) = server_fields(&req)?;
-    let id = app.store.server_create(&name, &host, port, req.group_id)?;
+    let (name, host, port, domain) = server_fields(&req)?;
+    let id = app
+        .store
+        .server_create(&name, &host, port, req.group_id, domain.as_deref())?;
     app.store.audit(
         &admin.username,
         "server.add",
@@ -373,9 +419,9 @@ async fn update_server(
     Json(req): Json<ServerForm>,
 ) -> ApiResult<StatusCode> {
     not_frozen(&app)?;
-    let (name, host, port) = server_fields(&req)?;
+    let (name, host, port, domain) = server_fields(&req)?;
     app.store
-        .server_update(id, &name, &host, port, req.group_id)?;
+        .server_update(id, &name, &host, port, req.group_id, domain.as_deref())?;
     app.store.audit(
         &admin.username,
         "server.edit",
@@ -429,7 +475,7 @@ fn csv_fields(line: &str) -> Result<Vec<String>, String> {
     Ok(fields.into_iter().map(|f| f.trim().to_owned()).collect())
 }
 
-/// `name,host[,port[,group]]` per line. A header row, blank lines and `#` comments are skipped.
+/// `name,host[,port[,group[,domain]]]` per line. A header row, blank lines and `#` comments are skipped.
 /// Every problem is reported; nothing is imported unless the whole file is good.
 pub fn parse_import(text: &str) -> Result<Vec<ImportRow>, Vec<String>> {
     let mut rows = Vec::new();
@@ -455,8 +501,10 @@ pub fn parse_import(text: &str) -> Result<Vec<ImportRow>, Vec<String>> {
                 continue;
             }
         };
-        if fields.len() < 2 || fields.len() > 4 {
-            errors.push(format!("line {n}: expected name,host[,port[,group]]"));
+        if fields.len() < 2 || fields.len() > 5 {
+            errors.push(format!(
+                "line {n}: expected name,host[,port[,group[,domain]]]"
+            ));
             continue;
         }
         let name = match valid_name(&fields[0]) {
@@ -495,6 +543,17 @@ pub fn parse_import(text: &str) -> Result<Vec<ImportRow>, Vec<String>> {
                 }
             },
         };
+        // The same for the default domain: absent keeps it, empty clears it.
+        let domain = match fields.get(4) {
+            None => None,
+            Some(d) => match valid_domain(d) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    errors.push(format!("line {n}: domain: {e}"));
+                    continue;
+                }
+            },
+        };
         if !seen.insert(name.to_lowercase()) {
             errors.push(format!("line {n}: {name} appears more than once"));
             continue;
@@ -504,6 +563,7 @@ pub fn parse_import(text: &str) -> Result<Vec<ImportRow>, Vec<String>> {
             host,
             port,
             group,
+            domain,
         });
     }
     if errors.is_empty() {
@@ -1173,6 +1233,8 @@ mod tests {
             ("POST", "/api/admin/migration/import/x"),
             ("DELETE", "/api/admin/migration/import/x"),
             ("POST", "/api/admin/settings/directory-password"),
+            ("GET", "/api/admin/settings"),
+            ("PUT", "/api/admin/settings"),
         ];
         for (m, p) in routes {
             let body = (m != "GET" && m != "DELETE").then(|| json!({}));
@@ -1182,6 +1244,162 @@ mod tests {
                 "{m} {p} returned {s}, expected 403"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn settings_are_checked_recorded_and_refused_while_frozen() {
+        let app = test_app();
+        let (_, cookie) = signed_in(&app, "boss");
+        let (s, v) = call(&app, "GET", "/api/admin/settings", Some(&cookie), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            v,
+            json!({"signin_hours": 24, "renew_below_hours": 18, "max_file_mb": 0})
+        );
+        let bad = json!({"signin_hours": 12, "renew_below_hours": 12, "max_file_mb": 5});
+        let (s, _) = call(&app, "PUT", "/api/admin/settings", Some(&cookie), Some(bad)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let good = json!({"signin_hours": 12, "renew_below_hours": 8, "max_file_mb": 5});
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/admin/settings",
+            Some(&cookie),
+            Some(good.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+        let (_, v) = call(&app, "GET", "/api/admin/settings", Some(&cookie), None).await;
+        assert_eq!(v, good);
+        let (_, v) = call(&app, "GET", "/api/admin/audit", Some(&cookie), None).await;
+        let entry = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["action"] == "settings.change")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            entry["detail"], "sign-in 12 h, ask again under 8 h, files up to 5 MB",
+            "{v}"
+        );
+
+        app.store.set_flag(META_FROZEN, true).unwrap();
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/api/admin/settings",
+            Some(&cookie),
+            Some(json!({"signin_hours": 6, "renew_below_hours": 0, "max_file_mb": 0})),
+        )
+        .await;
+        assert_ne!(s, StatusCode::NO_CONTENT);
+        assert_eq!(settings::read(&app.store).unwrap().signin_hours, 12);
+    }
+
+    #[tokio::test]
+    async fn a_server_keeps_its_default_domain_through_edits_imports_and_the_users_list() {
+        let app = test_app();
+        let (boss, cookie) = signed_in(&app, "boss");
+        let (s, v) = call(
+            &app,
+            "POST",
+            "/api/admin/servers",
+            Some(&cookie),
+            Some(json!({"name": "hist-01", "host": "hist-01.example", "domain": " PLANT "})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let id = v["id"].as_i64().unwrap();
+        let domain_of = |v: &Value| {
+            v["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == "hist-01")
+                .map(|s| s["domain"].clone())
+                .unwrap()
+        };
+        let (_, v) = call(&app, "GET", "/api/admin/servers", Some(&cookie), None).await;
+        assert_eq!(domain_of(&v), "PLANT");
+
+        // The user's own list carries it, for the server sign-in.
+        call(
+            &app,
+            "PUT",
+            &format!("/api/admin/users/{boss}/servers"),
+            Some(&cookie),
+            Some(json!({"server_ids": [id]})),
+        )
+        .await;
+        let (_, mine) = call(&app, "GET", "/api/me/servers", Some(&cookie), None).await;
+        assert_eq!(mine["groups"][0]["servers"][0]["domain"], "PLANT", "{mine}");
+
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/admin/servers",
+            Some(&cookie),
+            Some(json!({"name": "eng-01", "host": "eng-01.example", "domain": "PLANT\\ops"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // A CSV line without the column keeps the domain; an empty cell clears it.
+        let import = |csv: &str| {
+            call(
+                &app,
+                "POST",
+                "/api/admin/servers/import",
+                Some(&cookie),
+                Some(json!({ "csv": csv })),
+            )
+        };
+        let (s, v) = import("hist-01,hist-01.example").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, v) = call(&app, "GET", "/api/admin/servers", Some(&cookie), None).await;
+        assert_eq!(domain_of(&v), "PLANT");
+        let (s, _) = import("hist-01,hist-01.example,,,OT").await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, v) = call(&app, "GET", "/api/admin/servers", Some(&cookie), None).await;
+        assert_eq!(domain_of(&v), "OT");
+        let (s, _) = import("hist-01,hist-01.example,,,").await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, v) = call(&app, "GET", "/api/admin/servers", Some(&cookie), None).await;
+        assert!(domain_of(&v).is_null(), "{v}");
+
+        // Cleared from the form, too.
+        let (s, _) = call(
+            &app,
+            "PATCH",
+            &format!("/api/admin/servers/{id}"),
+            Some(&cookie),
+            Some(json!({"name": "hist-01", "host": "hist-01.example", "domain": "OT"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, _) = call(
+            &app,
+            "PATCH",
+            &format!("/api/admin/servers/{id}"),
+            Some(&cookie),
+            Some(json!({"name": "hist-01", "host": "hist-01.example", "domain": ""})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (_, v) = call(&app, "GET", "/api/admin/servers", Some(&cookie), None).await;
+        assert!(domain_of(&v).is_null(), "{v}");
+    }
+
+    #[test]
+    fn a_csv_domain_is_checked_and_a_sixth_column_refused() {
+        let rows = parse_import("hist-01,h,,,PLANT.example").unwrap();
+        assert_eq!(rows[0].domain, Some(Some("PLANT.example".into())));
+        assert_eq!(parse_import("hist-01,h").unwrap()[0].domain, None);
+        assert_eq!(parse_import("hist-01,h,,,").unwrap()[0].domain, Some(None));
+        assert!(parse_import("hist-01,h,,,a b").is_err());
+        assert!(parse_import("hist-01,h,,,user@plant").is_err());
+        assert!(parse_import("hist-01,h,,,PLANT,extra").is_err());
     }
 
     #[tokio::test]

@@ -24,10 +24,10 @@ Design record: `docs/architecture.md`.
 
 ## Using it
 
-1. Browse to the proxy and sign in with a network account: `jdoe`, `CORP\jdoe` or the account's sign-in name such as `john.doe@example.com`. Closing the browser does not sign out; the sign-in lasts 24 hours. Opening a server with less than 18 hours left asks for the password again first.
+1. Browse to the proxy and sign in with a network account: `jdoe`, `CORP\jdoe` or the account's sign-in name such as `john.doe@example.com`. Closing the browser does not sign out; the sign-in lasts 24 hours. Opening a server with less than 18 hours left asks for the password again first. Both are set on the Settings tab.
 2. The server list shows the servers assigned to you, in the administrator's groups. Groups collapse and expand; the filter matches names and hosts.
-3. Click a server. Enter its credentials, and tick "Save credentials" to be connected in one click next time. Credentials are saved only after the server accepts them.
-4. The desktop fills the window. The rail at the left edge carries clipboard, file transfer, Ctrl+Alt+Del, fullscreen and Disconnect. Files dropped on the desktop go to the remote clipboard.
+3. Click a server. Enter its credentials, and tick "Save credentials" to be connected in one click next time. Credentials are saved only after the server accepts them. The domain starts as the server's default, when an administrator set one.
+4. The desktop fills the window. The rail at the left edge carries clipboard, file transfer, Ctrl+Alt+Del, fullscreen and Disconnect. Files dropped on the desktop go to the remote clipboard. A file larger than the limit on the Settings tab is refused, both ways; a drop holding one sends nothing.
 5. Disconnecting, or closing the browser, leaves the desktop running on the server. The list marks it Reconnect; clicking the server again returns to the same desktop.
 
 The pages are dark by default; the button beside Sign out switches to a light theme, remembered per browser.
@@ -39,9 +39,10 @@ The pages are dark by default; the button beside Sign out switches to a light th
 | Tab | Does |
 |---|---|
 | Users | add users by network username; tick the servers each one gets, with select-all per group and copy-from-user; grant administrator; remove |
-| Servers | add, edit and delete servers; bulk import from CSV (`name,host,port,group`) |
+| Servers | add, edit and delete servers, each with an optional default domain for its sign-in; bulk import from CSV (`name,host,port,group,domain`) |
 | Groups | create, rename, order and delete the groups users see |
 | Activity | sign-ins, refusals, sessions opened, credential saves, every admin change; kept `audit_days` (400) |
+| Settings | how long a sign-in lasts (24 h) and when opening a server asks for the password again (under 18 h left; 0 never asks); the largest file sent or fetched (0, no limit). Kept in the database, so they move with an export |
 | Migration | this proxy's version and counts; recovery passphrase; unlock or reset the credential store; export, import, freeze; the directory service account's password and how its account checks last went |
 
 A user signs in, but sees no servers until an administrator assigns them. Disabling the account in Active Directory stops sign-in; with a service account configured, it also ends that user's sessions at the next check. An account renamed in Active Directory keeps its servers and saved credentials: the proxy follows the account's SID to its row and renames it at the next sign-in.

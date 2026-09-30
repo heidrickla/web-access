@@ -59,10 +59,10 @@ mod tests {
         let user = store.user_create("jdoe", None).unwrap();
         let other = store.user_create("asmith", None).unwrap();
         let assigned = store
-            .server_create("historian-01", "historian-01.example", 3389, None)
+            .server_create("historian-01", "historian-01.example", 3389, None, None)
             .unwrap();
         let unassigned = store
-            .server_create("dc-01", "dc-01.example", 3389, None)
+            .server_create("dc-01", "dc-01.example", 3389, None, None)
             .unwrap();
         store.set_assignments(user, &[assigned]).unwrap();
         Fixture {
