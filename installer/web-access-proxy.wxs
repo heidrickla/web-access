@@ -118,6 +118,14 @@
         <ServiceControl Id="StartAfterUpgrade" Name="WebAccessProxy" Start="install" Wait="yes" />
       </Component>
 
+      <!-- The licence and the third-party notices, beside the binary; the proxy also serves the
+           notices at /notices. -->
+      <Component Id="Notices" Directory="INSTALLFOLDER" Guid="a7c8d9e0-1f2a-4b34-8c5d-6e7f80910213">
+        <File Id="LICENSE.txt" Source="..\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+        <File Id="notices.html" Source="..\web\notices.html" Name="THIRD-PARTY-NOTICES.html" />
+        <File Id="notices_client.html" Source="..\web\notices-client.html" Name="THIRD-PARTY-NOTICES-CLIENT.html" />
+      </Component>
+
       <!-- Permanent: uninstalling, and the uninstall of the old version inside an upgrade, leave
            the administrator's config in place. NeverOverwrite: installing never replaces an
            existing config with the example. -->

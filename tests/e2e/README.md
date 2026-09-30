@@ -1,12 +1,8 @@
 # End-to-end tests
 
-A throwaway Samba AD domain controller and an xrdp server in containers, one or two proxies built
-from this tree, and headless Chromium driving the real pages. Linux host with Docker and sudo (for an
-`/etc/hosts` entry). Fixture passwords are generated into `fixtures.env` and never printed.
+A throwaway Samba AD domain controller and an xrdp server in containers, one or two proxies built from this tree, and headless Chromium driving the real pages. Linux host with Docker and sudo (for an `/etc/hosts` entry). Fixture passwords are generated into `fixtures.env` and never printed.
 
-`./all.sh` runs every stage in order and exits nonzero if any fails; `./background.sh` runs it
-detached, logging to `all.log` (`./background.sh stop` ends it). Every script exits nonzero on a
-failed check.
+`./all.sh` runs every stage in order and exits nonzero if any fails; `./background.sh` runs it detached, logging to `all.log` (`./background.sh stop` ends it). Every script exits nonzero on a failed check.
 
 | Step | Command | Covers |
 |---|---|---|
@@ -20,8 +16,6 @@ failed check.
 | Browser 2 and 3 | `./phases23.sh` | disabling the account ends the live session and the sign-in; export and freeze, frozen refusals, import on a second proxy, an admin page loaded before the import reloading, the user still signed in with the saved credential after cutover |
 | Guards | `./mutate.sh` | breaks each guard in a scratch copy; the mutant must compile and its named test must fail |
 
-xrdp is not an NLA server and the browser client does not send autologon, so the browser tests type
-the fixture password into xrdp's own login box. xrdp's `/var/log/xrdp-sesman.log` in the `wa-rdp`
-container records `reconnected session` when a reconnect returns to the same desktop.
+xrdp is not an NLA server and the browser client does not send autologon, so the browser tests type the fixture password into xrdp's own login box. xrdp's `/var/log/xrdp-sesman.log` in the `wa-rdp` container records `reconnected session` when a reconnect returns to the same desktop.
 
 Screenshots land in `shots/`. `docker rm -f wa-dc wa-rdp` removes the fixtures.

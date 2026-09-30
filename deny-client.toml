@@ -1,0 +1,39 @@
+# cargo deny, for the browser client's graph (IronRDP's ironrdp-web): what scripts/build-client.sh
+# builds and the proxy serves. Licences and sources as deny.toml.
+
+[graph]
+# The served file is the wasm32 build; dev-dependencies are not in it.
+targets = ["wasm32-unknown-unknown"]
+exclude-dev = true
+
+[advisories]
+ignore = [
+    # Marvin: timing of RSA decryption with a private key. The client holds no RSA private key for
+    # a password sign-in, and rsa has no fixed release. It enters through picky and sspi.
+    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operation in the browser client; no fixed release" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# IronRDP's own crates depend on each other by path within its workspace.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

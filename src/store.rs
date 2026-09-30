@@ -250,8 +250,11 @@ pub struct Counts {
 pub struct ImportRow {
     pub name: String,
     pub host: String,
-    pub port: u16,
-    pub group: Option<String>,
+    /// None when the column is absent or empty: an update keeps the port, a new server gets 3389.
+    pub port: Option<u16>,
+    /// None when the column is absent: an update keeps the group, a new server has none.
+    /// `Some(None)` for an empty cell: the server is ungrouped.
+    pub group: Option<Option<String>>,
 }
 
 pub struct Store {
@@ -906,7 +909,7 @@ impl Store {
         let tx = c.transaction()?;
         let (mut created, mut updated) = (0, 0);
         for row in rows {
-            let group_id = match &row.group {
+            let group_id = match row.group.as_ref().and_then(|g| g.as_ref()) {
                 None => None,
                 Some(name) => {
                     let found: Option<i64> = tx
@@ -930,15 +933,28 @@ impl Store {
             match existing {
                 Some(id) => {
                     tx.execute(
-                        "UPDATE servers SET host = ?2, port = ?3, group_id = ?4 WHERE id = ?1",
-                        params![id, row.host, row.port as i64, group_id],
+                        "UPDATE servers SET host = ?2, port = COALESCE(?3, port),
+                           group_id = CASE WHEN ?5 THEN ?4 ELSE group_id END
+                         WHERE id = ?1",
+                        params![
+                            id,
+                            row.host,
+                            row.port.map(i64::from),
+                            group_id,
+                            row.group.is_some()
+                        ],
                     )?;
                     updated += 1;
                 }
                 None => {
                     tx.execute(
                         "INSERT INTO servers (name, host, port, group_id) VALUES (?1, ?2, ?3, ?4)",
-                        params![row.name, row.host, row.port as i64, group_id],
+                        params![
+                            row.name,
+                            row.host,
+                            i64::from(row.port.unwrap_or(3389)),
+                            group_id
+                        ],
                     )?;
                     created += 1;
                 }
@@ -1274,14 +1290,36 @@ impl Store {
         )?)
     }
 
+    #[cfg(test)]
     pub fn audit_list(&self, limit: i64, before: Option<i64>) -> Result<Vec<AuditRow>> {
+        self.audit_search(limit, before, None)
+    }
+
+    /// Entries newest first; with `text`, only those whose actor, action or detail contains it,
+    /// ignoring case.
+    pub fn audit_search(
+        &self,
+        limit: i64,
+        before: Option<i64>,
+        text: Option<&str>,
+    ) -> Result<Vec<AuditRow>> {
+        let pattern = text.filter(|t| !t.is_empty()).map(|t| {
+            let escaped = t
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%{escaped}%")
+        });
         let c = self.c();
         let mut stmt = c.prepare(
             "SELECT id, at, actor, action, detail FROM audit
-             WHERE (?2 IS NULL OR id < ?2) ORDER BY id DESC LIMIT ?1",
+             WHERE (?2 IS NULL OR id < ?2)
+               AND (?3 IS NULL OR actor LIKE ?3 ESCAPE '\\'
+                    OR action LIKE ?3 ESCAPE '\\' OR detail LIKE ?3 ESCAPE '\\')
+             ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit, before], |r| {
+            .query_map(params![limit, before, pattern], |r| {
                 Ok(AuditRow {
                     id: r.get(0)?,
                     at: r.get(1)?,
@@ -1516,13 +1554,13 @@ mod tests {
             ImportRow {
                 name: "a".into(),
                 host: "a.example".into(),
-                port: 3389,
-                group: Some("G1".into()),
+                port: Some(3390),
+                group: Some(Some("G1".into())),
             },
             ImportRow {
                 name: "b".into(),
                 host: "b.example".into(),
-                port: 3390,
+                port: None,
                 group: None,
             },
         ];
@@ -1530,18 +1568,34 @@ mod tests {
         let again = vec![ImportRow {
             name: "A".into(),
             host: "a2.example".into(),
-            port: 3389,
-            group: Some("g1".into()),
+            port: None,
+            group: None,
         }];
         assert_eq!(s.servers_import(&again).unwrap(), (0, 1));
         assert_eq!(s.groups_list().unwrap().len(), 1);
-        let a = s
-            .servers_list()
-            .unwrap()
-            .into_iter()
-            .find(|r| r.server.name == "a")
-            .unwrap();
-        assert_eq!(a.server.host, "a2.example");
+        let find = |name: &str| {
+            s.servers_list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.server.name == name)
+                .unwrap()
+                .server
+        };
+        let a = find("a");
+        assert_eq!(a.host, "a2.example");
+        // Columns the file left out keep what the server had.
+        assert_eq!(a.port, 3390);
+        assert!(a.group_id.is_some());
+        assert_eq!(find("b").port, 3389);
+        // An empty group cell ungroups it.
+        let ungroup = vec![ImportRow {
+            name: "a".into(),
+            host: "a2.example".into(),
+            port: None,
+            group: Some(None),
+        }];
+        s.servers_import(&ungroup).unwrap();
+        assert!(find("a").group_id.is_none());
     }
 
     fn inc(s: &Store, id: i64) -> i64 {
@@ -1649,6 +1703,28 @@ mod tests {
             .user_by_name("alice")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn the_activity_log_is_searched_by_actor_action_or_detail() {
+        let s = store();
+        s.audit("jdoe", "signin", "");
+        s.audit("admin", "server.edit", "HIST-01 (hist-01.example:3389)");
+        s.audit("admin", "user.add", "100%_sure");
+        let found = |t: &str| -> Vec<String> {
+            s.audit_search(100, None, Some(t))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.action)
+                .collect()
+        };
+        assert_eq!(found("JDOE"), vec!["signin"]);
+        assert_eq!(found("hist-01"), vec!["server.edit"]);
+        assert_eq!(found("server."), vec!["server.edit"]);
+        // Wildcards in the text are matched literally.
+        assert_eq!(found("%_"), vec!["user.add"]);
+        assert_eq!(found("_"), vec!["user.add"]);
+        assert_eq!(s.audit_search(100, None, Some("")).unwrap().len(), 3);
     }
 
     #[test]

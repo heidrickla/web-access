@@ -126,6 +126,9 @@
   <section id="tab-activity" hidden>
     <div class="card">
       <h2>Activity</h2>
+      <div class="toolbar">
+        <input id="audit-filter" type="search" placeholder="Filter by who, what or detail" aria-label="Filter activity" autocomplete="off" spellcheck="false">
+      </div>
       <table class="grid" id="audit-table">
         <thead><tr><th>Time</th><th>Who</th><th>What</th><th>Detail</th></tr></thead>
         <tbody></tbody>
@@ -212,6 +215,7 @@
     </div>
   </section>
 </main>
+<footer class="page-foot"><a href="./notices">Third-party licences</a></footer>
 <script type="module" src="./admin.js"></script>
 </body>
 </html>

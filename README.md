@@ -165,6 +165,8 @@ Gates before a push:
 | dependencies | `cargo deny check` (advisories, licenses, bans, sources; `deny.toml`) |
 | mutation | `cargo mutants --in-diff <diff>` for the lines a change touches |
 
+CI (`.github/workflows/ci.yml`) runs format, lint, test, page scripts and dependencies on Linux, and lint and test on Windows where the host has a Windows runner (GitHub).
+
 ## Why not the obvious things
 
 | Ruled out | Reason |
@@ -255,16 +257,28 @@ WiX v5 specifically. v6 and v7 require accepting the Open Source Maintenance Fee
 
 | | |
 |---|---|
-| `web/ironrdp_web_bg.wasm` | built with `wasm-pack build --target web --release` |
+| `web/ironrdp_web_bg.wasm` | the client, built by `scripts/build-client.sh` |
 | `web/ironrdp_web.js` | wasm-bindgen glue |
 | `web/index.html`, `web/app.js` | sign-in, the server list, the session |
 | `web/admin.html`, `web/admin.js` | the admin pages |
-| `web/app.css` | both pages; dark by default, with a light theme |
-| `web/theme.js` | both pages: applies the stored theme before the page paints, and the header's theme button |
+| `web/app.css` | every page; dark by default, with a light theme |
+| `web/theme.js` | every page: applies the stored theme before the page paints, and the header's theme button |
+| `web/notices.html`, `web/notices-client.html` | third-party licences of the proxy and of the client, served at `/notices` and `/notices-client` and installed beside the binary |
+
+The client is built from a pinned IronRDP commit, and the build is reproducible: a clean clone gives the same bytes. A test checks the committed files against these digests.
+
+| | |
+|---|---|
+| IronRDP | `9b151c4c2e47c6014e1e8e55909d4180aa8bdb99` (2026-09-22), crate `ironrdp-web` |
+| Toolchain | Rust 1.98.1, target `wasm32-unknown-unknown`, wasm-pack 0.13.1 (`--target web --release`, with its wasm-opt pass) |
+| `ironrdp_web_bg.wasm` | sha256 `e34898c6ba5cbc72bf4b313e5d8085b55ddb60bf65b55177b4f6632f2f090996` |
+| `ironrdp_web.js` | sha256 `00544efdca030a0284d66ba021743deb49c9277260034f80da7f7aeda89bde3f` |
+
+`scripts/build-client.sh` (Linux, with cargo-deny and cargo-about) clones that commit, checks the client's dependency graph against `deny.toml`, builds it, copies it into `web/`, and writes `web/notices-client.html`. `scripts/notices.sh` writes `web/notices.html` from this crate's graph; run it after changing dependencies.
 
 Every page asset is a separate file: the proxy sends `default-src 'self'`, which forbids inline `<style>`, `<script>`, style attributes and event handlers. A test asserts no page carries one. All are embedded with `include_bytes!`, so a deployment is one MSI and one service, and the served client cannot drift from the proxy it talks to.
 
-`build.rs` gzips each asset and names it by a hash of its content. The proxy sends the gzip to a browser that accepts it (the 7.4 MB client goes as 1.8 MB), with an ETag and `Cache-Control: no-cache`: every load asks again, so an upgrade is picked up at once, and an unchanged asset costs a 304. API answers are `no-store`.
+`build.rs` gzips each asset and names it by a hash of its content. The proxy sends the gzip to a browser that accepts it, with an ETag and `Cache-Control: no-cache`: every load asks again, so an upgrade is picked up at once, and an unchanged asset costs a 304. API answers are `no-store`.
 
 The client's API maps onto the proxy's design: `SessionBuilder.destination()` carries the server id, never an address, and `authToken()` carries the single-use connect ticket.
 

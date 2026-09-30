@@ -185,8 +185,8 @@ impl App {
             .map(|t| ImportRow {
                 name: t.id.clone(),
                 host: t.host.clone(),
-                port: t.port,
-                group: Some("Imported".into()),
+                port: Some(t.port),
+                group: Some(Some("Imported".into())),
             })
             .collect();
         let (created, _) = self.store.servers_import(&rows)?;

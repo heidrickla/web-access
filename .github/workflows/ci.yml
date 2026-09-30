@@ -1,7 +1,7 @@
 name: checks
 
-# Runs on the forge's shared runner (capacity 1) and on GitHub. Linux only: the Windows
-# cfg is linted and tested by the local gates on the build machine.
+# Runs on the forge's shared runner (capacity 1) and on GitHub. The forge has no Windows runner, so
+# the Windows job runs on GitHub only; on the forge the Windows cfg is covered by the local gates.
 
 on:
   push:
@@ -43,5 +43,27 @@ jobs:
       - name: test
         run: cargo test --offline --locked
 
+      - name: page scripts
+        run: bash tests/js/run.sh
+
       - name: dependencies
         run: cargo deny check
+
+  windows:
+    if: github.server_url == 'https://github.com'
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: toolchain (pinned)
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.98.1
+
+      - name: lint
+        run: cargo clippy --offline --locked --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --offline --locked
