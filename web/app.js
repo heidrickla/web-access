@@ -801,7 +801,9 @@ function offerFiles(files) {
   renderOutgoing();
   try {
     ext('initiate_file_copy', outgoing.map(f => ({ name: f.name, size: f.size })));
-    say(outgoing.length + ' file(s) on the remote clipboard — paste on the remote');
+    say(me && me.scanning
+      ? 'scanning ' + outgoing.length + ' file(s); paste on the remote once they pass'
+      : outgoing.length + ' file(s) on the remote clipboard — paste on the remote');
   } catch (err) {
     say('offering files failed: ' + describe(err), true);
   }
@@ -816,8 +818,39 @@ drop.addEventListener('drop', ev => offerFiles(ev.dataTransfer.files));
 $('pick').addEventListener('click', () => $('picker').click());
 $('picker').addEventListener('change', ev => offerFiles(ev.target.files));
 
-$('files-note').textContent =
-  'Files ride the RDP clipboard channel, so they appear as a paste on the remote rather than as a drive.';
+function filesNote() {
+  $('files-note').textContent =
+    'Files ride the RDP clipboard channel, so they appear as a paste on the remote rather than as a drive.' +
+    (me && me.scanning ? ' Every file is scanned for malware on the way, in both directions.' : '');
+}
+filesNote();
+
+/* ---- the file scan's decisions -------------------------------------------------------------- */
+
+const NOTICE_POLL_MS = 2000;
+
+/// The newest notice number before a session opens, so none from an earlier session is shown;
+/// null when unknown, and the first poll then only takes it.
+async function noticeBaseline() {
+  try { return (await api('GET', '/api/me/notices?after=0')).last; } catch { return null; }
+}
+
+/// Shows what the proxy's file scan decided while `owner` is the session. Returns the stop.
+function watchNotices(owner, after) {
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy || session !== owner) return;
+    busy = true;
+    try {
+      const r = await api('GET', '/api/me/notices?after=' + (after ?? 0));
+      const show = after !== null && session === owner;
+      after = r.last;
+      if (show) for (const n of r.notices) say(n.text, n.bad);
+    } catch { /* a missed poll is retried; the sign-in's end is handled where it happens */ }
+    finally { busy = false; }
+  }, NOTICE_POLL_MS);
+  return () => clearInterval(timer);
+}
 
 /* ---- opening a server --------------------------------------------------------------------- */
 
@@ -997,9 +1030,13 @@ async function runSession(server, ticket, creds) {
   // connected: a desktop was reached. credentials: refused for the credentials, not the network.
   const outcome = { connected: false, credentials: false };
   let mine = null;   // this attempt's session; the page's state is cleared only while it is current
+  let stopNotices = () => {};
   say('connecting to ' + server.name);
   try {
     await clientReady;
+    filesNote();
+    // Taken before connecting: a clipboard the remote holds at connect is scanned at once.
+    const baseline = me && me.scanning ? await noticeBaseline() : undefined;
     const builder = new SessionBuilder()
       .proxyAddress(proxyAddress)
       .destination(String(server.id))   // a server ID, never an address
@@ -1042,6 +1079,7 @@ async function runSession(server, ticket, creds) {
     mine = await builder.connect();
     session = mine;
     outcome.connected = true;
+    if (baseline !== undefined) stopNotices = watchNotices(mine, baseline);
     // A resize sent before the display channel is open is dropped, so the scale waits until the
     // session has run a moment, and is asked once more if the bitmap has not changed by then.
     if (scale() !== 1) {
@@ -1075,6 +1113,7 @@ async function runSession(server, ticket, creds) {
     say((outcome.connected ? 'session with ' + server.name + ' ended: ' : 'could not connect to ' + server.name + ': ') + text, true);
   } finally {
     creds.password = '';
+    stopNotices();
     if (session === mine) {
       for (const t of fitTimers.splice(0)) clearTimeout(t);
       document.body.classList.remove('connected');

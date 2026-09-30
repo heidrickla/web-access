@@ -54,3 +54,23 @@ ca_bundle = 'C:\ProgramData\web-access\directory-ca.pem'
 # Migration page or with `web-access-proxy.exe set-secret directory`, never in this file.
 # service_account = "svc-webaccess"
 # check_interval_secs = 600
+
+# Files crossing the clipboard channel, in both directions, are held on the proxy until scanned,
+# and only files the scanner calls clean are passed on. Clipboard text is not scanned.
+#   "amsi"    the anti-malware product registered with Windows (Trellix, Defender); the default on Windows
+#   "command" a scanner program run on a copy of each file, its exit code the verdict
+#   "off"     the clipboard channel is relayed unread
+# The scanner is shown the EICAR test file and a harmless one at start and every check_every_mins,
+# and every file is refused while the last check failed or is more than two checks old. Each check
+# is one EICAR detection in the anti-malware product's own log.
+[scan]
+# scanner = "amsi"
+# Seconds a file waits for its verdict before the transfer is refused.
+# timeout_secs = 120
+# Megabytes held for scanning at once, across every session.
+# max_staged_mb = 2048
+# check_every_mins = 60
+# For the command scanner. {file} is replaced by the copy's path.
+# command = ['C:\Program Files\Scanner\scan.exe', '/quiet', '{file}']
+# clean_exit_codes = [0]
+# detected_exit_codes = [1]

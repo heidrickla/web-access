@@ -1,8 +1,9 @@
 //! The session: admission, the RDCleanPath handshake, then bytes.
 //!
-//! The proxy never decodes RDP. It performs the X.224 exchange and the TLS handshake on the
-//! client's behalf, hands back the server's certificate chain so the CLIENT can judge who it
-//! reached, and then moves bytes until one side stops.
+//! The proxy performs the X.224 exchange and the TLS handshake on the client's behalf, hands back
+//! the server's certificate chain so the CLIENT can judge who it reached, and then moves bytes
+//! until one side stops. With file scanning on (`scan`), it reads the clipboard channel and holds
+//! files until they are scanned; every other byte it moves as it arrived.
 //!
 //! The connection is registered in the live registry at upgrade, before anything is read, so it can
 //! be ended at every stage: while the client has not yet sent its request, during admission, while
@@ -15,6 +16,7 @@ use crate::resolve::resolve_one;
 use crate::store::{now, Server, User};
 
 use futures_util::{SinkExt, StreamExt};
+use ironrdp_pdu::nego::{ConnectionConfirm, SecurityProtocol};
 use ironrdp_rdcleanpath::{RDCleanPath, RDCleanPathPdu};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
@@ -58,6 +60,8 @@ pub enum SessionError {
     Timeout(&'static str),
     #[error("the server refused the security protocols the client asked for")]
     Negotiation,
+    #[error("clipboard: {0}")]
+    Clipboard(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for SessionError {
@@ -280,6 +284,18 @@ impl Session<'_> {
             }
         };
 
+        // What the server chose decides how the stream after the handshake is framed.
+        let hybrid_ex = match selected_protocol(&confirm) {
+            Some(p) if p.contains(SecurityProtocol::HYBRID_EX) => true,
+            Some(p) if p.intersects(SecurityProtocol::SSL | SecurityProtocol::HYBRID) => false,
+            other if self.app.scan.is_some() => {
+                warn!(%peer, %subject, target = %target.name, protocol = ?other,
+                    "the server chose a security protocol the file scan cannot frame; refused");
+                return self.refuse(ws).await;
+            }
+            _ => false,
+        };
+
         let chain: Vec<Vec<u8>> = tls
             .get_ref()
             .1
@@ -296,12 +312,203 @@ impl Session<'_> {
         ))
         .await?;
 
-        // 5. Bytes, both ways, until someone stops. Nothing below this line understands RDP.
+        // 5. Bytes, both ways, until someone stops.
         self.app.live.set_established(self.live_id);
         self.setup_permit
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+        match self.app.scan.clone() {
+            None => Self::relay_raw(ws, tls).await,
+            Some(scan) => {
+                self.relay_scanned(ws, tls, hybrid_ex, scan, &target.name)
+                    .await
+            }
+        }
+    }
+
+    /// With file scanning on: both directions framed, clipboard PDUs to the scan, every other unit
+    /// through one ordered writer per side. All of it is part of the session's future, so ending
+    /// the session ends every part.
+    async fn relay_scanned<S, T>(
+        &self,
+        ws: WebSocketStream<S>,
+        tls: T,
+        hybrid_ex: bool,
+        scan: Arc<crate::scan::ScanService>,
+        server: &str,
+    ) -> Result<(), SessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        use crate::scan::clip::{Clip, Context, Input, Output};
+        use crate::scan::framing::{Framer, Unit};
+        use crate::scan::route::{Route, Routed};
+        use tokio::sync::mpsc;
+
+        let clipboard = |e: &dyn std::fmt::Display| SessionError::Clipboard(e.to_string());
+        let (mut ws_tx, mut ws_rx) = ws.split();
+        let (mut srv_rx, mut srv_tx) = tokio::io::split(tls);
+        let route = Arc::new(std::sync::Mutex::new(Route::default()));
+        let (server_tx, mut server_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (client_tx, mut client_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (clip_tx, clip_rx) = mpsc::channel::<Input>(64);
+
+        let app = self.app;
+        let user_id = self.user.id;
+        let username = self.user.username.clone();
+        let server_name = server.to_owned();
+        let settings_store = &app.store;
+        let health = Arc::clone(&scan);
+        let ctx = Context {
+            scanner: Arc::clone(&scan.scanner),
+            scan_timeout: scan.timeout,
+            staging: Arc::clone(&scan.staging),
+            healthy: Arc::new(move || health.healthy()),
+            max_file_bytes: {
+                let limit = crate::settings::read(settings_store)
+                    .ok()
+                    .and_then(|s| s.max_file_bytes());
+                Arc::new(move || limit)
+            },
+            report: {
+                let notices = &app.notices;
+                let store = &app.store;
+                Arc::new(move |r| {
+                    let (text, bad) = crate::scan::notice_text(&r, &server_name);
+                    notices.push(user_id, text, bad);
+                    for (action, detail) in crate::scan::audit_lines(&r, &server_name) {
+                        store.audit(&username, action, &detail);
+                    }
+                })
+            },
+        };
+        let clip = Clip::new(ctx, Arc::clone(&route), clip_tx.clone());
+
+        let write_server = async {
+            while let Some(b) = server_rx.recv().await {
+                srv_tx.write_all(&b).await?;
+                srv_tx.flush().await?;
+            }
+            Ok::<_, SessionError>(())
+        };
+        let write_client = async {
+            while let Some(b) = client_rx.recv().await {
+                ws_tx.send(Message::Binary(b)).await?;
+            }
+            Ok::<_, SessionError>(())
+        };
+        // One reader per side: whole units, in the order they arrived, to the writer of the other
+        // side, except the clipboard channel's, which go to the scan.
+        let forward = |units: Vec<Unit>, from_client: bool| {
+            let route = Arc::clone(&route);
+            let to = if from_client {
+                server_tx.clone()
+            } else {
+                client_tx.clone()
+            };
+            let clip_tx = clip_tx.clone();
+            async move {
+                let mut pass = Vec::new();
+                for unit in units {
+                    let routed = match &unit {
+                        Unit::Tpkt(b) => {
+                            let mut r = route.lock().unwrap_or_else(|p| p.into_inner());
+                            if from_client {
+                                r.read_client(b)
+                            } else {
+                                r.read_server(b)
+                            }
+                            .map_err(|e| clipboard(&e))?
+                        }
+                        _ => Routed::Pass,
+                    };
+                    match routed {
+                        Routed::Pass => pass.extend_from_slice(unit.bytes()),
+                        Routed::Replace(b) => pass.extend_from_slice(&b),
+                        Routed::Clip(None) => {}
+                        Routed::Clip(Some(whole)) => {
+                            let input = if from_client {
+                                Input::FromClient(whole)
+                            } else {
+                                Input::FromServer(whole)
+                            };
+                            if clip_tx.send(input).await.is_err() {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                if !pass.is_empty() && to.send(pass).await.is_err() {
+                    return Ok(false);
+                }
+                Ok::<_, SessionError>(true)
+            }
+        };
+        let read_client = async {
+            let mut framer = Framer::new(false, hybrid_ex);
+            while let Some(msg) = ws_rx.next().await {
+                match msg? {
+                    Message::Binary(b) => {
+                        let units = framer.push(&b).map_err(|e| clipboard(&e))?;
+                        if !forward(units, true).await? {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            Ok::<_, SessionError>(())
+        };
+        let read_server = async {
+            let mut framer = Framer::new(true, hybrid_ex);
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                let n = srv_rx.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                let units = framer.push(&buf[..n]).map_err(|e| clipboard(&e))?;
+                if !forward(units, false).await? {
+                    break;
+                }
+            }
+            Ok::<_, SessionError>(())
+        };
+        let scanning = {
+            let server_tx = server_tx.clone();
+            let client_tx = client_tx.clone();
+            async move {
+                clip.run(clip_rx, move |o| {
+                    let server_tx = server_tx.clone();
+                    let client_tx = client_tx.clone();
+                    async move {
+                        match o {
+                            Output::ToServer(b) => server_tx.send(b).await.is_ok(),
+                            Output::ToClient(b) => client_tx.send(b).await.is_ok(),
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| clipboard(&e))
+            }
+        };
+        tokio::select! {
+            r = read_client => r,
+            r = read_server => r,
+            r = write_server => r,
+            r = write_client => r,
+            r = scanning => r,
+        }
+    }
+
+    /// With file scanning off: bytes, both ways, until someone stops. Nothing here understands RDP.
+    async fn relay_raw<S>(ws: WebSocketStream<S>, tls: ServerTls) -> Result<(), SessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let (mut ws_tx, mut ws_rx) = ws.split();
         let (mut srv_rx, mut srv_tx) = tokio::io::split(tls);
 
@@ -448,6 +655,14 @@ pub fn tune(stream: &TcpStream) {
 }
 
 type ServerTls = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// The security protocol the server's X.224 Connection Confirm selected.
+fn selected_protocol(confirm: &[u8]) -> Option<SecurityProtocol> {
+    match ironrdp_core::decode::<ironrdp_pdu::x224::X224<ConnectionConfirm>>(confirm) {
+        Ok(ironrdp_pdu::x224::X224(ConnectionConfirm::Response { protocol, .. })) => Some(protocol),
+        _ => None,
+    }
+}
 /// Why a server could not be reached: the PDU for the client and the error for the log.
 type Unreached = Box<(RDCleanPathPdu, SessionError)>;
 
@@ -665,6 +880,287 @@ mod insecure {
 mod tests {
     use super::*;
     use crate::web::tests::{signed_in, test_app};
+
+    mod scanned {
+        use super::*;
+        use crate::scan::route::tests::{
+            connect_initial, connect_response, connected, send_indication, send_request, units,
+            OTHER, QUIET,
+        };
+        use crate::scan::route::{Route, Routed};
+        use crate::scan::scanner::{Scanner, Verdict};
+        use ironrdp_cliprdr::pdu::{
+            ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardPdu,
+            FileContentsResponse, FileDescriptor, FormatDataResponse, FormatList,
+            FormatListResponse, PackedFileList,
+        };
+        use ironrdp_core::IntoOwned;
+        use tokio::io::DuplexStream;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        const FGD: u32 = 0xc0a1;
+
+        struct ByName;
+        impl Scanner for ByName {
+            fn describe(&self) -> String {
+                "by name".into()
+            }
+            fn scan(&self, name: &str, _: &[u8]) -> Verdict {
+                if name.starts_with("bad") {
+                    Verdict::Detected
+                } else {
+                    Verdict::Clean
+                }
+            }
+        }
+
+        /// The browser and the RDP server as the relay sees them, each reading what reached it.
+        struct Ends {
+            browser: WebSocketStream<DuplexStream>,
+            server: DuplexStream,
+            /// What the browser wrote on the clipboard channel, and what the server read on it.
+            at_browser: Route,
+            at_server: Route,
+        }
+
+        impl Ends {
+            async fn browser_sends(&mut self, bytes: Vec<u8>) {
+                self.browser.send(Message::Binary(bytes)).await.unwrap();
+            }
+
+            async fn server_sends(&mut self, bytes: &[u8]) {
+                self.server.write_all(bytes).await.unwrap();
+            }
+
+            /// Exactly `n` bytes, as the server reads them.
+            async fn server_reads(&mut self, n: usize) -> Vec<u8> {
+                let mut b = vec![0; n];
+                timeout(Duration::from_secs(5), self.server.read_exact(&mut b))
+                    .await
+                    .expect("nothing reached the server")
+                    .unwrap();
+                b
+            }
+
+            async fn browser_reads(&mut self) -> Vec<u8> {
+                loop {
+                    let m = timeout(Duration::from_secs(5), self.browser.next())
+                        .await
+                        .expect("nothing reached the browser")
+                        .unwrap()
+                        .unwrap();
+                    if let Message::Binary(b) = m {
+                        return b.to_vec();
+                    }
+                }
+            }
+
+            /// The next clipboard PDU the browser is sent.
+            async fn browser_clip(&mut self) -> Vec<u8> {
+                loop {
+                    let b = self.browser_reads().await;
+                    for u in units(&b, true) {
+                        if let Routed::Clip(Some(w)) = self.at_browser.read_server(&u).unwrap() {
+                            return w.pdu;
+                        }
+                    }
+                }
+            }
+
+            /// Whether the server has been sent anything on the clipboard channel in `wait`.
+            async fn server_clip(&mut self, wait: Duration) -> Option<Vec<u8>> {
+                let mut buf = vec![0; 1 << 16];
+                let n = timeout(wait, self.server.read(&mut buf))
+                    .await
+                    .ok()?
+                    .unwrap();
+                units(&buf[..n], false).into_iter().find_map(|u| {
+                    match self.at_server.read_client(&u).unwrap() {
+                        Routed::Clip(Some(w)) => Some(w.pdu),
+                        _ => None,
+                    }
+                })
+            }
+
+            async fn browser_clip_sends(&mut self, pdu: ClipboardPdu<'static>) {
+                let bytes = connected().to_server(pdu).unwrap();
+                self.browser_sends(bytes).await;
+            }
+        }
+
+        fn decoded(bytes: &[u8]) -> ClipboardPdu<'_> {
+            ironrdp_core::decode::<ClipboardPdu<'_>>(bytes).unwrap()
+        }
+
+        /// The browser and server connected through the scanned relay, past the connection
+        /// sequence, with every byte of it checked on the way.
+        async fn through_the_relay(ends: &mut Ends) {
+            // CredSSP before the first TPKT: DER, relayed as it came.
+            let der = vec![0x30, 0x03, 0x02, 0x01, 0x06];
+            ends.browser_sends(der.clone()).await;
+            assert_eq!(ends.server_reads(der.len()).await, der);
+            ends.server_sends(&der).await;
+            assert_eq!(ends.browser_reads().await, der);
+
+            // The Connect Initial reaches the server with only the clipboard's compression off.
+            let ci = connect_initial();
+            ends.browser_sends(ci.clone()).await;
+            let got = ends.server_reads(ci.len()).await;
+            let name = b"cliprdr\0";
+            let at = got.windows(name.len()).position(|w| w == name).unwrap() + name.len();
+            let options = u32::from_le_bytes(got[at..at + 4].try_into().unwrap());
+            assert_eq!(options & 0x00C0_0000, 0, "compression left on");
+            let differ: Vec<usize> = (0..ci.len()).filter(|&i| ci[i] != got[i]).collect();
+            assert!(
+                differ.iter().all(|&i| (at..at + 4).contains(&i)),
+                "{differ:?}"
+            );
+
+            let cr = connect_response();
+            ends.server_sends(&cr).await;
+            assert_eq!(ends.browser_reads().await, cr);
+
+            // Another channel's data passes byte for byte, both ways.
+            let req = send_request(OTHER, &QUIET);
+            ends.browser_sends(req.clone()).await;
+            assert_eq!(ends.server_reads(req.len()).await, req);
+            let ind = send_indication(OTHER, &QUIET);
+            ends.server_sends(&ind).await;
+            assert_eq!(ends.browser_reads().await, ind);
+        }
+
+        fn file_offer() -> ClipboardPdu<'static> {
+            let formats = [ClipboardFormat::new(ClipboardFormatId::new(FGD))
+                .with_name(ClipboardFormatName::new("FileGroupDescriptorW"))];
+            ClipboardPdu::FormatList(FormatList::new_unicode(&formats, true).unwrap())
+        }
+
+        /// The browser offers one file and answers every request the proxy makes for it.
+        async fn upload(ends: &mut Ends, name: &str, body: &[u8]) {
+            ends.browser_clip_sends(file_offer()).await;
+            let mut listed = false;
+            loop {
+                let pdu = ends.browser_clip().await;
+                match decoded(&pdu) {
+                    ClipboardPdu::FormatListResponse(FormatListResponse::Ok) => {}
+                    ClipboardPdu::FormatDataRequest(r) => {
+                        assert_eq!(r.format, ClipboardFormatId::new(FGD));
+                        assert!(
+                            ends.server_clip(Duration::from_millis(200)).await.is_none(),
+                            "the offer reached the server before it was scanned"
+                        );
+                        let list = PackedFileList {
+                            files: vec![FileDescriptor::new(name).with_file_size(body.len() as u64)],
+                        };
+                        let d = FormatDataResponse::new_file_list(&list)
+                            .unwrap()
+                            .into_owned();
+                        ends.browser_clip_sends(ClipboardPdu::FormatDataResponse(d))
+                            .await;
+                        listed = true;
+                    }
+                    ClipboardPdu::FileContentsRequest(r) => {
+                        assert!(listed);
+                        let start = r.position as usize;
+                        let end = (start + r.requested_size as usize).min(body.len());
+                        ends.browser_clip_sends(ClipboardPdu::FileContentsResponse(
+                            FileContentsResponse::new_data_response(
+                                r.stream_id,
+                                body[start..end].to_vec(),
+                            ),
+                        ))
+                        .await;
+                        if end == body.len() {
+                            return;
+                        }
+                    }
+                    other => panic!("unexpected {}", other.message_name()),
+                }
+            }
+        }
+
+        async fn relayed(check: impl AsyncFnOnce(&mut Ends, &App, i64)) {
+            let app = test_app();
+            let (uid, cookie) = signed_in(&app, "jdoe");
+            let user = app.store.user_by_id(uid).unwrap().unwrap();
+            let hash = hash_of(&cookie);
+            let (b, p) = tokio::io::duplex(1 << 20);
+            let ws = WebSocketStream::from_raw_socket(p, Role::Server, None).await;
+            let browser = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
+            let (to_server, server) = tokio::io::duplex(1 << 20);
+            let scan = crate::scan::ScanService::for_test(Arc::new(ByName));
+            let session = Session {
+                app: &app,
+                user: &user,
+                token_hash: &hash,
+                peer: "127.0.0.1:1".parse().unwrap(),
+                live_id: 0,
+                setup_permit: Default::default(),
+            };
+            let mut ends = Ends {
+                browser,
+                server,
+                at_browser: connected(),
+                at_server: connected(),
+            };
+            let relay = session.relay_scanned(ws, to_server, false, scan, "hist-01");
+            let test = async {
+                through_the_relay(&mut ends).await;
+                check(&mut ends, &app, uid).await;
+                ends.browser.close(None).await.unwrap();
+            };
+            let (r, ()) = tokio::join!(relay, test);
+            r.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_clean_upload_reaches_the_server_only_after_its_scan() {
+            relayed(async |ends: &mut Ends, app: &App, uid: i64| {
+                upload(ends, "notes.txt", b"hello").await;
+                let pdu = ends
+                    .server_clip(Duration::from_secs(5))
+                    .await
+                    .expect("never offered");
+                assert!(matches!(decoded(&pdu), ClipboardPdu::FormatList(_)));
+                let (notices, _) = app.notices.since(uid, 0);
+                assert!(
+                    notices.iter().any(|n| n.text.contains("notes.txt passed")),
+                    "{notices:?}"
+                );
+                let audit = app
+                    .store
+                    .audit_search(10, None, Some("file.upload"))
+                    .unwrap();
+                assert!(audit
+                    .iter()
+                    .any(|a| a.detail.contains("notes.txt (5 bytes), hist-01: passed")));
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn malware_never_reaches_the_server() {
+            relayed(async |ends: &mut Ends, app: &App, uid: i64| {
+                upload(ends, "bad.exe", b"MZ....").await;
+                // The server is told the clipboard holds nothing, and never sees the file's formats.
+                let pdu = ends
+                    .server_clip(Duration::from_secs(5))
+                    .await
+                    .expect("server not told");
+                let ClipboardPdu::FormatList(l) = decoded(&pdu) else {
+                    panic!("the server was sent something other than an empty list");
+                };
+                assert!(l.get_formats(true).unwrap().is_empty());
+                assert!(ends.server_clip(Duration::from_millis(300)).await.is_none());
+                let (notices, _) = app.notices.since(uid, 0);
+                assert!(
+                    notices.iter().any(|n| n.bad && n.text.contains("bad.exe")),
+                    "{notices:?}"
+                );
+            })
+            .await;
+        }
+    }
 
     #[tokio::test]
     async fn a_tpkt_unit_is_read_whole() {

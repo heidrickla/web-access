@@ -6,6 +6,8 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 
 ### Added
 
+- Files crossing the clipboard channel, both ways, are held on the proxy and scanned by the anti-malware product registered with Windows through AMSI (Trellix, Defender), or by a scanner command. Only files called clean are passed on; an offer with one file refused is refused whole. The user's page says what was decided, and the Activity tab has an entry per file. On by default on Windows; `[scan]` in `config.toml`.
+- The scanner is checked with the EICAR test file and a harmless one at start and hourly, and files are refused while the check fails. The Migration tab shows the scanner and its last check; the Activity tab records `scan.failing` and `scan.restored`.
 - A Settings tab: how long a sign-in lasts, when opening a server asks for the password again, and the largest file sent or fetched over the clipboard. A larger file is refused.
 - A default domain per server, set on the Servers tab or as the fifth CSV column, filled into the server sign-in.
 - A light theme beside the dark default, a phone layout, server tiles whose whole area opens the server, and a refreshed look on both pages.
@@ -29,6 +31,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 
 ### Changed
 
+- With file scanning on, the clipboard channel is not compressed, clipboard locking is not offered, and only SSL, HYBRID and HYBRID_EX security are relayed.
 - With `netbios` set, a sign-in name with a domain in it is checked as typed, a password accepted for an account in another domain is refused, and the account signed in is the one Active Directory says the password was checked for. Without it, every name binds as `name@domain`, as before.
 - The directory account checks find an account by its SID, so an account renamed in the directory keeps its sessions; a pass in which no account could be looked up counts as failing.
 - An account renamed in Active Directory keeps its row, servers and saved credentials.

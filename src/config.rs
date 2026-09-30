@@ -40,6 +40,9 @@ pub struct Config {
     /// Seeds an empty database, then ignored.
     #[serde(default)]
     pub target: Vec<Target>,
+    /// How files crossing the clipboard channel are scanned before they are passed on.
+    #[serde(default)]
+    pub scan: Scan,
     /// Keys in the file that nothing reads, such as a misspelt `service_acount`. Logged at start.
     #[serde(skip)]
     pub unknown: Vec<String>,
@@ -60,6 +63,19 @@ const KNOWN: &[(&str, &[&str])] = &[
             "max_connections",
             "audit_days",
             "target",
+            "scan",
+        ],
+    ),
+    (
+        "scan",
+        &[
+            "scanner",
+            "command",
+            "clean_exit_codes",
+            "detected_exit_codes",
+            "timeout_secs",
+            "max_staged_mb",
+            "check_every_mins",
         ],
     ),
     ("https", &["cert", "key"]),
@@ -113,6 +129,84 @@ fn unknown_keys(text: &str) -> Vec<String> {
     found.sort();
     found.dedup();
     found
+}
+
+/// `amsi` hands each file to the anti-malware product registered with Windows (Trellix, Defender);
+/// `command` runs a scanner program on a copy; `off` passes the clipboard channel through unread.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Scanner {
+    Amsi,
+    Command,
+    Off,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct Scan {
+    pub scanner: Scanner,
+    /// For `command`: the program and its arguments; `{file}` is replaced by the copy's path.
+    pub command: Vec<String>,
+    pub clean_exit_codes: Vec<i32>,
+    pub detected_exit_codes: Vec<i32>,
+    /// A file that has no verdict in this time is refused.
+    pub timeout_secs: u64,
+    /// Bytes held for scanning at once, across every session; a transfer past it is refused.
+    pub max_staged_mb: u64,
+    /// How often the scanner is shown the EICAR test file. Each check is one detection in the
+    /// anti-malware product's own log.
+    pub check_every_mins: u64,
+}
+
+impl Scan {
+    fn check(&self) -> Result<(), String> {
+        if self.scanner == Scanner::Amsi && !cfg!(windows) {
+            return Err("scanner = \"amsi\" needs Windows".into());
+        }
+        if self.scanner == Scanner::Command {
+            if self.command.is_empty() {
+                return Err("scanner = \"command\" needs command = [program, args...]".into());
+            }
+            if !self.command.iter().any(|a| a.contains("{file}")) {
+                return Err("command must pass the file as {file}".into());
+            }
+            if self.detected_exit_codes.is_empty() {
+                return Err("detected_exit_codes lists no code".into());
+            }
+            if self
+                .clean_exit_codes
+                .iter()
+                .any(|c| self.detected_exit_codes.contains(c))
+            {
+                return Err("an exit code cannot mean both clean and detected".into());
+            }
+        }
+        if self.timeout_secs == 0 || self.max_staged_mb == 0 {
+            return Err("timeout_secs and max_staged_mb must be at least 1".into());
+        }
+        if !(5..=1440).contains(&self.check_every_mins) {
+            return Err("check_every_mins must be 5 to 1440".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for Scan {
+    fn default() -> Self {
+        Self {
+            scanner: if cfg!(windows) {
+                Scanner::Amsi
+            } else {
+                Scanner::Off
+            },
+            command: Vec::new(),
+            clean_exit_codes: vec![0],
+            detected_exit_codes: Vec::new(),
+            timeout_secs: 120,
+            max_staged_mb: 2048,
+            check_every_mins: 60,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -217,6 +311,8 @@ pub enum ConfigError {
     MissingCaBundle,
     #[error("audit_days must be at least 1")]
     AuditDays,
+    #[error("scan: {0}")]
+    Scan(String),
     #[error("directory: {0}")]
     Directory(String),
 }
@@ -260,6 +356,7 @@ impl Config {
         if self.audit_days == 0 {
             return Err(ConfigError::AuditDays);
         }
+        self.scan.check().map_err(ConfigError::Scan)?;
         let Some(d) = &self.directory else {
             if self.allow_local_accounts {
                 return Ok(());
@@ -354,6 +451,31 @@ urls = ["ldaps://dc1.corp.example.com"]
         let c = Config::parse("config.toml", include_str!("../config.example.toml")).unwrap();
         assert!(c.https.is_some());
         assert_eq!(c.directory.as_ref().unwrap().urls.len(), 2);
+        // As installed on Windows, files are scanned by the registered anti-malware product.
+        if cfg!(windows) {
+            assert_eq!(c.scan.scanner, Scanner::Amsi);
+        }
+    }
+
+    #[test]
+    fn a_scan_setting_that_cannot_work_is_refused() {
+        for bad in [
+            "[scan]\nscanner = \"command\"\ncommand = [\"scan\"]\ndetected_exit_codes = [1]\n",
+            "[scan]\nscanner = \"command\"\ncommand = [\"scan\", \"{file}\"]\n",
+            "[scan]\nscanner = \"command\"\ncommand = [\"scan\", \"{file}\"]\ndetected_exit_codes = [0]\n",
+            "[scan]\nscanner = \"off\"\ncheck_every_mins = 1\n",
+            "[scan]\nscanner = \"off\"\ntimeout_secs = 0\n",
+        ] {
+            let text = format!("{GOOD}\n{bad}");
+            assert!(
+                matches!(Config::parse("t", &text), Err(ConfigError::Scan(_))),
+                "accepted: {bad}"
+            );
+        }
+        let ok = format!(
+            "{GOOD}\n[scan]\nscanner = \"command\"\ncommand = [\"scan\", \"{{file}}\"]\ndetected_exit_codes = [1]\n"
+        );
+        assert!(Config::parse("t", &ok).is_ok());
     }
 
     const LOCAL_ONLY: &str = r#"
@@ -404,6 +526,12 @@ verify = "insecure"
             })
             .map(|l| format!("{l}\n"))
             .collect();
+        // AMSI is Windows-only, and the command scanner the example also documents runs anywhere.
+        let every = if cfg!(windows) {
+            every
+        } else {
+            every.replace("scanner = \"amsi\"", "scanner = \"command\"")
+        };
         let c = Config::parse("t", &every).unwrap();
         assert!(c.unknown.is_empty(), "{:?}", c.unknown);
         assert!(

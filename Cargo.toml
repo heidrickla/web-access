@@ -7,7 +7,14 @@ description = "Browser-based RDP gateway: directory sign-in, per-user server lis
 repository = "https://github.com/heidrickla/web-access"
 
 [dependencies]
-ironrdp-rdcleanpath = "0.2.2"
+# The RDP layers, from the IronRDP commit the browser client is built from (README, "The browser
+# client"), so both ends of every clipboard PDU are the same code. core, pdu and svc frame and
+# route the stream; cliprdr reads and writes the clipboard channel the file scan intercepts.
+ironrdp-rdcleanpath = { version = "0.2.2", git = "https://github.com/Devolutions/IronRDP", rev = "9b151c4c2e47c6014e1e8e55909d4180aa8bdb99" }
+ironrdp-core = { version = "0.2.1", git = "https://github.com/Devolutions/IronRDP", rev = "9b151c4c2e47c6014e1e8e55909d4180aa8bdb99" }
+ironrdp-pdu = { version = "0.9.0", git = "https://github.com/Devolutions/IronRDP", rev = "9b151c4c2e47c6014e1e8e55909d4180aa8bdb99" }
+ironrdp-svc = { version = "0.8.0", git = "https://github.com/Devolutions/IronRDP", rev = "9b151c4c2e47c6014e1e8e55909d4180aa8bdb99" }
+ironrdp-cliprdr = { version = "0.7.0", git = "https://github.com/Devolutions/IronRDP", rev = "9b151c4c2e47c6014e1e8e55909d4180aa8bdb99" }
 # "sync" is for the oneshot the Windows service uses to turn an SCM stop into a shutdown future.
 # Its absence compiles fine on Linux, because service.rs is cfg(windows) — only the cross-build finds it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
@@ -51,7 +58,7 @@ x509-parser = { version = "0.18", default-features = false }
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 # DPAPI for the local wrap of the master key, and console echo control for passphrase prompts.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Console", "Win32_System_Antimalware", "Win32_System_Registry"] }
 
 [profile.release]
 strip = true

@@ -25,3 +25,5 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The IronRDP crates come from the commit the browser client is built from (Cargo.toml).
+allow-git = ["https://github.com/Devolutions/IronRDP"]

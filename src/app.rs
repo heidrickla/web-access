@@ -53,6 +53,10 @@ pub struct App {
     pub throttle: crate::auth::Throttle,
     /// How the directory account checks last went, for the Migration tab.
     pub revocation: Mutex<RevocationHealth>,
+    /// Files on the clipboard channel are scanned before they are passed on; none when off.
+    pub scan: Option<Arc<crate::scan::ScanService>>,
+    /// Messages for users' pages, such as a file refused by the scan.
+    pub notices: crate::scan::Notices,
 }
 
 /// The last directory account check. `error` is set while checks fail, and nothing is revoked
@@ -112,6 +116,7 @@ impl App {
             &app.cfg.data_dir(),
             std::time::Duration::from_secs(60 * 60),
         );
+        crate::scan::scanner::clear_staging(&app.cfg.data_dir());
         Ok(app)
     }
 
@@ -141,6 +146,7 @@ impl App {
         host_name: String,
         secure_cookies: bool,
     ) -> Self {
+        let scan = crate::scan::ScanService::new(&cfg.scan, &cfg.data_dir());
         Self {
             secure_cookies,
             host_name,
@@ -158,6 +164,8 @@ impl App {
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
             throttle: crate::auth::Throttle::default(),
             revocation: Mutex::new(RevocationHealth::default()),
+            scan,
+            notices: crate::scan::Notices::default(),
         }
     }
 

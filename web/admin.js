@@ -770,8 +770,23 @@ loaders.migration = async () => {
         + (c.unread && c.unread.length ? `; ${c.unread.length} could not be looked up (${c.unread.join(', ')}).` : '.')
       : 'Account checks have not run since the proxy started.';
   checks.hidden = !dir.service_account;
+  scanStatus(m.scan);
   note('migration');
 };
+
+/// Whether files crossing the clipboard channel are being scanned, and if not, why.
+function scanStatus(s) {
+  const line = $('scan-status');
+  line.classList.toggle('bad', !!s && !s.admitting);
+  if (!s) {
+    line.textContent = 'Off in the configuration: files cross the clipboard channel without a scan.';
+  } else if (s.admitting) {
+    line.textContent = `Every file is scanned by ${s.health.scanner}. Last check ${when(s.health.checked_at)}: ${s.health.detail}.`;
+  } else {
+    line.textContent = `Every file is refused until the scanner passes its check: ${s.refusing}. Scanner: ${s.health.scanner}`
+      + (s.health.checked_at ? `, last checked ${when(s.health.checked_at)}.` : '.');
+  }
+}
 
 $('recovery-form').addEventListener('submit', async ev => {
   ev.preventDefault();
