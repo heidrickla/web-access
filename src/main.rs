@@ -19,7 +19,11 @@ mod app;
 mod auth;
 mod config;
 mod directory;
+mod https;
 mod live;
+// Used by the Windows service; built and tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod logfile;
 mod migrate;
 mod policy;
 mod proxy;
@@ -49,14 +53,18 @@ pub fn config_path_from_args() -> String {
     absolute(&given)
 }
 
+/// Days of service log kept, one file a day.
+#[cfg(windows)]
+const LOG_DAYS: usize = 30;
+
 /// Where a service writes its log: beside the config, because a service has no stdout.
 #[cfg(windows)]
-fn service_log_path(config_path: &str) -> std::path::PathBuf {
+fn service_log(config_path: &str) -> std::sync::Arc<logfile::DailyLog> {
     use std::path::Path;
-    Path::new(config_path)
+    let dir = Path::new(config_path)
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("web-access-proxy.log")
+        .unwrap_or_else(|| Path::new("."));
+    logfile::DailyLog::new(dir, "web-access-proxy", LOG_DAYS)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,20 +75,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(windows)]
     if std::env::args().any(|a| a == "--service") {
-        let path = service_log_path(&config_path_from_args());
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let log = service_log(&config_path_from_args());
+        let path = log.current_path();
         tracing_subscriber::fmt()
             .with_env_filter(filter())
             .with_ansi(false)
-            .with_writer(move || {
-                file.try_clone()
-                    .expect("could not clone the log file handle")
-            })
+            .with_writer(move || logfile::Writer(std::sync::Arc::clone(&log)))
             .init();
-        tracing::info!(log = %path.display(), "starting as a windows service");
+        tracing::info!(log = %path.display(), keep_days = LOG_DAYS, "starting as a windows service");
         service::start()?;
         return Ok(());
     }

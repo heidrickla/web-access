@@ -15,6 +15,11 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - Opening a server when the sign-in has less than 18 hours left asks for the password again, so a desktop is not cut off mid-shift.
 - Mouse-wheel scrolling on the desktop. Files dropped on the desktop go to the remote clipboard.
 - A page that cannot reach the proxy says so and tries again every ten seconds.
+- `audit_days` (default 400): older activity is removed hourly.
+- The service log is one file per UTC day, `web-access-proxy-<date>.log`, and the newest 30 are kept.
+- The HTTPS certificate is read again when its files change; its expiry is logged, with a daily warning from 30 days out.
+- The Migration tab shows how the directory account checks last went; the Activity tab records when they start failing and when they recover.
+- Cancel on an uploaded import releases it on the proxy.
 
 ### Changed
 
@@ -33,11 +38,20 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - A refresh does not replace a message said in the last eight seconds; an error wraps rather than being cut off; during a session the rail repeats messages and its button marks a new one.
 - Saved credentials are asked for again only when the server refused them.
 - Admin user rows are selectable from the keyboard.
+- The database runs in WAL mode, and an export copies it on a connection of its own, so an export no longer holds up sign-ins and edits. An import refuses to swap while another process has the database open.
+- Page assets are gzipped at build time and served with an ETag and `no-cache`, so a repeat load of the client is a 304.
+- One account that cannot be looked up no longer stops the account checks for everyone else.
+- The domain controller that last answered is tried first.
+- Both legs of a relay use TCP keepalive and no-delay, so a vanished peer is found in about three minutes; writes to the server are flushed at once.
+- A config key the proxy does not read is named in the log at start.
+- A failed TLS handshake is logged at info, at most one line a minute.
+- At most two uploaded imports are held, and unconfirmed ones are dropped after 30 minutes.
 
 ### Fixed
 
 - An upgrade or an uninstall no longer deletes `config.toml`.
 - A damaged or truncated export is reported as damaged instead of as a server error.
+- A `[tls] ca_bundle` that holds no certificate is refused at start instead of every server being refused, and a missing one is named in the error.
 - A database that does not reopen after an import's swap stops the service instead of serving an empty one.
 - Pressing a server tile outside its name opened nothing; opening a server said nothing while the client loaded.
 - Enter in the server sign-in dialog cancelled it instead of connecting.

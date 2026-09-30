@@ -583,6 +583,7 @@ body.connected #screen { display: block; }
   overflow-wrap: anywhere;
 }
 .panel-msg.bad { color: var(--bad); background: var(--bad-soft); }
+.note.bad { color: var(--bad); }
 
 #panel {
   display: none;

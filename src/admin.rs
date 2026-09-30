@@ -50,7 +50,10 @@ pub fn router() -> Router<Shared> {
             "/migration/import",
             post(upload_import).layer(DefaultBodyLimit::max(IMPORT_LIMIT)),
         )
-        .route("/migration/import/{upload}", post(confirm_import))
+        .route(
+            "/migration/import/{upload}",
+            post(confirm_import).delete(cancel_import),
+        )
         .route("/settings/directory-password", post(set_directory_password))
 }
 
@@ -647,6 +650,7 @@ async fn migration_status(State(app): State<Shared>, _: AdminUser) -> ApiResult<
             "password_set": app.directory_password_set(),
             // Set but sealed under a key a locked store cannot open: the account checks cannot run.
             "password_readable": app.directory_password_set() && app.vault.is_unlocked(),
+            "checks": app.revocation.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         },
         "local_accounts": app.cfg.allow_local_accounts,
     })))
@@ -1021,6 +1025,18 @@ async fn confirm_import(
     Ok(Json(json!({ "counts": counts })))
 }
 
+/// An administrator backed out of an import: the upload is not held until it expires.
+async fn cancel_import(
+    State(app): State<Shared>,
+    AdminToken(token): AdminToken,
+    Path(upload): Path<String>,
+) -> ApiResult<StatusCode> {
+    let _shared = app.gate.read().await;
+    revalidate_admin(&app, &token)?;
+    migrate::cancel(&app, &upload);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The swap runs with the gate held exclusively: every request in flight finishes first, and none
 /// starts until the new database and its key are both in place. The task holding the gate runs to
 /// the end of the swap whatever becomes of the request.
@@ -1143,6 +1159,7 @@ mod tests {
             ("POST", "/api/admin/migration/unfreeze"),
             ("POST", "/api/admin/migration/import"),
             ("POST", "/api/admin/migration/import/x"),
+            ("DELETE", "/api/admin/migration/import/x"),
             ("POST", "/api/admin/settings/directory-password"),
         ];
         for (m, p) in routes {

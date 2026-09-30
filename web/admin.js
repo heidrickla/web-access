@@ -613,6 +613,16 @@ loaders.migration = async () => {
   $('directory-note').textContent = dir.service_account
     ? `Account ${dir.service_account}. Password ${password}. It lets the proxy check accounts when they are added, and end the sessions of accounts disabled in the directory.`
     : '';
+  const c = dir.checks || {};
+  const checks = $('directory-checks');
+  checks.classList.toggle('bad', !!c.error);
+  checks.textContent = c.error
+    ? `Account checks are failing${c.last_ok ? ` since ${when(c.last_ok)}` : ''}: ${c.error}. Sessions of accounts disabled in the directory are not being ended.`
+    : c.last_run
+      ? `Account checks last ran ${when(c.last_run)}: ${c.checked} signed-in account(s) checked`
+        + (c.unread && c.unread.length ? `; ${c.unread.length} could not be looked up (${c.unread.join(', ')}).` : '.')
+      : 'Account checks have not run since the proxy started.';
+  checks.hidden = !dir.service_account;
   note('migration');
 };
 
@@ -736,12 +746,18 @@ $('import-upload').addEventListener('submit', async ev => {
   }
 });
 
-$('imp-cancel').addEventListener('click', () => {
+function closeImport() {
   upload = null;
   $('import-confirm').reset();
   $('import-confirm').hidden = true;
   $('import-upload').hidden = false;
   $('import-upload').reset();
+}
+
+$('imp-cancel').addEventListener('click', () => {
+  // The proxy holds the upload in memory until it expires; let it go now.
+  if (upload) api('DELETE', `/api/admin/migration/import/${upload.upload_id}`).catch(() => {});
+  closeImport();
 });
 
 $('import-confirm').addEventListener('submit', async ev => {
@@ -755,7 +771,7 @@ $('import-confirm').addEventListener('submit', async ev => {
       confirm_host: $('imp-host').value || null,
     }, undefined, { replacesData: true });
     const c = r.counts;
-    $('imp-cancel').click();
+    closeImport();
     say(`imported ${c.users} users, ${c.servers} servers, ${c.credentials} saved credentials; reloading`);
     // Everything on the page came from the replaced database. The imported sign-in sessions replace
     // this host's, so the reload may ask for a fresh sign-in.

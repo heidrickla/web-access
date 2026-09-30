@@ -33,6 +33,8 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }
 rustls-native-certs = "0.8"
+# TCP keepalive, which tokio does not expose: a relay whose peer vanished is found and closed.
+socket2 = "0.6"
 # SQLite compiled from source, so the store needs no system library on either target.
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 # LDAPS to the domain controllers, on the same rustls and ring as everything else.
@@ -41,6 +43,8 @@ ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ri
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # Export archives. Entries are stored, not compressed: the payload is ciphertext.
 zip = { version = "8", default-features = false }
+# The HTTPS certificate's expiry, for the log. Already in the tree through ldap3.
+x509-parser = { version = "0.18", default-features = false }
 
 # Only the Windows build needs the Service Control Manager integration. On Linux the binary is a
 # plain daemon and this is not compiled at all.
@@ -51,3 +55,14 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [profile.release]
 strip = true
+
+# Page assets are gzipped at build time (build.rs), so serving them costs nothing.
+[build-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# The build script compresses a 7 MB WASM file; optimised, a debug build does it in a moment.
+[profile.dev.build-override]
+opt-level = 3

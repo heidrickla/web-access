@@ -471,16 +471,85 @@ async fn deadline(req: Request, next: Next) -> Response {
     }
 }
 
-async fn static_asset(method: Method, uri: Uri) -> Response {
+include!(concat!(env!("OUT_DIR"), "/packed.rs"));
+
+/// The gzip and ETags build.rs made for the file behind a request path.
+fn packed(path: &str) -> Option<(&'static [u8], &'static str, &'static str)> {
+    let file = match path {
+        "/" => "index.html",
+        "/admin" => "admin.html",
+        p => p.strip_prefix('/')?,
+    };
+    PACKED
+        .iter()
+        .find(|(f, ..)| *f == file)
+        .map(|(_, gz, etag, gz_etag)| (*gz, *etag, *gz_etag))
+}
+
+/// Whether the request's Accept-Encoding takes gzip (a `q=0` refuses it).
+fn takes_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|coding| {
+            let mut parts = coding.split(';').map(str::trim);
+            let name = parts.next().unwrap_or("");
+            let refused = parts.any(|p| {
+                p.strip_prefix("q=")
+                    .and_then(|q| q.parse::<f32>().ok())
+                    .is_some_and(|q| q == 0.0)
+            });
+            name.eq_ignore_ascii_case("gzip") && !refused
+        })
+}
+
+/// Pages and the client are revalidated on every load, so an upgrade is picked up at once, and a
+/// repeat load of the 7 MB client costs a 304.
+async fn static_asset(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
     }
-    match ASSETS.iter().find(|(p, _, _)| *p == uri.path()) {
-        Some((_, content_type, body)) => {
-            ([(header::CONTENT_TYPE, *content_type)], *body).into_response()
-        }
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    let Some((path, content_type, body)) = ASSETS.iter().find(|(p, _, _)| *p == uri.path()) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let cache = [
+        (header::CACHE_CONTROL, "no-cache"),
+        (header::VARY, "Accept-Encoding"),
+    ];
+    let Some((gz, etag, gz_etag)) = packed(path) else {
+        return ([(header::CONTENT_TYPE, *content_type)], cache, *body).into_response();
+    };
+    let gzip = takes_gzip(&headers);
+    let tag = if gzip { gz_etag } else { etag };
+    let current = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().trim_start_matches("W/") == tag);
+    if current {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)], cache).into_response();
     }
+    if gzip {
+        return (
+            [
+                (header::CONTENT_TYPE, *content_type),
+                (header::CONTENT_ENCODING, "gzip"),
+                (header::ETAG, gz_etag),
+            ],
+            cache,
+            gz,
+        )
+            .into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, *content_type), (header::ETAG, etag)],
+        cache,
+        *body,
+    )
+        .into_response()
 }
 
 // ---- sign-in --------------------------------------------------------------------------------
@@ -1846,6 +1915,79 @@ pub mod tests {
                 assert!(tag.contains("src="), "{path}: inline <script{tag}>");
             }
         }
+    }
+
+    async fn fetch_asset(path: &str, headers: &[(&str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut req = Request::builder()
+            .uri(path)
+            .header(header::HOST, "proxy.test");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let res = router(test_app())
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn every_asset_has_its_gzip_and_it_matches() {
+        for (path, _, body) in ASSETS {
+            let (gz, etag, gz_etag) = packed(path).unwrap_or_else(|| panic!("{path} not packed"));
+            assert_eq!(gunzip(gz), *body, "{path}");
+            assert_ne!(etag, gz_etag);
+        }
+    }
+
+    #[tokio::test]
+    async fn assets_are_revalidated_compressed_and_answered_304_when_unchanged() {
+        let raw = ASSETS.iter().find(|(p, ..)| *p == "/app.js").unwrap().2;
+        let (s, h, body) = fetch_asset("/app.js", &[("accept-encoding", "br, gzip")]).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(h[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(gunzip(&body), raw);
+        let gz_tag = h[header::ETAG].to_str().unwrap().to_owned();
+
+        let (s, h, body) = fetch_asset(
+            "/app.js",
+            &[("accept-encoding", "gzip"), ("if-none-match", &gz_tag)],
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_MODIFIED);
+        assert_eq!(h[header::ETAG], gz_tag.as_str());
+        assert!(body.is_empty());
+
+        // Without gzip the other representation is sent, whatever tag the gzip one had.
+        let (s, h, body) = fetch_asset("/app.js", &[("if-none-match", &gz_tag)]).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(h.get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(body, raw);
+        let (s, _, body) = fetch_asset("/app.js", &[("accept-encoding", "gzip;q=0")]).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body, raw);
+    }
+
+    #[tokio::test]
+    async fn api_answers_are_never_cached() {
+        let (_, h, _) = fetch_asset("/api/me", &[]).await;
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]
