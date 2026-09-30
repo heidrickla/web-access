@@ -221,7 +221,7 @@ It builds the proxy, takes the version from `Cargo.toml`, stamps the source revi
 | Service arguments | `--service "[ProgramData]\web-access\config.toml"` |
 | First install | the service is not started: the config has to be written first |
 | Upgrade | the new version is installed, then the old one removed; the service is stopped, replaced and started again. A start that fails (a config still to be edited) is in the service log and does not fail the upgrade; an upgrade that fails leaves the old version installed |
-| Firewall | one exception for `web-access-proxy.exe`, not a port, because the port comes from the config. Remote addresses from `REMOTE_ADDRESSES`: any by default, or a comma-separated list of addresses and subnets; remembered for upgrades and kept on uninstall, so a reinstall uses it too |
+| Firewall | one exception, `web-access RDP proxy`, for `web-access-proxy.exe`, not a port, because the port comes from the config. An upgrade keeps it; the upgrade from 0.2 removes 0.2's rule, `web-access proxy`. Remote addresses from `REMOTE_ADDRESSES`: any by default, or a comma-separated list of addresses and subnets; remembered for upgrades and kept on uninstall, so a reinstall uses it too |
 
 ### Installing
 

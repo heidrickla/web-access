@@ -60,7 +60,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 ### Fixed
 
 - An upgrade or an uninstall does not delete `config.toml`, including the upgrade from 0.2: the old version is removed after the new one is installed, and the config is kept on uninstall.
-- The firewall exception is scoped to `web-access-proxy.exe`; it had no program, so it admitted every inbound TCP port from its remote addresses.
+- The firewall exception is scoped to `web-access-proxy.exe`; it had no program, so it admitted every inbound TCP port from its remote addresses. It is named `web-access RDP proxy`, and the upgrade from 0.2 removes 0.2's rule, `web-access proxy`.
 - A failed service start during an upgrade no longer fails the upgrade, a failed upgrade leaves the old version installed, and a rebuild of the same version upgrades in place.
 - `REMOTE_ADDRESSES` is kept on uninstall, so a reinstall or a rollback keeps the same firewall scope.
 - Cancelling an uploaded import could hold every request for up to two minutes while an export or import waited.
