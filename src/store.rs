@@ -1740,7 +1740,19 @@ mod tests {
                 .unwrap();
             }
         }
+        let times = |s: &Store| -> Vec<i64> {
+            s.audit_list(10, None)
+                .unwrap()
+                .iter()
+                .map(|r| r.at)
+                .collect()
+        };
         assert_eq!(s.audit_prune(45, 2).unwrap(), 2);
+        assert_eq!(
+            times(&s),
+            vec![50, 40, 30],
+            "the first batch was not the oldest"
+        );
         assert_eq!(s.audit_prune(45, 2).unwrap(), 2);
         assert_eq!(s.audit_prune(45, 2).unwrap(), 0);
         let left: Vec<i64> = s

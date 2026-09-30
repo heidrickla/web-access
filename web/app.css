@@ -527,7 +527,8 @@ body.connected { background: #000; overflow: hidden; }
 body.connected > header { display: none; }
 body.connected main { padding: 0; }
 body.connected #list, body.connected #login { display: none; }
-body.connected #screen { display: block; }
+/* Natural size, capped to the viewport with its shape kept: a bitmap in device pixels shows one to one. */
+body.connected #screen { display: block; margin: 0 auto; max-width: 100vw; max-height: 100vh; }
 
 #rail {
   position: fixed;

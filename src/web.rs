@@ -120,6 +120,17 @@ pub const ASSETS: &[(&str, &str, &[u8])] = &[
         "text/html; charset=utf-8",
         include_bytes!("../web/notices-client.html"),
     ),
+    // The names the pages cross-link by, which also resolve beside the installed binary.
+    (
+        "/notices.html",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/notices.html"),
+    ),
+    (
+        "/notices-client.html",
+        "text/html; charset=utf-8",
+        include_bytes!("../web/notices-client.html"),
+    ),
 ];
 
 // ---- errors ---------------------------------------------------------------------------------
@@ -1921,7 +1932,17 @@ pub mod tests {
                 !html.contains(" style=\""),
                 "{path}: inline style attribute"
             );
-            assert!(!html.contains(" onclick="), "{path}: inline handler");
+            // Any on…= attribute in any tag; the text between tags is not looked at.
+            for tag in html.split('<').skip(1).filter_map(|t| t.split('>').next()) {
+                let handler = tag.split_whitespace().skip(1).find(|attr| {
+                    let name = attr.split('=').next().unwrap_or("").to_ascii_lowercase();
+                    attr.contains('=')
+                        && name.len() > 2
+                        && name.starts_with("on")
+                        && name[2..].chars().all(|c| c.is_ascii_lowercase())
+                });
+                assert!(handler.is_none(), "{path}: inline handler {handler:?}");
+            }
             for fragment in html.split("<script").skip(1) {
                 let tag = fragment.split('>').next().unwrap_or("");
                 assert!(tag.contains("src="), "{path}: inline <script{tag}>");

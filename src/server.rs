@@ -352,22 +352,30 @@ fn record_revocation(
 ) -> Option<(&'static str, String)> {
     let mut health = app.revocation.lock().unwrap_or_else(|p| p.into_inner());
     let was_failing = health.error.is_some();
-    match outcome {
-        Ok(None) => None,
-        Ok(Some(pass)) => {
-            health.last_run = Some(at);
-            health.last_ok = Some(at);
-            health.error = None;
-            health.checked = pass.checked;
-            health.unread.clone_from(&pass.unread);
-            was_failing.then(|| ("revocation.restored", String::new()))
-        }
+    let pass = match outcome {
+        Ok(None) => return None,
+        Ok(Some(pass)) => pass,
         Err(e) => {
             health.last_run = Some(at);
             health.error = Some(e.clone());
-            (!was_failing).then(|| ("revocation.failing", e.clone()))
+            return (!was_failing).then(|| ("revocation.failing", e.clone()));
         }
+    };
+    health.last_run = Some(at);
+    health.checked = pass.checked;
+    health.unread.clone_from(&pass.unread);
+    // Bound, then every lookup failed: nothing was checked, so the checks are not working.
+    if pass.checked == 0 && !pass.unread.is_empty() {
+        let e = format!(
+            "none of the {} signed-in account(s) could be looked up",
+            pass.unread.len()
+        );
+        health.error = Some(e.clone());
+        return (!was_failing).then_some(("revocation.failing", e));
     }
+    health.last_ok = Some(at);
+    health.error = None;
+    was_failing.then(|| ("revocation.restored", String::new()))
 }
 
 /// A connection lives only as long as the sign-in it was opened under: expired, signed out,
@@ -438,7 +446,14 @@ pub async fn revocation_pass(app: &App) -> Result<Option<Pass>, Box<dyn std::err
     if users.is_empty() {
         return Ok(Some(Pass::default()));
     }
-    let names: Vec<String> = users.iter().map(|u| u.username.clone()).collect();
+    // By SID where the row has one, so an account renamed in the directory is still found.
+    let names: Vec<(String, Option<String>)> = users
+        .iter()
+        .map(|u| {
+            let sid = u.sid.clone().filter(|s| s.starts_with("S-"));
+            (u.username.clone(), sid)
+        })
+        .collect();
     let found = directory.lookup_each(&password, &names).await?;
     apply_lookups(app, generation, &users, found)
         .await
@@ -573,8 +588,21 @@ mod tests {
             record_revocation(&app, &ok(), 40),
             Some(("revocation.restored", String::new()))
         );
+        {
+            let h = app.revocation.lock().unwrap();
+            assert_eq!((h.error.as_deref(), h.checked), (None, 3));
+        }
+        // Bound, then every lookup failed: nothing was checked, so that is a failing pass.
+        let blind = Ok(Some(Pass {
+            unread: vec!["jdoe".into(), "asmith".into()],
+            ..Pass::default()
+        }));
+        let logged = record_revocation(&app, &blind, 50).expect("no failing entry");
+        assert_eq!(logged.0, "revocation.failing");
         let h = app.revocation.lock().unwrap();
-        assert_eq!((h.error.as_deref(), h.checked), (None, 3));
+        assert_eq!(h.last_ok, Some(40));
+        assert!(h.error.is_some());
+        assert_eq!(h.unread.len(), 2);
     }
 
     #[tokio::test]

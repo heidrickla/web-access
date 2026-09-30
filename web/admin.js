@@ -237,6 +237,8 @@ $('user-filter').addEventListener('input', debounced(renderUsers));
 
 $('add-user').addEventListener('submit', async ev => {
   ev.preventDefault();
+  // Asked before the user is created: once it is, the pane moves to the new user.
+  if (!discardUnsaved()) return;
   const mine = selection;
   detailBusy(true);
   let r;
@@ -265,6 +267,8 @@ function discardUnsaved() {
   const u = users.find(x => x.id === selected);
   if (!confirm(`Discard the unsaved changes to ${u ? u.username : 'this user'}'s servers?`)) return false;
   assigned = new Set(savedAssigned);
+  // The ticks on screen match what is kept, whatever happens next.
+  renderChecklist();
   return true;
 }
 
@@ -274,6 +278,11 @@ window.addEventListener('beforeunload', e => {
 
 async function selectUser(id) {
   if (id !== selected && !discardUnsaved()) return;
+  // Refreshing the user on screen (after an admin toggle, a reset, a reload) keeps the ticks that
+  // are not saved yet: they are laid over what the proxy now holds.
+  const keep = id === selected
+    ? { added: [...assigned].filter(x => !savedAssigned.has(x)), removed: [...savedAssigned].filter(x => !assigned.has(x)) }
+    : null;
   wanted = id;
   const mine = ++selection;
   const u = users.find(x => x.id === id);
@@ -291,6 +300,10 @@ async function selectUser(id) {
   selected = id;
   assigned = new Set(r.assigned);
   savedAssigned = new Set(r.assigned);
+  if (keep) {
+    for (const x of keep.added) assigned.add(x);
+    for (const x of keep.removed) assigned.delete(x);
+  }
   renderUsers();
 
   $('user-detail').hidden = false;
@@ -623,16 +636,22 @@ $('add-group').addEventListener('submit', async ev => {
 
 let oldest = null;
 
+// Bumped by every fresh load: an answer for an older filter is dropped rather than appended.
+let auditLoad = 0;
+
 loaders.activity = async () => {
+  const mine = ++auditLoad;
   oldest = null;
   $('audit-table').tBodies[0].innerHTML = '';
-  await loadAudit();
+  await loadAudit(mine);
 };
 
-async function loadAudit() {
+async function loadAudit(mine = auditLoad) {
   const text = $('audit-filter').value.trim();
+  $('audit-more').disabled = true;
   const r = await api('GET', '/api/admin/audit?limit=100' + (oldest ? '&before=' + oldest : '')
     + (text ? '&q=' + encodeURIComponent(text) : ''));
+  if (mine !== auditLoad) return;
   const body = $('audit-table').tBodies[0];
   for (const e of r.entries) {
     body.append(el('tr', {},
@@ -646,7 +665,10 @@ async function loadAudit() {
   note(body.rows.length + ' entries');
 }
 
-$('audit-more').addEventListener('click', () => loadAudit().catch(fail));
+$('audit-more').addEventListener('click', () => loadAudit().catch(err => {
+  $('audit-more').disabled = false;
+  fail(err);
+}));
 $('audit-filter').addEventListener('input', debounced(() => loaders.activity().catch(fail), 300));
 
 /* ---- migration ---------------------------------------------------------------------------- */

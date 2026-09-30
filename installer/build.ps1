@@ -6,7 +6,7 @@ Build the MSI. Run from anywhere; paths resolve against this script.
     pwsh installer/build.ps1 -Exe <path>   package a binary built elsewhere (cross-compiled on Linux)
 
 The version comes from Cargo.toml, and the binary reports it with the source revision it was
-built from (`web-access-proxy.exe --version`, the log's first line, the Migration tab), so an
+built from (`web-access-proxy.exe --version`, the start of each run in the log, the Migration tab), so an
 installed proxy names exactly what it is. A release is built from its tag, v<version>.
 
 Cross-compiling on Linux, with rustup and gcc-mingw-w64-x86-64:

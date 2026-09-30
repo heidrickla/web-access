@@ -1,7 +1,7 @@
 name: checks
 
-# GitHub's copy. The forge runs .gitea/workflows/ci.yml, the Linux job alone, since it has no
-# Windows runner; there the Windows cfg is covered by the local gates.
+# The forge's copy: its shared runner (capacity 1) has Linux labels only, and a job for a label no
+# runner has waits a day before it is cancelled. Gitea reads this directory instead of .github/.
 
 on:
   push:
@@ -48,21 +48,3 @@ jobs:
 
       - name: dependencies
         run: cargo deny check
-
-  windows:
-    runs-on: windows-latest
-    env:
-      CARGO_TERM_COLOR: never
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: toolchain (pinned)
-        run: |
-          rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
-          rustup default 1.98.1
-
-      - name: lint
-        run: cargo clippy --offline --locked --all-targets -- -D warnings
-
-      - name: test
-        run: cargo test --offline --locked

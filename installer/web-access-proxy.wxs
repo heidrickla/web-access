@@ -27,7 +27,13 @@
            Scope="perMachine"
            Compressed="yes">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- The old version is removed after the new one is installed. Components with the same GUID
+         (the config, the service, the data folder) are then shared and survive the removal, which
+         the default schedule does not allow: it removed 0.2.0 first, and 0.2.0's own package deleted
+         config.toml. A failure installing the new version rolls back with the old one still there. -->
+    <MajorUpgrade Schedule="afterInstallExecute"
+                  AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- The firewall rule's remote addresses: given on the command line, else the value the last
@@ -89,11 +95,13 @@
                         Wait="yes" />
 
         <!-- Scoped to the program, not to a port: the listening port comes from config.toml, which
-             an administrator edits after install. The remote addresses come from REMOTE_ADDRESSES,
-             any by default, since users reach the proxy from other subnets. -->
+             an administrator edits after install. File= is what scopes it: without it the rule has
+             no program and admits every port. The remote addresses come from REMOTE_ADDRESSES, any
+             by default, since users reach the proxy from other subnets. -->
         <fw:FirewallException Id="InboundWebSocket"
                               Name="web-access proxy"
                               Description="Inbound connections to the web-access RDP proxy"
+                              File="web_access_proxy.exe"
                               Profile="all"
                               Protocol="tcp"
                               IgnoreFailure="no">
@@ -101,9 +109,10 @@
         </fw:FirewallException>
       </Component>
 
-      <!-- Records REMOTE_ADDRESSES so the next upgrade keeps it. -->
+      <!-- Records REMOTE_ADDRESSES so the next install keeps it: an upgrade, or a reinstall after an
+           uninstall (Permanent), as when going back to a previous version. -->
       <Component Id="Settings" Directory="INSTALLFOLDER" Guid="e5a6b7c8-9d0e-4f12-8a3b-4c5d6e7f8091"
-                 Bitness="always64">
+                 Bitness="always64" Permanent="yes">
         <RegistryValue Root="HKLM" Key="Software\web-access" Name="RemoteAddresses"
                        Value="[REMOTE_ADDRESSES]" Type="string" KeyPath="yes" />
       </Component>
@@ -115,15 +124,17 @@
                  Bitness="always64" Condition="WIX_UPGRADE_DETECTED">
         <RegistryValue Root="HKLM" Key="Software\web-access" Name="StartedAfterUpgrade"
                        Value="1" Type="integer" KeyPath="yes" />
-        <ServiceControl Id="StartAfterUpgrade" Name="WebAccessProxy" Start="install" Wait="yes" />
+        <!-- Wait="no": a start that fails (a config not yet edited) is in the service's log, and does
+             not fail the upgrade. -->
+        <ServiceControl Id="StartAfterUpgrade" Name="WebAccessProxy" Start="install" Wait="no" />
       </Component>
 
       <!-- The licence and the third-party notices, beside the binary; the proxy also serves the
            notices at /notices. -->
       <Component Id="Notices" Directory="INSTALLFOLDER" Guid="a7c8d9e0-1f2a-4b34-8c5d-6e7f80910213">
         <File Id="LICENSE.txt" Source="..\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
-        <File Id="notices.html" Source="..\web\notices.html" Name="THIRD-PARTY-NOTICES.html" />
-        <File Id="notices_client.html" Source="..\web\notices-client.html" Name="THIRD-PARTY-NOTICES-CLIENT.html" />
+        <File Id="notices.html" Source="..\web\notices.html" Name="notices.html" />
+        <File Id="notices_client.html" Source="..\web\notices-client.html" Name="notices-client.html" />
       </Component>
 
       <!-- Permanent: uninstalling, and the uninstall of the old version inside an upgrade, leave

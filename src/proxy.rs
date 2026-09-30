@@ -56,6 +56,8 @@ pub enum SessionError {
     Tls(String),
     #[error("timed out {0}")]
     Timeout(&'static str),
+    #[error("the server refused the security protocols the client asked for")]
+    Negotiation,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for SessionError {
@@ -367,6 +369,12 @@ impl Session<'_> {
             Ok(Err(e)) => return Err(Box::new((wsa_error(&e), e.into()))),
             Err(_) => return Err(timed_out("waiting for the server's X.224 confirm")),
         };
+        // The server's own answer goes back, so the client can say which protocol it wanted.
+        if negotiation_failed(&confirm) {
+            let pdu = RDCleanPathPdu::new_negotiation_error(confirm)
+                .unwrap_or_else(|_| RDCleanPathPdu::new_general_error());
+            return Err(Box::new((pdu, SessionError::Negotiation)));
+        }
         let server_name = rustls_pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
             Box::new((
                 RDCleanPathPdu::new_general_error(),
@@ -381,7 +389,7 @@ impl Session<'_> {
         {
             Ok(Ok(tls)) => Ok((tls, confirm)),
             Ok(Err(e)) => Err(Box::new((
-                RDCleanPathPdu::new_tls_error(tls_alert(&e)),
+                tls_failure(&e),
                 SessionError::Tls(e.to_string()),
             ))),
             Err(_) => Err(timed_out("in the TLS handshake with the server")),
@@ -466,6 +474,23 @@ fn wsa_error(e: &std::io::Error) -> RDCleanPathPdu {
         _ => return RDCleanPathPdu::new_general_error(),
     };
     RDCleanPathPdu::new_wsa_error(code)
+}
+
+/// Whether an X.224 Connection Confirm carries RDP_NEG_FAILURE: after the TPKT header (4 bytes)
+/// and the fixed part of the CC TPDU (7 bytes, code 0xD0), the negotiation type byte is 0x03.
+fn negotiation_failed(confirm: &[u8]) -> bool {
+    confirm.get(5).is_some_and(|code| code & 0xF0 == 0xD0) && confirm.get(11) == Some(&0x03)
+}
+
+/// A failed TLS handshake: its alert when TLS refused it, its socket error when the connection
+/// itself failed (reset, or closed mid-handshake).
+fn tls_failure(e: &std::io::Error) -> RDCleanPathPdu {
+    let refused_by_tls = e.get_ref().is_some_and(|inner| inner.is::<rustls::Error>());
+    if refused_by_tls {
+        RDCleanPathPdu::new_tls_error(tls_alert(e))
+    } else {
+        wsa_error(e)
+    }
 }
 
 /// The TLS alert that names why the server's certificate or handshake was refused.
@@ -1082,5 +1107,34 @@ mod tests {
         ));
         assert_eq!(tls_alert(&alert), 70);
         assert_eq!(tls_alert(&std::io::Error::other("reset")), 40);
+    }
+
+    #[test]
+    fn a_connection_lost_during_the_handshake_is_a_socket_error_not_an_alert() {
+        let tls_of = |pdu: &RDCleanPathPdu| pdu.error.as_ref().and_then(|e| e.tls_alert_code);
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "tls handshake eof");
+        let pdu = tls_failure(&eof);
+        assert_eq!(wsa_of(&pdu), Some(WSAECONNRESET));
+        assert_eq!(tls_of(&pdu), None);
+        let refused = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        );
+        assert_eq!(tls_of(&tls_failure(&refused)), Some(48));
+    }
+
+    #[test]
+    fn a_refused_negotiation_is_recognised_in_the_confirm() {
+        // TPKT, CC TPDU, then RDP_NEG_FAILURE (type 3, length 8, SSL_REQUIRED_BY_SERVER).
+        let failure = [
+            3, 0, 0, 19, 14, 0xD0, 0, 0, 0x12, 0x34, 0, 3, 0, 8, 0, 1, 0, 0, 0,
+        ];
+        assert!(negotiation_failed(&failure));
+        let mut success = failure;
+        success[11] = 2;
+        assert!(!negotiation_failed(&success));
+        assert!(!negotiation_failed(&failure[..11]));
+        let pdu = RDCleanPathPdu::new_negotiation_error(failure.to_vec()).unwrap();
+        assert!(pdu.to_der().is_ok());
     }
 }

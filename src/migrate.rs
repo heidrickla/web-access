@@ -348,8 +348,12 @@ pub fn sweep_temp_files(dir: &Path, min_age: std::time::Duration) {
         return;
     };
     for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+        // With the SQLite files a crash can leave beside an open temporary database.
         let named = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            (n.starts_with("export-") || n.starts_with("import-")) && n.ends_with(".tmp")
+            (n.starts_with("export-") || n.starts_with("import-"))
+                && [".tmp", ".tmp-wal", ".tmp-shm", ".tmp-journal"]
+                    .iter()
+                    .any(|end| n.ends_with(end))
         });
         let old = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -386,8 +390,12 @@ pub fn apply(app: &App, blob: &[u8], passphrase: &str) -> Result<Counts> {
 
     let backup = dir.join(format!("backup-{}.db", utc_stamp(now())));
     app.store.snapshot_to(&backup)?;
+    if let Err(e) = app.store.replace_with(&staged_path) {
+        // Refused: this attempt's copy goes, and the older backups stay, however often it is tried.
+        let _ = std::fs::remove_file(&backup);
+        return Err(e.into());
+    }
     prune_backups(&dir, KEEP_BACKUPS);
-    app.store.replace_with(&staged_path)?;
     std::mem::forget(guard); // renamed into place; nothing left to remove
     app.bump_generation();
     app.vault.install(key);
@@ -554,6 +562,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("export-abc.tmp"), b"x").unwrap();
         std::fs::write(dir.join("import-def.tmp"), b"x").unwrap();
+        std::fs::write(dir.join("import-def.tmp-wal"), b"x").unwrap();
+        std::fs::write(dir.join("import-def.tmp-shm"), b"x").unwrap();
         std::fs::write(dir.join("other.tmp"), b"x").unwrap();
         sweep_temp_files(&dir, std::time::Duration::from_secs(3600));
         assert!(
@@ -563,6 +573,8 @@ mod tests {
         sweep_temp_files(&dir, std::time::Duration::ZERO);
         assert!(!dir.join("export-abc.tmp").exists());
         assert!(!dir.join("import-def.tmp").exists());
+        assert!(!dir.join("import-def.tmp-wal").exists());
+        assert!(!dir.join("import-def.tmp-shm").exists());
         assert!(
             dir.join("other.tmp").exists(),
             "an unrelated file was swept"
@@ -679,6 +691,41 @@ mod tests {
             "the restore kept the instance pages loaded before it carry"
         );
         assert!(!app.instance().is_empty());
+    }
+
+    /// A swap refused because another process holds the database leaves no copy of its own and
+    /// prunes nothing: repeated refusals must not push out the backup of an earlier import.
+    #[tokio::test]
+    async fn a_refused_swap_keeps_the_earlier_backups() {
+        let old = test_app_keyed([1; 32], "oldhost");
+        let new = test_app_keyed([2; 32], "newhost");
+        old.vault.set_recovery(&old.store, None, PASS).unwrap();
+        old.store.user_create("jdoe", None).unwrap();
+        let dir = new.cfg.data_dir();
+        for day in 1..=KEEP_BACKUPS {
+            std::fs::write(dir.join(format!("backup-202609{day:02}T000000Z.db")), b"x").unwrap();
+        }
+        let backups = || {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("backup-2"))
+                .collect();
+            names.sort();
+            names
+        };
+        let before = backups();
+        let exported = export(&old, PASS).unwrap();
+        let (upload, _) = stage(&new, &exported.bytes).unwrap();
+        let elsewhere = rusqlite::Connection::open(new.cfg.database_path()).unwrap();
+        let _: i64 = elsewhere
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        for _ in 0..2 {
+            assert!(confirm(&new, &upload, PASS, Some("newhost")).is_err());
+        }
+        assert_eq!(backups(), before, "a refused swap changed the backups");
+        drop(elsewhere);
     }
 
     #[tokio::test]
