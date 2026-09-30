@@ -41,10 +41,12 @@ The pages are dark by default; the button beside Sign out switches to a light th
 | Users | add users by network username; tick the servers each one gets, with select-all per group and copy-from-user; grant administrator; remove |
 | Servers | add, edit and delete servers; bulk import from CSV (`name,host,port,group`) |
 | Groups | create, rename, order and delete the groups users see |
-| Activity | sign-ins, refusals, sessions opened, credential saves, every admin change |
-| Migration | this proxy's version and counts; recovery passphrase; unlock or reset the credential store; export, import, freeze; the directory service account's password |
+| Activity | sign-ins, refusals, sessions opened, credential saves, every admin change; kept `audit_days` (400) |
+| Migration | this proxy's version and counts; recovery passphrase; unlock or reset the credential store; export, import, freeze; the directory service account's password and how its account checks last went |
 
 A user signs in, but sees no servers until an administrator assigns them. Disabling the account in Active Directory stops sign-in; with a service account configured, it also ends that user's sessions at the next check. An account renamed in Active Directory keeps its servers and saved credentials: the proxy follows the account's SID to its row and renames it at the next sign-in.
+
+The account checks run every `check_interval_secs`. When they cannot run (no domain controller answers, the service account is refused), nothing is revoked; the Migration tab says so in red and the Activity tab records `revocation.failing` once, then `revocation.restored`. An account whose lookup fails is skipped and named on the Migration tab; the others are still checked. The domain controller that last answered is tried first.
 
 ## Moving to new hardware
 
@@ -66,7 +68,7 @@ For a scheduled backup, a task running as SYSTEM with the passphrase in a file o
 
 The export is written beside the target, read back, and only then renamed over it, so a full disk or a dropped share keeps the previous night's file. Rotate the files with the task, for example by putting the date in the file name.
 
-An import keeps the database it replaces as `backup-<time>.db` in the data directory; the newest five are kept. A schema upgrade keeps the database as it was as `backup-schema<N>-<time>.db`. To restore either: stop the service, rename it to `web-access.db`, start the service. It carries this host's key, so it opens unlocked.
+An import keeps the database it replaces as `backup-<time>.db` in the data directory; the newest five are kept. A schema upgrade keeps the database as it was as `backup-schema<N>-<time>.db`. To restore either: stop the service, delete `web-access.db-wal` and `web-access.db-shm` if they are there, rename the backup to `web-access.db`, start the service. It carries this host's key, so it opens unlocked. The two files are the write-ahead log of the database being replaced; left beside a restored copy, they would be applied to it.
 
 ## The recovery passphrase
 
@@ -107,7 +109,7 @@ With `allow_local_accounts = true`, the `[directory]` section may be left out en
 
 ## Configuration
 
-`config.example.toml` is the starting point and is installed as `%ProgramData%\web-access\config.toml`. The service reads it at start; restart the service after changing it.
+`config.example.toml` is the starting point and is installed as `%ProgramData%\web-access\config.toml`. The service reads it at start; restart the service after changing it. A key the proxy does not read, such as a misspelt `service_acount`, is named in the log at start.
 
 | Key | |
 |---|---|
@@ -116,6 +118,7 @@ With `allow_local_accounts = true`, the `[directory]` section may be left out en
 | `data_dir` | database location; defaults to the directory holding the config |
 | `allow_local_accounts` | let local accounts sign in; default false |
 | `max_connections` | connections served at once, default 1024; a WebSocket counts until its RDP session is connected |
+| `audit_days` | days the activity log keeps an entry, default 400 |
 | `[https]` | `cert` (PEM, the server certificate first, then its chain) and `key` (PEM, unencrypted) |
 | `[tls]` | how RDP servers' certificates are checked: `verify = "ca"` with `ca_bundle`, or `"insecure"`. No default |
 | `[directory]` | `domain`; `netbios`; `urls` (ldaps only); optional `ca_bundle` (the Windows certificate store when omitted), `base_dn` (derived from `domain` when omitted), `service_account`, `check_interval_secs` (default 600) and `timeout_secs` (default 10). Optional when local accounts are allowed |
@@ -131,6 +134,8 @@ Set `netbios` to the domain's NetBIOS name: the proxy then refuses a password ac
     openssl pkcs12 -in proxy.pfx -nocerts -nodes -out proxy-key.pem
 
 Append `chain.pem` to `proxy-cert.pem`. Keep the key file in the data directory, whose permissions admit only SYSTEM, Administrators and the service.
+
+A renewal needs no restart: the files are read again within a minute of changing, and new connections get the new certificate. A pair that does not load (a key that does not match, a half-written file) is refused with an error in the log and the previous certificate stays in use. The log gives the certificate's expiry at start and at each reload, and warns once a day from 30 days before it. A browser that refuses the certificate shows in the log as `TLS handshake failed`, at most one line a minute.
 
 ## Build
 
@@ -230,7 +235,7 @@ Then:
 3. On the Migration tab, set the recovery passphrase, and the service account's password if one is configured.
 4. Add servers and users on the admin pages.
 
-The service reports running only once it has read the config, opened the database and bound its port; a start that cannot do all three fails where it was started. The reason is in `C:\ProgramData\web-access\web-access-proxy.log`.
+The service reports running only once it has read the config, opened the database and bound its port; a start that cannot do all three fails where it was started. The reason is in `C:\ProgramData\web-access\web-access-proxy-<yyyy>-<mm>-<dd>.log`, one file per UTC day; the newest 30 are kept.
 
 ### Upgrading
 
@@ -238,7 +243,7 @@ The service reports running only once it has read the config, opened the databas
 2. `msiexec /i web-access-proxy-<new version>.msi /qn /l*v upgrade.log`. The service is stopped, replaced and started again. A newer schema is applied at its first start, and the database as it was is kept as `backup-schema<N>-<time>.db`.
 3. Check the log for the `listening` line and the version on the Migration tab.
 
-To go back: uninstall, install the previous MSI, stop the service, rename the `backup-schema<N>-<time>.db` copy to `web-access.db`, and start the service. A database migrated by a newer version is refused by an older one.
+To go back: uninstall, install the previous MSI, stop the service, delete `web-access.db-wal` and `web-access.db-shm` if they are there, rename the `backup-schema<N>-<time>.db` copy to `web-access.db`, and start the service. A database migrated by a newer version is refused by an older one.
 
 Upgrading from 0.1: the `[[target]]` entries are imported once into an "Imported" group; `[[policy]]` is no longer read. Add `[directory]`, `admins` and `[https]` before starting the service.
 
@@ -258,6 +263,8 @@ WiX v5 specifically. v6 and v7 require accepting the Open Source Maintenance Fee
 | `web/theme.js` | both pages: applies the stored theme before the page paints, and the header's theme button |
 
 Every page asset is a separate file: the proxy sends `default-src 'self'`, which forbids inline `<style>`, `<script>`, style attributes and event handlers. A test asserts no page carries one. All are embedded with `include_bytes!`, so a deployment is one MSI and one service, and the served client cannot drift from the proxy it talks to.
+
+`build.rs` gzips each asset and names it by a hash of its content. The proxy sends the gzip to a browser that accepts it (the 7.4 MB client goes as 1.8 MB), with an ETag and `Cache-Control: no-cache`: every load asks again, so an upgrade is picked up at once, and an unchanged asset costs a 304. API answers are `no-store`.
 
 The client's API maps onto the proxy's design: `SessionBuilder.destination()` carries the server id, never an address, and `authToken()` carries the single-use connect ticket.
 

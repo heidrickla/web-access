@@ -270,7 +270,19 @@ pub fn open_connection(path: &Path) -> Result<Connection> {
 fn configure(conn: &Connection) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    // WAL: an export's copy, or a command-line export in another process, reads a snapshot while
+    // sign-ins and admin edits go on writing. Under the rollback journal a long read blocked every
+    // write for its length.
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
     Ok(())
+}
+
+/// The write-ahead log beside a database file. It outlives a connection only while another
+/// connection has the database open, or after a crash.
+fn wal_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push("-wal");
+    PathBuf::from(name)
 }
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {
@@ -1239,6 +1251,29 @@ impl Store {
         }
     }
 
+    /// `n` entries written at `at`, for retention tests.
+    #[cfg(test)]
+    pub fn audit_many_at(&self, at: i64, n: usize) {
+        let c = self.c();
+        for _ in 0..n {
+            c.execute(
+                "INSERT INTO audit (at, actor, action) VALUES (?1, 'test', 'x')",
+                [at],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Remove up to `batch` entries written before `before`, oldest first; the number removed.
+    /// Batched, so the store is held for a moment at a time however far behind retention is.
+    pub fn audit_prune(&self, before: i64, batch: i64) -> Result<usize> {
+        Ok(self.c().execute(
+            "DELETE FROM audit WHERE id IN
+               (SELECT id FROM audit WHERE at < ?1 ORDER BY id LIMIT ?2)",
+            params![before, batch],
+        )?)
+    }
+
     pub fn audit_list(&self, limit: i64, before: Option<i64>) -> Result<Vec<AuditRow>> {
         let c = self.c();
         let mut stmt = c.prepare(
@@ -1278,12 +1313,19 @@ impl Store {
         }
     }
 
-    /// A consistent copy of the whole database, written to `dest`, which must not exist.
+    /// A consistent copy of the whole database, written to `dest`, which must not exist. The copy
+    /// is made on its own connection, so the store is not held for however long it takes, and its
+    /// counts are read from the copy itself.
     pub fn snapshot_to(&self, dest: &Path) -> Result<Counts> {
-        let c = self.c();
-        let counts = counts_of(&c)?;
-        c.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
-        Ok(counts)
+        let into = dest.to_string_lossy();
+        if self.path == Path::new(":memory:") {
+            self.c().execute("VACUUM INTO ?1", [into.as_ref()])?;
+        } else {
+            let source = Connection::open(&self.path)?;
+            source.busy_timeout(std::time::Duration::from_secs(5))?;
+            source.execute("VACUUM INTO ?1", [into.as_ref()])?;
+        }
+        counts_of(&Connection::open(dest)?)
     }
 
     /// Replace the database file with `new_file`, which has already been validated. The current
@@ -1294,7 +1336,15 @@ impl Store {
         let placeholder = Connection::open_in_memory()?;
         let old = std::mem::replace(&mut *c, placeholder);
         drop(old);
-        let installed = std::fs::rename(new_file, &self.path);
+        // The last connection to close removes the write-ahead log. One still there means another
+        // process has the database open, and its log would be replayed onto the new file.
+        let installed = if wal_path(&self.path).exists() {
+            Err(std::io::Error::other(
+                "another process has the database open",
+            ))
+        } else {
+            std::fs::rename(new_file, &self.path)
+        };
         // Reopen whichever file is now in place, so a failed rename leaves the old data serving. A
         // scanner can hold a just-renamed file for a moment, so a failed open is retried; one that
         // never opens stops the process rather than serve the empty placeholder, and the service's
@@ -1530,6 +1580,102 @@ mod tests {
 
     /// The served database keeps a copy of itself, as it was, before its schema is migrated; a
     /// current one is opened without a copy.
+    fn file_store(name: &str) -> (PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!(
+            "web-access-{name}-{}",
+            &crate::auth::random_token()[..12]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("web-access.db");
+        let store = Store::open(&path).unwrap();
+        (path, store)
+    }
+
+    /// Under the rollback journal this write waited out the busy timeout and failed.
+    #[test]
+    fn a_long_read_elsewhere_does_not_block_a_write() {
+        let (path, s) = file_store("wal");
+        let mode: String = s
+            .c()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        s.user_create("alice", None).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        let started = std::time::Instant::now();
+        s.user_create("bob", None).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        reader.execute_batch("COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn a_swap_waits_until_no_other_process_has_the_database_open() {
+        let (path, s) = file_store("swap");
+        s.user_create("alice", None).unwrap();
+        let replacement = path.with_file_name("staged.db");
+        {
+            let other = Store::open(&replacement).unwrap();
+            other.user_create("carol", None).unwrap();
+        }
+        let elsewhere = Connection::open(&path).unwrap();
+        let _: i64 = elsewhere
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert!(s.replace_with(&replacement).is_err());
+        assert!(
+            s.user_by_name("alice").unwrap().is_some(),
+            "the old data stopped serving"
+        );
+        assert!(replacement.exists(), "the staged file was consumed");
+        drop(elsewhere);
+        s.replace_with(&replacement).unwrap();
+        assert!(s.user_by_name("carol").unwrap().is_some());
+        assert!(s.user_by_name("alice").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_snapshot_counts_what_it_copied() {
+        let (path, s) = file_store("snap");
+        s.user_create("alice", None).unwrap();
+        let dest = path.with_file_name("copy.db");
+        let counts = s.snapshot_to(&dest).unwrap();
+        assert_eq!(counts.users, 1);
+        assert!(Store::open(&dest)
+            .unwrap()
+            .user_by_name("alice")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn the_activity_log_is_pruned_oldest_first_in_batches() {
+        let s = store();
+        {
+            let c = s.c();
+            for at in [10, 20, 30, 40, 50] {
+                c.execute(
+                    "INSERT INTO audit (at, actor, action) VALUES (?1, 'a', 'x')",
+                    [at],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(s.audit_prune(45, 2).unwrap(), 2);
+        assert_eq!(s.audit_prune(45, 2).unwrap(), 2);
+        assert_eq!(s.audit_prune(45, 2).unwrap(), 0);
+        let left: Vec<i64> = s
+            .audit_list(10, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.at)
+            .collect();
+        assert_eq!(left, vec![50]);
+    }
+
     #[test]
     fn a_schema_migration_keeps_a_copy_of_the_old_database() {
         let dir = std::env::temp_dir().join(format!(

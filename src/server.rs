@@ -2,14 +2,12 @@
 //! account checks.
 
 use crate::app::App;
-use crate::config::{Config, Https};
+use crate::config::Config;
 use crate::store::now;
 use crate::web::{ConnectionPermit, Peer};
 
 use axum::Router;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use rustls_pki_types::pem::{self, PemObject};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,6 +33,9 @@ pub fn serve_blocking(
     );
     // Read once: the directory locked is the directory served, whatever happens to the file.
     let cfg = Config::load(config_path)?;
+    for key in &cfg.unknown {
+        warn!(%key, path = %config_path, "config key is not one the proxy reads; check its spelling");
+    }
     let lock = ServingLock::acquire(&cfg)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let outcome = runtime.block_on(async {
@@ -79,13 +80,19 @@ pub async fn run(
         .into());
     }
     let listen = cfg.listen.clone();
-    let acceptor = match &cfg.https {
-        Some(h) => Some(TlsAcceptor::from(Arc::new(server_tls(h)?))),
+    let certificate = match &cfg.https {
+        Some(h) => Some(crate::https::Certificate::open(h)?),
         None => {
             warn!("no [https] section: the listener serves plain HTTP");
             None
         }
     };
+    let acceptor = certificate
+        .as_ref()
+        .map(|c| TlsAcceptor::from(Arc::new(crate::https::server_config(Arc::clone(c)))));
+    if let Some(c) = certificate {
+        tokio::spawn(crate::https::watch(c));
+    }
     let app = Arc::new(App::for_serving(cfg)?);
     let counts = app.store.counts()?;
     info!(
@@ -98,6 +105,7 @@ pub async fn run(
 
     tokio::spawn(session_checks(Arc::clone(&app)));
     tokio::spawn(directory_checks(Arc::clone(&app)));
+    tokio::spawn(audit_retention(Arc::clone(&app)));
 
     let limits = Limits {
         max_connections: app.cfg.max_connections,
@@ -153,6 +161,7 @@ pub async fn accept_loop(
     shutdown: impl Future<Output = ()>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let failures = Arc::new(crate::https::HandshakeLog::default());
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -175,8 +184,10 @@ pub async fn accept_loop(
                     drop(stream);
                     continue;
                 };
+                crate::proxy::tune(&stream);
                 let router = router.clone();
                 let acceptor = acceptor.clone();
+                let failures = Arc::clone(&failures);
                 tokio::spawn(async move {
                     // Held for the HTTP cycle; a WebSocket upgrade takes it over.
                     let slot = ConnectionPermit::new(permit);
@@ -184,7 +195,12 @@ pub async fn accept_loop(
                         Some(acceptor) => {
                             match tokio::time::timeout(limits.tls_handshake, acceptor.accept(stream)).await {
                                 Ok(Ok(tls)) => serve(tls, peer, slot, router).await,
-                                Ok(Err(e)) => debug!(%peer, error = %e, "TLS handshake failed"),
+                                // A browser that does not trust the certificate fails here, so this
+                                // is worth seeing, but a scanner can produce a stream of them.
+                                Ok(Err(e)) => match failures.admit(std::time::Instant::now()) {
+                                    Some(skipped) => info!(%peer, error = %e, earlier_unlogged = skipped, "TLS handshake failed"),
+                                    None => debug!(%peer, error = %e, "TLS handshake failed"),
+                                },
                                 Err(_) => debug!(%peer, "TLS handshake timed out"),
                             }
                         }
@@ -217,26 +233,6 @@ where
     }
 }
 
-fn server_tls(h: &Https) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
-    let cert_pem = std::fs::read(&h.cert).map_err(|e| format!("reading {}: {e}", h.cert))?;
-    let key_pem = std::fs::read(&h.key).map_err(|e| format!("reading {}: {e}", h.key))?;
-    let certs = CertificateDer::pem_slice_iter(&cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("{}: {e}", h.cert))?;
-    if certs.is_empty() {
-        return Err(format!("{} holds no certificate", h.cert).into());
-    }
-    let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| match e {
-        pem::Error::NoItemsFound => format!("{} holds no private key", h.key),
-        e => format!("{}: {e}", h.key),
-    })?;
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
-}
-
 /// How often connections are checked against the sign-in they were opened under.
 pub const SESSION_CHECK: Duration = Duration::from_secs(30);
 
@@ -258,6 +254,52 @@ async fn session_checks(app: Arc<App>) {
                 "connections ended because their sign-in ended"
             );
         }
+        let expired = crate::migrate::sweep_pending(&app, std::time::Instant::now());
+        if expired > 0 {
+            info!(expired, "uploaded imports never confirmed were dropped");
+        }
+    }
+}
+
+const AUDIT_PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
+const AUDIT_PRUNE_BATCH: i64 = 1000;
+
+/// Activity log entries older than `audit_days` go, hourly, from the first tick at start.
+async fn audit_retention(app: Arc<App>) {
+    let mut tick = tokio::time::interval(AUDIT_PRUNE_EVERY);
+    loop {
+        tick.tick().await;
+        let removed = prune_audit(&app).await;
+        if removed > 0 {
+            info!(
+                removed,
+                days = app.cfg.audit_days,
+                "activity log entries past retention removed"
+            );
+        }
+    }
+}
+
+/// One retention pass, a batch at a time with the gate held only per batch.
+async fn prune_audit(app: &App) -> usize {
+    let before = now() - i64::from(app.cfg.audit_days) * 86_400;
+    let mut removed = 0;
+    loop {
+        let n = {
+            let _shared = app.gate.read().await;
+            match app.store.audit_prune(before, AUDIT_PRUNE_BATCH) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(error = %e, "activity log pruning failed");
+                    return removed;
+                }
+            }
+        };
+        removed += n;
+        if n < AUDIT_PRUNE_BATCH as usize {
+            return removed;
+        }
+        tokio::task::yield_now().await;
     }
 }
 
@@ -273,10 +315,57 @@ async fn directory_checks(app: Arc<App>) {
     let mut tick = tokio::time::interval(every);
     loop {
         tick.tick().await;
-        match revocation_pass(&app).await {
-            Ok(0) => {}
-            Ok(n) => info!(revoked = n, "revocation pass ended sessions"),
+        let outcome = revocation_pass(&app).await.map_err(|e| e.to_string());
+        match &outcome {
+            Ok(None) => {}
+            Ok(Some(pass)) => {
+                if pass.revoked > 0 {
+                    info!(revoked = pass.revoked, "revocation pass ended sessions");
+                }
+                if !pass.unread.is_empty() {
+                    warn!(accounts = ?pass.unread, "these accounts could not be looked up and were not checked");
+                }
+            }
             Err(e) => warn!(error = %e, "revocation pass could not run; nothing was revoked"),
+        }
+        if let Some((action, detail)) = record_revocation(&app, &outcome, now()) {
+            app.store.audit("system", action, &detail);
+        }
+    }
+}
+
+/// What one revocation pass did.
+#[derive(Debug, Default)]
+pub struct Pass {
+    pub checked: usize,
+    pub revoked: usize,
+    /// Accounts whose lookup failed: not checked, not revoked.
+    pub unread: Vec<String>,
+}
+
+/// Keep the health the Migration tab shows. Returns the activity-log entry for a change between
+/// working and failing, so the log records each once rather than every pass.
+fn record_revocation(
+    app: &App,
+    outcome: &Result<Option<Pass>, String>,
+    at: i64,
+) -> Option<(&'static str, String)> {
+    let mut health = app.revocation.lock().unwrap_or_else(|p| p.into_inner());
+    let was_failing = health.error.is_some();
+    match outcome {
+        Ok(None) => None,
+        Ok(Some(pass)) => {
+            health.last_run = Some(at);
+            health.last_ok = Some(at);
+            health.error = None;
+            health.checked = pass.checked;
+            health.unread.clone_from(&pass.unread);
+            was_failing.then(|| ("revocation.restored", String::new()))
+        }
+        Err(e) => {
+            health.last_run = Some(at);
+            health.error = Some(e.clone());
+            (!was_failing).then(|| ("revocation.failing", e.clone()))
         }
     }
 }
@@ -334,30 +423,55 @@ fn revocation_reason(
 /// Who to check is read under a short hold and the directory is asked without the gate. What it
 /// said is applied under a hold, only to the database it was asked about, and to each user as they
 /// are by then.
-pub async fn revocation_pass(app: &App) -> Result<usize, Box<dyn std::error::Error>> {
+/// None when no checks are configured: no directory, service account or readable password.
+pub async fn revocation_pass(app: &App) -> Result<Option<Pass>, Box<dyn std::error::Error>> {
     let Some(directory) = app.lookup_directory() else {
-        return Ok(0);
+        return Ok(None);
     };
     let (generation, password, users) = {
         let _shared = app.gate.read().await;
         let Some(password) = app.directory_password()? else {
-            return Ok(0);
+            return Ok(None);
         };
         (app.generation(), password, users_to_check(app)?)
     };
     if users.is_empty() {
-        return Ok(0);
+        return Ok(Some(Pass::default()));
     }
     let names: Vec<String> = users.iter().map(|u| u.username.clone()).collect();
-    let found = directory.lookup_many(&password, &names).await?;
+    let found = directory.lookup_each(&password, &names).await?;
+    apply_lookups(app, generation, &users, found)
+        .await
+        .map(Some)
+}
 
+/// Revoke by what the directory said, under a hold, only in the database it was asked about. An
+/// account whose lookup failed is left alone.
+async fn apply_lookups(
+    app: &App,
+    generation: u64,
+    users: &[crate::store::User],
+    found: Vec<(
+        String,
+        crate::directory::Result<Option<crate::directory::Account>>,
+    )>,
+) -> Result<Pass, Box<dyn std::error::Error>> {
     let _shared = app.gate.read().await;
     if app.generation() != generation {
         info!("an import replaced the database during the revocation pass; its results were discarded");
-        return Ok(0);
+        return Ok(Pass::default());
     }
-    let mut revoked = 0;
-    for (checked, (_, account)) in users.iter().zip(found) {
+    let mut pass = Pass::default();
+    for (checked, (name, looked_up)) in users.iter().zip(found) {
+        let account = match looked_up {
+            Ok(account) => account,
+            Err(e) => {
+                tracing::debug!(%name, error = %e, "account lookup failed");
+                pass.unread.push(name);
+                continue;
+            }
+        };
+        pass.checked += 1;
         let Some(user) = app
             .store
             .user_by_id(checked.id)?
@@ -373,10 +487,10 @@ pub async fn revocation_pass(app: &App) -> Result<usize, Box<dyn std::error::Err
                 "revoked",
                 &format!("{}: {reason}; {ended} live session(s) ended", user.username),
             );
-            revoked += 1;
+            pass.revoked += 1;
         }
     }
-    Ok(revoked)
+    Ok(pass)
 }
 
 /// Installed before any TLS config is built. A provider already installed is kept.
@@ -392,7 +506,92 @@ pub fn install_crypto_provider() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::web::tests::{signed_in, test_app};
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::io::AsyncReadExt;
+
+    fn hash_of(cookie: &str) -> Vec<u8> {
+        crate::auth::token_hash(cookie.split_once('=').unwrap().1)
+    }
+
+    #[tokio::test]
+    async fn an_account_that_could_not_be_looked_up_is_left_alone_and_the_rest_checked() {
+        let app = test_app();
+        let (_, alice) = signed_in(&app, "alice");
+        let (_, bob) = signed_in(&app, "bob");
+        let users = users_to_check(&app).unwrap();
+        let found = users
+            .iter()
+            .map(|u| {
+                let r = if u.username == "alice" {
+                    Err(crate::directory::DirError::Protocol("timed out".into()))
+                } else {
+                    Ok(None)
+                };
+                (u.username.clone(), r)
+            })
+            .collect();
+        let pass = apply_lookups(&app, app.generation(), &users, found)
+            .await
+            .unwrap();
+        assert_eq!(pass.unread, vec!["alice".to_owned()]);
+        assert_eq!((pass.checked, pass.revoked), (1, 1));
+        assert!(app
+            .store
+            .session_user(&hash_of(&alice), now())
+            .unwrap()
+            .is_some());
+        assert!(app
+            .store
+            .session_user(&hash_of(&bob), now())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn account_checks_failing_and_recovering_are_each_logged_once() {
+        let app = test_app();
+        let ok = || {
+            Ok(Some(Pass {
+                checked: 3,
+                ..Pass::default()
+            }))
+        };
+        assert_eq!(record_revocation(&app, &ok(), 10), None);
+        let down: Result<Option<Pass>, String> = Err("dc unreachable".into());
+        assert_eq!(
+            record_revocation(&app, &down, 20),
+            Some(("revocation.failing", "dc unreachable".into()))
+        );
+        assert_eq!(record_revocation(&app, &down, 30), None);
+        {
+            let h = app.revocation.lock().unwrap();
+            assert_eq!((h.last_run, h.last_ok), (Some(30), Some(10)));
+            assert!(h.error.is_some());
+        }
+        assert_eq!(
+            record_revocation(&app, &ok(), 40),
+            Some(("revocation.restored", String::new()))
+        );
+        let h = app.revocation.lock().unwrap();
+        assert_eq!((h.error.as_deref(), h.checked), (None, 3));
+    }
+
+    #[tokio::test]
+    async fn activity_past_retention_is_removed_and_the_rest_kept() {
+        let app = test_app();
+        let day = 86_400;
+        let days = i64::from(app.cfg.audit_days);
+        app.store.audit_many_at(now() - (days + 1) * day, 2500);
+        app.store.audit_many_at(now() - (days - 1) * day, 3);
+        let before = app.store.audit_list(10_000, None).unwrap().len();
+        assert_eq!(prune_audit(&app).await, 2500);
+        assert_eq!(
+            app.store.audit_list(10_000, None).unwrap().len(),
+            before - 2500
+        );
+        assert_eq!(prune_audit(&app).await, 0);
+    }
 
     #[test]
     fn a_connection_whose_sign_in_ended_is_closed() {

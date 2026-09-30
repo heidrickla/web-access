@@ -34,9 +34,85 @@ pub struct Config {
     /// session is established; established sessions are not counted.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// Days the activity log keeps an entry.
+    #[serde(default = "default_audit_days")]
+    pub audit_days: u32,
     /// Seeds an empty database, then ignored.
     #[serde(default)]
     pub target: Vec<Target>,
+    /// Keys in the file that nothing reads, such as a misspelt `service_acount`. Logged at start.
+    #[serde(skip)]
+    pub unknown: Vec<String>,
+}
+
+/// Every key the file may hold, by table. Anything else is reported by `unknown_keys`.
+const KNOWN: &[(&str, &[&str])] = &[
+    (
+        "",
+        &[
+            "listen",
+            "https",
+            "tls",
+            "directory",
+            "admins",
+            "allow_local_accounts",
+            "data_dir",
+            "max_connections",
+            "audit_days",
+            "target",
+        ],
+    ),
+    ("https", &["cert", "key"]),
+    ("tls", &["verify", "ca_bundle"]),
+    (
+        "directory",
+        &[
+            "domain",
+            "netbios",
+            "urls",
+            "ca_bundle",
+            "base_dn",
+            "service_account",
+            "timeout_secs",
+            "check_interval_secs",
+        ],
+    ),
+    ("target", &["id", "host", "port"]),
+];
+
+/// Dotted names of the keys `KNOWN` does not list.
+fn unknown_keys(text: &str) -> Vec<String> {
+    let Ok(root) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let known = |table: &str| {
+        KNOWN
+            .iter()
+            .find(|(t, _)| *t == table)
+            .map_or(&[][..], |(_, keys)| *keys)
+    };
+    let mut found = Vec::new();
+    for (key, value) in &root {
+        if !known("").contains(&key.as_str()) {
+            found.push(key.clone());
+            continue;
+        }
+        let tables: Vec<&toml::Table> = match value {
+            toml::Value::Table(t) => vec![t],
+            toml::Value::Array(items) => items.iter().filter_map(|v| v.as_table()).collect(),
+            _ => continue,
+        };
+        for t in tables {
+            for inner in t.keys() {
+                if !known(key).contains(&inner.as_str()) {
+                    found.push(format!("{key}.{inner}"));
+                }
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -105,6 +181,10 @@ fn default_check_interval() -> u64 {
     600
 }
 
+fn default_audit_days() -> u32 {
+    400
+}
+
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct Target {
     pub id: String,
@@ -135,6 +215,8 @@ pub enum ConfigError {
     DuplicateTarget(String),
     #[error("tls.verify is \"ca\" but no tls.ca_bundle was given")]
     MissingCaBundle,
+    #[error("audit_days must be at least 1")]
+    AuditDays,
     #[error("directory: {0}")]
     Directory(String),
 }
@@ -160,6 +242,7 @@ impl Config {
                 .unwrap_or_else(|| std::path::Path::new("."));
             config.data_dir = Some(dir.to_string_lossy().into_owned());
         }
+        config.unknown = unknown_keys(text);
         config.validate()?;
         Ok(config)
     }
@@ -173,6 +256,9 @@ impl Config {
         }
         if self.tls.verify == VerifyMode::Ca && self.tls.ca_bundle.is_none() {
             return Err(ConfigError::MissingCaBundle);
+        }
+        if self.audit_days == 0 {
+            return Err(ConfigError::AuditDays);
         }
         let Some(d) = &self.directory else {
             if self.allow_local_accounts {
@@ -300,6 +386,30 @@ verify = "insecure"
             Config::parse("t", &text),
             Err(ConfigError::Directory(_))
         ));
+    }
+
+    #[test]
+    fn a_misspelt_key_is_reported_and_every_documented_one_is_known() {
+        let text = GOOD.replace("[directory]\n", "[directory]\nservice_acount = \"svc\"\n")
+            + "\n[[target]]\nid = \"a\"\nhost = \"a.example\"\nprot = 3390\n";
+        let c = Config::parse("t", &text).unwrap();
+        assert_eq!(c.unknown, vec!["directory.service_acount", "target.prot"]);
+        // The example documents every key, some commented out: all of them are known.
+        let every: String = include_str!("../config.example.toml")
+            .lines()
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .filter(|r| r.contains(" = "))
+                    .unwrap_or(l)
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let c = Config::parse("t", &every).unwrap();
+        assert!(c.unknown.is_empty(), "{:?}", c.unknown);
+        assert!(
+            c.allow_local_accounts,
+            "the commented keys were not uncommented"
+        );
     }
 
     #[test]

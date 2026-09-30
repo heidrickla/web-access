@@ -51,6 +51,21 @@ pub struct App {
     pub export_lock: Arc<tokio::sync::Mutex<()>>,
     /// Failed local-account sign-ins, per username.
     pub throttle: crate::auth::Throttle,
+    /// How the directory account checks last went, for the Migration tab.
+    pub revocation: Mutex<RevocationHealth>,
+}
+
+/// The last directory account check. `error` is set while checks fail, and nothing is revoked
+/// then: a disabled account keeps its sessions until the checks work again.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct RevocationHealth {
+    pub last_run: Option<i64>,
+    pub last_ok: Option<i64>,
+    pub error: Option<String>,
+    /// Accounts checked in the last pass that ran.
+    pub checked: usize,
+    /// Accounts whose lookup failed in the last pass, and so were not checked.
+    pub unread: Vec<String>,
 }
 
 impl App {
@@ -142,6 +157,7 @@ impl App {
             hash_permits: Arc::new(tokio::sync::Semaphore::new(HASH_PERMITS)),
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
             throttle: crate::auth::Throttle::default(),
+            revocation: Mutex::new(RevocationHealth::default()),
         }
     }
 

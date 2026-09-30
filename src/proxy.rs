@@ -306,7 +306,11 @@ impl Session<'_> {
         let to_server = async {
             while let Some(msg) = ws_rx.next().await {
                 match msg? {
-                    Message::Binary(b) => srv_tx.write_all(&b).await?,
+                    Message::Binary(b) => {
+                        srv_tx.write_all(&b).await?;
+                        // The TLS layer may hold part of a record until flushed.
+                        srv_tx.flush().await?;
+                    }
                     Message::Close(_) => break,
                     _ => {}
                 }
@@ -352,8 +356,7 @@ impl Session<'_> {
             Ok(Err(e)) => return Err(Box::new((wsa_error(&e), e.into()))),
             Err(_) => return Err(timed_out("connecting to the server")),
         };
-        // Interactive traffic: an input event waits for nothing.
-        let _ = tcp.set_nodelay(true);
+        tune(&tcp);
         let confirm = match timeout(SERVER_HANDSHAKE, async {
             tcp.write_all(x224).await?;
             read_tpkt(&mut tcp).await
@@ -413,6 +416,26 @@ impl Session<'_> {
         }
         let _ = ws.close(None).await;
         Err(error)
+    }
+}
+
+/// Idle time before the first keepalive probe, and the time between probes. With the platform's
+/// retry count (10 on Windows, 9 on Linux) a vanished peer is found in about three minutes.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Both legs of a relay: an input event waits for nothing, and a peer that vanished (a laptop
+/// closed, a NAT entry dropped) is found instead of holding a connection slot for good.
+pub fn tune(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    let socket = socket2::SockRef::from(stream);
+    if let Err(e) = stream
+        .set_nodelay(true)
+        .and_then(|()| socket.set_tcp_keepalive(&keepalive))
+    {
+        tracing::debug!(error = %e, "could not set TCP options");
     }
 }
 
@@ -533,13 +556,20 @@ pub fn tls_setup(cfg: &Tls) -> Result<TlsSetup, SessionError> {
                 .ca_bundle
                 .as_ref()
                 .ok_or_else(|| SessionError::Tls("ca_bundle required".into()))?;
-            let pem = std::fs::read(path)?;
+            let pem = std::fs::read(path)
+                .map_err(|e| SessionError::Tls(format!("tls.ca_bundle: reading {path}: {e}")))?;
             let mut roots = rustls::RootCertStore::empty();
             for cert in CertificateDer::pem_slice_iter(&pem) {
                 let cert = cert.map_err(|e| SessionError::Tls(format!("{path}: {e}")))?;
                 roots
                     .add(cert)
-                    .map_err(|e| SessionError::Tls(e.to_string()))?;
+                    .map_err(|e| SessionError::Tls(format!("{path}: {e}")))?;
+            }
+            // Without a root every server would be refused, which reads as every server down.
+            if roots.is_empty() {
+                return Err(SessionError::Tls(format!(
+                    "tls.ca_bundle: {path} holds no certificate"
+                )));
             }
             rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
@@ -950,8 +980,41 @@ mod tests {
         assert_eq!(app.live.count(), 0);
     }
 
+    #[test]
+    fn a_target_ca_bundle_that_is_missing_or_empty_is_named() {
+        let dir = std::env::temp_dir().join(format!(
+            "web-access-bundle-{}",
+            &crate::auth::random_token()[..12]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        let missing = dir.join("missing.pem");
+        for path in [&empty, &missing] {
+            let cfg = Tls {
+                verify: VerifyMode::Ca,
+                ca_bundle: Some(path.to_string_lossy().into_owned()),
+            };
+            let Err(e) = tls_setup(&cfg) else {
+                panic!("{} was accepted", path.display());
+            };
+            let text = e.to_string();
+            assert!(text.contains(&*path.to_string_lossy()), "{text}");
+        }
+    }
+
     fn wsa_of(pdu: &RDCleanPathPdu) -> Option<u16> {
         pdu.error.as_ref().and_then(|e| e.wsa_last_error)
+    }
+
+    #[tokio::test]
+    async fn a_relay_socket_sends_at_once_and_probes_an_idle_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        tune(&stream);
+        assert!(stream.nodelay().unwrap());
+        assert!(socket2::SockRef::from(&stream).keepalive().unwrap());
     }
 
     #[tokio::test]

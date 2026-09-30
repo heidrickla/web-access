@@ -22,6 +22,8 @@ const MANIFEST: &str = "manifest.json";
 const DATA: &str = "data.db.enc";
 /// How long an uploaded archive waits for its confirmation.
 const PENDING_TTL: Duration = Duration::from_secs(30 * 60);
+/// Uploads held at once. Each is a whole database in memory; the oldest gives way.
+const MAX_PENDING: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
@@ -101,7 +103,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// (year, month, day, hour, minute, second) in UTC from unix seconds.
-fn utc_parts(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
+pub fn utc_parts(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     // Howard Hinnant's civil_from_days.
@@ -236,6 +238,16 @@ pub fn stage(app: &App, bytes: &[u8]) -> Result<(String, Manifest)> {
     let id = crate::auth::random_token();
     let mut pending = app.imports.lock().unwrap_or_else(|p| p.into_inner());
     pending.retain(|_, p| p.uploaded.elapsed() < PENDING_TTL);
+    while pending.len() >= MAX_PENDING {
+        let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, p)| p.uploaded)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        pending.remove(&oldest);
+    }
     pending.insert(
         id.clone(),
         PendingImport {
@@ -244,6 +256,23 @@ pub fn stage(app: &App, bytes: &[u8]) -> Result<(String, Manifest)> {
         },
     );
     Ok((id, manifest))
+}
+
+/// Drop uploads whose confirmation window has passed at `at`; the number dropped.
+pub fn sweep_pending(app: &App, at: Instant) -> usize {
+    let mut pending = app.imports.lock().unwrap_or_else(|p| p.into_inner());
+    let before = pending.len();
+    pending.retain(|_, p| at.saturating_duration_since(p.uploaded) < PENDING_TTL);
+    before - pending.len()
+}
+
+/// Drop an upload an administrator cancelled. Whether it was held.
+pub fn cancel(app: &App, upload_id: &str) -> bool {
+    app.imports
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(upload_id)
+        .is_some()
 }
 
 /// Apply a staged archive. A host that already holds data needs its own name typed as confirmation.
@@ -385,6 +414,27 @@ pub fn test_manifest(blob: &[u8]) -> Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploads_held_are_capped_cancellable_and_swept() {
+        let app = crate::web::tests::test_app();
+        let zip = build_zip(&test_manifest(b"blob"), b"blob").unwrap();
+        let held = |app: &App| app.imports.lock().unwrap().len();
+        let (first, _) = stage(&app, &zip).unwrap();
+        let (second, _) = stage(&app, &zip).unwrap();
+        let (third, _) = stage(&app, &zip).unwrap();
+        assert_eq!(held(&app), MAX_PENDING);
+        assert!(
+            !app.imports.lock().unwrap().contains_key(&first),
+            "the oldest was kept"
+        );
+        assert!(cancel(&app, &second));
+        assert!(!cancel(&app, &second));
+        assert_eq!(sweep_pending(&app, Instant::now()), 0);
+        let later = Instant::now() + PENDING_TTL + Duration::from_secs(1);
+        assert_eq!(sweep_pending(&app, later), 1);
+        assert!(!app.imports.lock().unwrap().contains_key(&third));
+    }
 
     #[test]
     fn utc_stamps_are_correct() {

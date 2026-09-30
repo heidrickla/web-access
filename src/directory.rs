@@ -8,6 +8,7 @@ use crate::config::DirectoryConfig;
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,6 +105,18 @@ pub struct Directory {
     cfg: DirectoryConfig,
     tls: Arc<rustls::ClientConfig>,
     base_dn: String,
+    /// The domain controller that last answered, tried first: with the first one listed down,
+    /// every sign-in would otherwise wait out its timeout before reaching the next.
+    preferred: AtomicUsize,
+}
+
+/// The order to try `count` controllers in: the preferred one, then the rest as configured.
+fn try_order(count: usize, preferred: usize) -> Vec<usize> {
+    let first = if preferred < count { preferred } else { 0 };
+    std::iter::once(first)
+        .chain((0..count).filter(|i| *i != first))
+        .take(count)
+        .collect()
 }
 
 /// The account name part of `DOMAIN\user`, `user@domain` or `user`, lowercased, or None for
@@ -235,6 +248,7 @@ impl Directory {
                 .unwrap_or_else(|| base_dn_for(&cfg.domain)),
             cfg: cfg.clone(),
             tls: Arc::new(tls),
+            preferred: AtomicUsize::new(0),
         })
     }
 
@@ -248,6 +262,7 @@ impl Directory {
             base_dn: base_dn_for(&cfg.domain),
             cfg: cfg.clone(),
             tls: Arc::new(tls),
+            preferred: AtomicUsize::new(0),
         }
     }
 
@@ -301,16 +316,19 @@ impl Directory {
         Duration::from_secs(self.cfg.timeout_secs.max(1))
     }
 
-    /// Connect to the first domain controller that answers.
+    /// Connect to the first domain controller that answers, starting with the last one that did.
     async fn connect(&self) -> Result<Ldap> {
         let mut last = String::from("no domain controller configured");
-        for url in &self.cfg.urls {
+        let order = try_order(self.cfg.urls.len(), self.preferred.load(Ordering::Relaxed));
+        for index in order {
+            let url = &self.cfg.urls[index];
             let settings = LdapConnSettings::new()
                 .set_conn_timeout(self.timeout())
                 .set_config(Arc::clone(&self.tls));
             match LdapConnAsync::with_settings(settings, url).await {
                 Ok((conn, ldap)) => {
                     ldap3::drive!(conn);
+                    self.preferred.store(index, Ordering::Relaxed);
                     return Ok(ldap);
                 }
                 Err(e) => {
@@ -424,12 +442,27 @@ impl Directory {
         outcome
     }
 
-    /// Look accounts up with the service account. None for an account that no longer exists.
+    /// Look accounts up with the service account. None for an account that no longer exists. Any
+    /// failure fails the whole call.
     pub async fn lookup_many(
         &self,
         service_password: &str,
         usernames: &[String],
     ) -> Result<Vec<(String, Option<Account>)>> {
+        self.lookup_each(service_password, usernames)
+            .await?
+            .into_iter()
+            .map(|(name, found)| found.map(|a| (name, a)))
+            .collect()
+    }
+
+    /// As `lookup_many`, but a lookup that fails fails only its own account: one unreadable entry
+    /// does not stop the checks of everyone else. Connecting and binding still fail the call.
+    pub async fn lookup_each(
+        &self,
+        service_password: &str,
+        usernames: &[String],
+    ) -> Result<Vec<(String, Result<Option<Account>>)>> {
         let service = self
             .cfg
             .service_account
@@ -452,7 +485,7 @@ impl Directory {
                 })?;
             let mut out = Vec::with_capacity(usernames.len());
             for name in usernames {
-                out.push((name.clone(), self.find(&mut ldap, name).await?));
+                out.push((name.clone(), self.find(&mut ldap, name).await));
             }
             Ok(out)
         }
@@ -519,6 +552,57 @@ mod tests {
             text.push_str(&format!("netbios = \"{nb}\"\n"));
         }
         toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn the_controller_that_last_answered_is_tried_first() {
+        assert_eq!(try_order(3, 0), vec![0, 1, 2]);
+        assert_eq!(try_order(3, 2), vec![2, 0, 1]);
+        assert_eq!(try_order(3, 7), vec![0, 1, 2]);
+        assert_eq!(try_order(0, 0), Vec::<usize>::new());
+    }
+
+    /// A real LDAPS listener stands in for the second controller; the first refuses connections.
+    #[tokio::test]
+    async fn a_controller_that_answered_is_remembered() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let cert_path = format!("{dir}/tests/fixtures/server-cert.pem");
+        let certs = CertificateDer::pem_file_iter(&cert_path)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_file(format!(
+            "{dir}/tests/fixtures/server-key.pem"
+        ))
+        .unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _held = acceptor.accept(s).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cfg: DirectoryConfig = toml::from_str(&format!(
+            "domain = \"corp.example.com\"\nurls = [\"ldaps://127.0.0.1:{closed}\", \"ldaps://localhost:{up}\"]\nca_bundle = '{cert_path}'\ntimeout_secs = 3\n"
+        ))
+        .unwrap();
+        let d = Directory::new(&cfg).unwrap();
+        assert!(d.connect().await.is_ok());
+        assert_eq!(d.preferred.load(Ordering::Relaxed), 1);
     }
 
     #[test]

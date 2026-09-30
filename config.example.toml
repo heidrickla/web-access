@@ -18,6 +18,9 @@ admins = ["jdoe"]
 # Connections served at once. A WebSocket counts until its RDP session is connected.
 # max_connections = 1024
 
+# Days the activity log keeps an entry.
+# audit_days = 400
+
 # HTTPS. PEM files: the certificate for the name users browse to followed by its chain, and its
 # unencrypted private key. Without this section the listener speaks plain HTTP.
 [https]
