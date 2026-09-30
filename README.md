@@ -1,6 +1,6 @@
 # web-access
 
-Browser-based RDP with no third party in the session. Users sign in with their Active Directory account, see the servers an administrator assigned to them, and click one to get its desktop. The RDP client runs in the browser as WebAssembly; the proxy signs users in, keeps the server lists and saved credentials, and relays sessions without decoding them.
+Browser-based RDP with no third party in the session. Users sign in with their Active Directory account, see the servers an administrator assigned to them, and click one to get its desktop. The RDP client runs in the browser as WebAssembly; the proxy signs users in, keeps the server lists and saved credentials, and relays sessions. Files crossing the clipboard are held on the proxy until the anti-malware product registered with Windows has scanned them.
 
 Design record: `docs/architecture.md`.
 
@@ -21,13 +21,14 @@ Design record: `docs/architecture.md`.
 | Admin pages | `src/admin.rs`, `web/admin.*` | users, servers, groups, activity, migration |
 | Export and import | `src/migrate.rs` | a zip that moves everything, saved credentials included, to a new host |
 | Relay | `src/proxy.rs` | RDCleanPath handshake, then bytes |
+| File scanning | `src/scan/` | files on the clipboard channel held until AMSI (Trellix, Defender) or a scanner command calls them clean |
 
 ## Using it
 
 1. Browse to the proxy and sign in with a network account: `jdoe`, `CORP\jdoe` or the account's sign-in name such as `john.doe@example.com`. Closing the browser does not sign out; the sign-in lasts 24 hours. Opening a server with less than 18 hours left asks for the password again first. Both are set on the Settings tab.
 2. The server list shows the servers assigned to you, in the administrator's groups. Groups collapse and expand; the filter matches names and hosts.
 3. Click a server. Enter its credentials, and tick "Save credentials" to be connected in one click next time. Credentials are saved only after the server accepts them. The domain starts as the server's default, when an administrator set one.
-4. The desktop fills the window. The rail at the left edge carries clipboard, file transfer, Ctrl+Alt+Del, fullscreen and Disconnect. Files dropped on the desktop go to the remote clipboard. A file larger than the limit on the Settings tab is refused, both ways; a drop holding one sends nothing.
+4. The desktop fills the window. The rail at the left edge carries clipboard, file transfer, Ctrl+Alt+Del, fullscreen and Disconnect. Files dropped on the desktop go to the remote clipboard. A file larger than the limit on the Settings tab is refused, both ways; a drop holding one sends nothing. Every file is scanned on the proxy on the way, both ways, and the rail says when it passed or why it was refused.
 5. Disconnecting, or closing the browser, leaves the desktop running on the server. The list marks it Reconnect; clicking the server again returns to the same desktop.
 
 The pages are dark by default; the button beside Sign out switches to a light theme, remembered per browser.
@@ -43,11 +44,13 @@ The pages are dark by default; the button beside Sign out switches to a light th
 | Groups | create, rename, order and delete the groups users see |
 | Activity | sign-ins, refusals, sessions opened, credential saves, every admin change; kept `audit_days` (400) |
 | Settings | how long a sign-in lasts (24 h) and when opening a server asks for the password again (under 18 h left; 0 never asks); the largest file sent or fetched (0, no limit). Kept in the database, so they move with an export |
-| Migration | this proxy's version and counts; recovery passphrase; unlock or reset the credential store; export, import, freeze; the directory service account's password and how its account checks last went |
+| Migration | this proxy's version and counts; recovery passphrase; unlock or reset the credential store; export, import, freeze; the directory service account's password and how its account checks last went; the file scanner and its last check |
 
 A user signs in, but sees no servers until an administrator assigns them. Disabling the account in Active Directory stops sign-in; with a service account configured, it also ends that user's sessions at the next check. An account renamed in Active Directory keeps its servers and saved credentials: the proxy follows the account's SID to its row and renames it at the next sign-in.
 
 The account checks run every `check_interval_secs`. When they cannot run (no domain controller answers, the service account is refused), nothing is revoked; the Migration tab says so in red and the Activity tab records `revocation.failing` once, then `revocation.restored`. An account whose lookup fails is skipped and named on the Migration tab; the others are still checked. The domain controller that last answered is tried first.
+
+Files are scanned by the anti-malware product registered with Windows (AMSI) unless `[scan]` says otherwise. The scanner is shown the EICAR test file and a harmless file at start and hourly; while the last check failed, or is over two hours ten minutes old, every file is refused. The Migration tab shows the scanner, named by its AMSI provider (Trellix registers `MfeAntimalwareProvider Class`), and its last check; the Activity tab records `scan.failing` and `scan.restored`, and one `file.upload` or `file.download` entry per file passed or refused. Each hourly check shows in the anti-malware product's own log as an EICAR detection by `web-access-proxy.exe`, under the name `web-access-check.com`.
 
 ## Moving to new hardware
 
@@ -122,6 +125,7 @@ With `allow_local_accounts = true`, the `[directory]` section may be left out en
 | `audit_days` | days the activity log keeps an entry, default 400 |
 | `[https]` | `cert` (PEM, the server certificate first, then its chain) and `key` (PEM, unencrypted) |
 | `[tls]` | how RDP servers' certificates are checked: `verify = "ca"` with `ca_bundle`, or `"insecure"`. No default |
+| `[scan]` | `scanner`: `"amsi"` (default on Windows), `"command"` or `"off"`; `timeout_secs` (120), `max_staged_mb` (2048), `check_every_mins` (60); for `"command"`, `command` with `{file}`, `clean_exit_codes` and `detected_exit_codes` |
 | `[directory]` | `domain`; `urls` (ldaps only); optional `netbios`, `ca_bundle` (the Windows certificate store when omitted), `base_dn` (derived from `domain` when omitted), `service_account`, `check_interval_secs` (default 600) and `timeout_secs` (default 10). Optional when local accounts are allowed |
 
 Set `netbios` to the domain's NetBIOS name. A sign-in name with a domain in it (`CORP\jdoe`, `john.doe@example.com`) is then checked exactly as typed, a password accepted for an account in another domain is refused, and the account signed in is the one Active Directory says the password was checked for. Without `netbios`, every sign-in name binds as `name@domain`.
@@ -186,6 +190,7 @@ CI (`.github/workflows/ci.yml`) runs format, lint, test, page scripts and depend
 - Users sign in with their Active Directory accounts; the proxy host is not domain-joined.
 - Each user's server list is maintained by hand on the proxy, per user.
 - Credentials pass through to the server unless the user saves them; saved ones are kept encrypted on the proxy, per user and per server, and move with an export.
+- Files crossing the clipboard are scanned on the proxy, inline, by the anti-malware product registered with Windows; only a clean verdict passes.
 - MIT OR Apache-2.0 upstream, so the licence question is closed.
 
 ## Roadmap

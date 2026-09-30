@@ -724,6 +724,14 @@ async fn migration_status(State(app): State<Shared>, _: AdminUser) -> ApiResult<
             "checks": app.revocation.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         },
         "local_accounts": app.cfg.allow_local_accounts,
+        "scan": app.scan.as_ref().map(|s| {
+            let admitting = s.healthy();
+            json!({
+                "health": s.health(),
+                "admitting": admitting.is_ok(),
+                "refusing": admitting.err(),
+            })
+        }),
     })))
 }
 

@@ -28,6 +28,7 @@ mod migrate;
 mod policy;
 mod proxy;
 mod resolve;
+mod scan;
 mod server;
 mod settings;
 mod store;

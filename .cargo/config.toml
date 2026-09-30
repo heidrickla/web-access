@@ -1,6 +1,11 @@
 [source.crates-io]
 replace-with = "vendored-sources"
 
+[source."git+https://github.com/Devolutions/IronRDP?rev=9b151c4c2e47c6014e1e8e55909d4180aa8bdb99"]
+git = "https://github.com/Devolutions/IronRDP"
+rev = "9b151c4c2e47c6014e1e8e55909d4180aa8bdb99"
+replace-with = "vendored-sources"
+
 [source.vendored-sources]
 directory = "vendor"
 

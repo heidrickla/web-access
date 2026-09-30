@@ -106,6 +106,9 @@ pub async fn run(
     tokio::spawn(session_checks(Arc::clone(&app)));
     tokio::spawn(directory_checks(Arc::clone(&app)));
     tokio::spawn(audit_retention(Arc::clone(&app)));
+    if let Some(scan) = app.scan.clone() {
+        tokio::spawn(scan_checks(Arc::clone(&app), scan));
+    }
 
     let limits = Limits {
         max_connections: app.cfg.max_connections,
@@ -257,6 +260,25 @@ async fn session_checks(app: Arc<App>) {
         let expired = crate::migrate::sweep_pending(&app, std::time::Instant::now());
         if expired > 0 {
             info!(expired, "uploaded imports never confirmed were dropped");
+        }
+    }
+}
+
+/// The scanner is shown the EICAR test file and a harmless one at start and every
+/// `check_every_mins`. Files are refused while the last check failed or is stale.
+async fn scan_checks(app: Arc<App>, scan: Arc<crate::scan::ScanService>) {
+    let mut tick = tokio::time::interval(scan.check_every);
+    loop {
+        tick.tick().await;
+        let was = scan.health();
+        let h = scan.check().await;
+        if h.ok {
+            debug!(scanner = %h.scanner, "file scanner check passed");
+        } else {
+            warn!(scanner = %h.scanner, detail = %h.detail, "file scanner check failed; files are refused");
+        }
+        if let Some((action, detail)) = crate::scan::transition(&was, &h) {
+            app.store.audit("system", action, &detail);
         }
     }
 }

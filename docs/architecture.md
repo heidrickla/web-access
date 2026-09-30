@@ -35,8 +35,9 @@ Upstream is `Devolutions/IronRDP`, MIT OR Apache-2.0.
 | Crate | Role |
 |---|---|
 | `ironrdp-web` | the WASM browser build; the client half, served by the proxy |
-| `ironrdp-rdcleanpath` | the protocol between browser and proxy; the only IronRDP crate the proxy links |
-| `ironrdp-cliprdr` | clipboard text and files in the client, in use |
+| `ironrdp-rdcleanpath` | the protocol between browser and proxy |
+| `ironrdp-cliprdr` | clipboard text and files in the client; the clipboard PDUs the proxy's file scan reads and writes |
+| `ironrdp-pdu`, `ironrdp-svc` | framing, the MCS connection sequence and virtual-channel chunks, for the file scan |
 | `ironrdp-rdpsnd`, `ironrdp-rdpdr` | audio and drives in the client, available if wanted |
 
 The proxy's own transport is tokio, `tokio-rustls` for TLS to the target and on the listener, and `tokio-tungstenite` for the WebSocket. Devolutions Gateway is the reference implementation of the proxy half.
@@ -49,9 +50,9 @@ A gateway with a relay at its centre:
 2. Show the user the servers assigned to them.
 3. On a click, mint a single-use ticket for that user and that server, and hand the user's saved credential, if any, to their browser.
 4. Take the WebSocket, check the cookie and the ticket, read the RDCleanPath request, open TCP to the server, send the client's X.224 request, perform the TLS handshake on the client's behalf, return the server's confirm and certificate chain.
-5. Pipe bytes until the session ends.
+5. Pipe bytes until the session ends. With file scanning on, files on the clipboard channel are held until scanned.
 
-The proxy never decodes RDP. It decides who may reach which server, and relays.
+The proxy decides who may reach which server, and relays. It decodes RDP only as far as the file scan needs: it frames the stream and reads the clipboard channel, and every other byte passes as it arrived.
 
 ## Decisions
 
@@ -71,7 +72,8 @@ The proxy never decodes RDP. It decides who may reach which server, and relays.
 | The client sends a target id, never an address | settled by design. Cloudflare's `/rdp/<vnet>/<ip>/<port>` lets the browser name the destination, so the allowlist is all that stands between a crafted request and an unlisted host. An opaque id makes reaching an arbitrary host inexpressible rather than forbidden |
 | Resolve by name, not by address | settled (Lewis, 2026-09-23) |
 | Verify the target's certificate against an internal CA | per deployment: `tls.verify`, which has no default, and is coupled to the row above |
-| Session recording | outside the proxy: a proxy that does not decode the stream cannot record it, so recording comes from the target or from a gateway that decodes RDP |
+| Session recording | outside the proxy: the proxy reads only the clipboard channel, so recording comes from the target or from a gateway that decodes all of RDP |
+| Files crossing the clipboard channel are scanned on the proxy, inline and enforced, by the anti-malware product registered with Windows through AMSI (Trellix on the hosts it serves); only a clean verdict passes | settled (Lewis, 2026-09-30); see File scanning below |
 
 ### Resolving by name puts DNS in the trust chain
 
@@ -128,7 +130,7 @@ SQLite in WAL mode, one connection behind a mutex for requests. A reader and the
 | Service log | one file per UTC day, the newest 30 |
 | Import backups | the newest 5 |
 | Schema backup | one per upgrade that changes the schema |
-| Settings | one JSON value in `meta`, written whole; a stored value that fails the checks reads as the defaults. The file-size limit is kept by the page: its purpose is sparing the network |
+| Settings | one JSON value in `meta`, written whole; a stored value that fails the checks reads as the defaults. The file-size limit is kept by the page, and by the proxy for the files it scans: its purpose is sparing the network |
 | Uploaded imports awaiting confirmation | at most 2, each for 30 minutes |
 | Sign-in sessions | until they expire, purged every 30 seconds |
 
@@ -181,13 +183,35 @@ Import checks the manifest and checksum, decrypts, opens the result (migrating a
 
 ## The capability note
 
+### File scanning
+
+Store and forward: a file reaches the other side only after the scanner has called every file in the offer clean. Clipboard text and other formats pass unscanned.
+
+| Step | How |
+|---|---|
+| Framing | both directions after RDCleanPath: CredSSP DER messages, the early authorization result a HYBRID_EX server sends, then TPKT and fast-path units by `ironrdp_pdu::find_size`, at most 1 MiB each. Only SSL, HYBRID and HYBRID_EX security are relayed |
+| The clipboard channel | the Connect Initial's channel names in order, matched to the Connect Response's channel ids. The channel's compression options are cleared in the Connect Initial, a compressed chunk is refused, and chunks are joined into whole PDUs (64 MiB at most) |
+| Locking | `CAN_LOCK_CLIPDATA` is removed from both capability PDUs, so file contents are always read from the current clipboard |
+| Interception | a Format List offering `FileGroupDescriptorW` is answered by the proxy. It fetches the descriptors and every byte of every file, 1 MiB per range request, under stream ids of its own from `0x5741_0000` |
+| Refused before any byte moves | a folder, a file without a size, a file over the Settings limit, or an offer larger than what `max_staged_mb` has left across every session |
+| Scan | each file on a blocking thread under `timeout_secs`. AMSI results 0 and 1 are clean, 0x8000 and above and the administrator-block range 0x4000 to 0x4FFF are detected, and anything else, or a failed call, is no verdict. The command scanner's exit codes are listed in the config; any other code is no verdict |
+| Passed | the sender's own Format List units go to the receiver, and its requests are answered from the proxy's copy |
+| Refused | the receiver is sent an empty Format List, so a clipboard it held from before is cleared |
+| Answer time | an offer is refused when the sender leaves a request unanswered for 30 seconds, or a file has no verdict in `timeout_secs` |
+
+Files are held in memory. The AMSI scanner reads them there; the command scanner reads a copy written under a random name in `<data_dir>\scan-staging`, deleted after the scan and emptied at start.
+
+The scanner is shown the EICAR test file and a harmless file at start and every `check_every_mins` (60). Offers are refused while the last check failed or is older than two checks and ten minutes. The EICAR string is kept reversed in the source and assembled at run time, so no file of the proxy's matches a signature. Each check is one detection in the anti-malware product's own log.
+
+The user's page polls `/api/me/notices` every two seconds during a session and shows what the scan decided. Every file passed or refused is an Activity entry (`file.upload`, `file.download`); the scanner's standing changing is `scan.failing` and `scan.restored`.
+
 Every limitation of the Cloudflare implementation is a choice made for a multi-tenant edge. On an internal network none of those reasons apply, so audio, drive redirection and a full clipboard are all available from the same upstream crates.
 
 ## Other connection types
 
 Roadmap; RDP comes first (Lewis, 2026-09-23).
 
-The proxy never decodes, so any protocol with a browser-side client fits. Proxy changes shared by VNC, SSH and Telnet:
+The relay reads nothing outside RDP's clipboard channel, so any protocol with a browser-side client fits. Proxy changes shared by VNC, SSH and Telnet:
 
 - A server gains a protocol; the port defaults by protocol (3389, 5900, 22, 23).
 - A raw-forward mode: authenticate, resolve, connect, pipe. The RDP path minus the RDCleanPath step.

@@ -10,12 +10,19 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
-rust-version = "1.65"
+edition = "2024"
+rust-version = "1.85"
 name = "der_derive"
-version = "0.7.3"
+version = "0.8.0"
 authors = ["RustCrypto Developers"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 description = "Custom derive support for the `der` crate's `Choice` and `Sequence` traits"
+homepage = "https://github.com/RustCrypto/formats/tree/master/der_derive"
 documentation = "https://docs.rs/der"
 readme = "README.md"
 keywords = [
@@ -33,9 +40,12 @@ categories = [
     "parser-implementations",
 ]
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/RustCrypto/formats/tree/master/der/derive"
+repository = "https://github.com/RustCrypto/formats"
+resolver = "2"
 
 [lib]
+name = "der_derive"
+path = "src/lib.rs"
 proc-macro = true
 
 [dependencies.proc-macro2]

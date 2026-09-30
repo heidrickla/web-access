@@ -15,7 +15,7 @@ use crate::store::{now, StoreError, StoredCredential, User};
 use crate::vault::{credential_aad, Vault, VaultError};
 
 use axum::body::Body;
-use axum::extract::{FromRequestParts, Path, Request, State};
+use axum::extract::{FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -361,6 +361,7 @@ pub fn router(app: Shared) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/me/servers", get(my_servers))
+        .route("/api/me/notices", get(my_notices))
         .route("/api/connect", post(connect))
         .route(
             "/api/credentials/{server}",
@@ -596,6 +597,9 @@ struct Me {
     renew_below_secs: i64,
     /// The largest file the page sends or fetches over the clipboard channel; none is no limit.
     max_file_bytes: Option<u64>,
+    /// Files crossing the clipboard channel are held until scanned, and the page shows what the
+    /// scan decided.
+    scanning: bool,
 }
 
 fn me_of(app: &App, user: &User, expires: Option<i64>) -> ApiResult<Me> {
@@ -607,6 +611,7 @@ fn me_of(app: &App, user: &User, expires: Option<i64>) -> ApiResult<Me> {
         remaining_secs: expires.map(|e| (e - now()).max(0)),
         renew_below_secs: settings.renew_below_secs(),
         max_file_bytes: settings.max_file_bytes(),
+        scanning: app.scan.is_some(),
     })
 }
 
@@ -953,6 +958,22 @@ async fn logout(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Re
 async fn me(State(app): State<Shared>, current: CurrentUser) -> ApiResult<Json<Me>> {
     let expires = app.store.session_expires(&current.token_hash)?;
     Ok(Json(me_of(&app, &current.user, expires)?))
+}
+
+#[derive(Deserialize)]
+struct NoticesQuery {
+    #[serde(default)]
+    after: u64,
+}
+
+/// What the file scan decided for this user since `after`, and the number to ask after next.
+async fn my_notices(
+    State(app): State<Shared>,
+    current: CurrentUser,
+    Query(q): Query<NoticesQuery>,
+) -> Json<serde_json::Value> {
+    let (notices, last) = app.notices.since(current.user.id, q.after);
+    Json(json!({ "notices": notices, "last": last }))
 }
 
 // ---- the user's servers -----------------------------------------------------------------------
