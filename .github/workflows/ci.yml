@@ -19,10 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # shell: bash runs with pipefail, so a failed download fails the step instead of feeding sh nothing.
       - name: toolchain (pinned)
+        shell: bash
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain 1.98.1 --component clippy,rustfmt
+          "$HOME/.cargo/bin/rustc" --version | grep -F ' 1.98.1 '
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # A release binary checked against its published digest, not a build on every push.

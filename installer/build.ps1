@@ -41,8 +41,11 @@ if (-not $Output) { $Output = Join-Path $PSScriptRoot "web-access-proxy-$version
 
 Push-Location $repo
 try {
+    # Outside a checkout both come back empty, which would read as a clean tree with no revision.
     $dirty = git status --porcelain --untracked-files=no
+    if ($LASTEXITCODE) { throw "git status failed in $repo (exit $LASTEXITCODE)" }
     $build = git describe --tags --always --dirty
+    if ($LASTEXITCODE) { throw "git describe failed in $repo (exit $LASTEXITCODE)" }
 }
 finally {
     Pop-Location

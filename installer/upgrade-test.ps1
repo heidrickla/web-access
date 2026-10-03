@@ -62,6 +62,18 @@ function Logged([string]$text, [int]$secs) {
     ''
 }
 function Marked { (Test-Path $cfg) -and (Select-String -Path $cfg -SimpleMatch 'upgrade-test-marker' -Quiet) }
+# How many failed starts the service logs hold; a start that never happened adds none.
+function Failures {
+    @(Get-ChildItem $data -Filter 'web-access-proxy-*.log' | Get-Content |
+        Select-String -SimpleMatch 'service failed').Count
+}
+function FailedSince([int]$before, [int]$secs) {
+    for ($i = 0; $i -lt $secs; $i++) {
+        if ((Failures) -gt $before) { return $true }
+        Start-Sleep 1
+    }
+    $false
+}
 $good = @'
 # upgrade-test-marker
 listen = "0.0.0.0:8443"
@@ -104,6 +116,7 @@ Check 'the notices and licence are installed' ((Test-Path 'C:\Program Files\web-
 
 # 3. A rebuild of the same version, over a config that no longer loads.
 Add-Content -Path $cfg -Value 'broken = [' -Encoding ascii
+$failed = Failures
 $e = Msi '/i C:\wa\web-access-proxy-new-b.msi /qn /l*v C:\wa\03-same-version.log'
 Check 'a rebuild of the same version upgrades in place' ($e -eq 0) "exit $e"
 $pr = Products
@@ -111,6 +124,7 @@ Check 'still one product' ($pr.Count -eq 1) (($pr | ForEach-Object { $_.PSChildN
 $facts = RuleFacts
 Check 'the rule survives the removal of the version it replaced' (($facts -like 'count=1 *') -and ($facts -like "*program=$exe *")) $facts
 Check 'a failed start does not fail the upgrade' (($e -eq 0) -and -not (Running 15))
+Check 'the upgrade tried to start the service' (FailedSince $failed 30)
 Set-Content -Path $cfg -Value $good -Encoding ascii
 Start-Service WebAccessProxy -ErrorAction SilentlyContinue
 Check 'the service starts once the config is fixed' (Running 30)

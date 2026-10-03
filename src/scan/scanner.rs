@@ -453,6 +453,31 @@ mod tests {
         assert_eq!(left, 0, "a copy was left behind");
     }
 
+    /// The scanner is handed the staged copy itself: the stand-in copies `{file}` out, so a wrong
+    /// path or an empty copy shows as a failed copy or different bytes.
+    #[test]
+    fn the_command_scanner_is_given_a_copy_of_the_file() {
+        let staging = std::env::temp_dir().join(format!(
+            "web-access-scan-{}",
+            &crate::auth::random_token()[..12]
+        ));
+        let seen = std::env::temp_dir().join(format!(
+            "web-access-seen-{}",
+            &crate::auth::random_token()[..12]
+        ));
+        let out = seen.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let argv = ["cmd", "/c", "copy", "/y", "{file}", out.as_str()];
+        #[cfg(not(windows))]
+        let argv = ["cp", "{file}", out.as_str()];
+        let v = command(&argv, Duration::from_secs(30), &staging).scan("a.txt", b"body");
+        let copied = std::fs::read(&seen);
+        let _ = std::fs::remove_file(&seen);
+        let _ = std::fs::remove_dir_all(&staging);
+        assert_eq!(v, Verdict::Clean);
+        assert_eq!(copied.unwrap(), b"body");
+    }
+
     /// The real AMSI provider on this host. Run with --ignored on a Windows machine with an
     /// anti-malware product registered, as the real-install check does.
     #[cfg(windows)]

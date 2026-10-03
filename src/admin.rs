@@ -1009,6 +1009,8 @@ async fn export_task(
             .map_err(ApiError::internal)?
             .map_err(ApiError::from)?
     };
+    #[cfg(test)]
+    app.packaged.notify_one();
     let delivery = Delivery { export, undo };
     // Recorded under a hold, only in the database the snapshot came from, and only while someone
     // is waiting for the archive.
@@ -1751,14 +1753,6 @@ mod tests {
         let app = test_app();
         let (_, cookie) = signed_in(&app, "boss");
         app.vault.set_recovery(&app.store, None, PASS).unwrap();
-        // An unobstructed export's duration bounds how long packaging takes.
-        let start = std::time::Instant::now();
-        export_supervised(&app, token_of(&cookie), PASS.into(), false)
-            .await
-            .unwrap()
-            .into_export();
-        let unobstructed = start.elapsed();
-
         let app2 = app.clone();
         let token = token_of(&cookie);
         let task =
@@ -1768,8 +1762,10 @@ mod tests {
         })
         .await;
         let held = app.gate.write().await;
-        // Packaging finishes and the export waits on the gate to record itself.
-        tokio::time::sleep(unobstructed * 2).await;
+        // Packaging finishes; with no await before it, the export then waits on the gate to record itself.
+        tokio::time::timeout(std::time::Duration::from_secs(60), app.packaged.notified())
+            .await
+            .expect("the export never finished packaging");
         task.abort();
         let _ = task.await;
         drop(held);

@@ -635,6 +635,7 @@ mod tests {
     }
 
     /// A real LDAPS listener stands in for the second controller; the first refuses connections.
+    /// `localhost` tries ::1 first, and Windows takes about 2 s to refuse it there.
     #[tokio::test]
     async fn a_controller_that_answered_is_remembered() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -669,7 +670,7 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         let cfg: DirectoryConfig = toml::from_str(&format!(
-            "domain = \"corp.example.com\"\nurls = [\"ldaps://127.0.0.1:{closed}\", \"ldaps://localhost:{up}\"]\nca_bundle = '{cert_path}'\ntimeout_secs = 3\n"
+            "domain = \"corp.example.com\"\nurls = [\"ldaps://127.0.0.1:{closed}\", \"ldaps://localhost:{up}\"]\nca_bundle = '{cert_path}'\ntimeout_secs = 10\n"
         ))
         .unwrap();
         let d = Directory::new(&cfg).unwrap();

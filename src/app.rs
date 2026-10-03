@@ -49,6 +49,9 @@ pub struct App {
     pub hash_permits: Arc<tokio::sync::Semaphore>,
     /// One export at a time, so a failed export can only undo a freeze it set itself.
     pub export_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Notified when an export has packaged its archive, so a test can cancel it at that step.
+    #[cfg(test)]
+    pub packaged: tokio::sync::Notify,
     /// Failed local-account sign-ins, per username.
     pub throttle: crate::auth::Throttle,
     /// How the directory account checks last went, for the Migration tab.
@@ -162,6 +165,8 @@ impl App {
             generation: AtomicU64::new(0),
             hash_permits: Arc::new(tokio::sync::Semaphore::new(HASH_PERMITS)),
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            packaged: tokio::sync::Notify::new(),
             throttle: crate::auth::Throttle::default(),
             revocation: Mutex::new(RevocationHealth::default()),
             scan,
@@ -298,11 +303,19 @@ mod tests {
         drop(app);
         let tool = App::new(config_in(&dir)).unwrap();
         assert!(
+            tool.vault.is_unlocked(),
+            "the credential store's local key did not open when the store was reopened"
+        );
+        assert!(
             tool.frozen(),
             "a command-line tool lifted a freeze whose export may still be running"
         );
         drop(tool);
         let app = App::for_serving(config_in(&dir)).unwrap();
+        assert!(
+            app.vault.is_unlocked(),
+            "the service reopened a locked credential store"
+        );
         assert!(!app.frozen(), "a stranded freeze survived a restart");
         app.store.set_flag(META_FROZEN, true).unwrap();
         drop(app);
