@@ -518,6 +518,28 @@ mod tests {
         Vault::load(store, Box::new(KeyFile::from_key(key))).unwrap()
     }
 
+    /// The Windows protector: a wrapped key unwraps to itself on this machine, a damaged blob does
+    /// not, and a vault reloaded over the same store opens with the key it wrote.
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_unwraps_what_it_wrapped_and_a_reloaded_vault_opens() {
+        let key = random_key().unwrap();
+        let blob = dpapi::Dpapi.protect(&key).unwrap();
+        assert_ne!(&blob[..], &key[..]);
+        assert_eq!(dpapi::Dpapi.unprotect(&blob).unwrap(), key);
+        assert!(dpapi::Dpapi.unprotect(&blob[..blob.len() - 1]).is_err());
+
+        let store = Store::open_in_memory().unwrap();
+        let first = Vault::load(&store, Box::new(dpapi::Dpapi)).unwrap();
+        let (nonce, ct) = first.seal(b"aad", b"secret").unwrap();
+        let again = Vault::load(&store, Box::new(dpapi::Dpapi)).unwrap();
+        assert!(
+            again.is_unlocked(),
+            "the local key did not unwrap on reload"
+        );
+        assert_eq!(again.open(b"aad", &nonce, &ct).unwrap(), b"secret");
+    }
+
     #[test]
     fn a_key_file_is_created_once_reloaded_after_and_refused_when_malformed() {
         let dir = std::env::temp_dir().join(format!("web-access-keyfile-{}", std::process::id()));
