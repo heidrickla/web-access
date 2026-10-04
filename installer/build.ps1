@@ -1,9 +1,9 @@
 <#
 Build the MSI. Run from anywhere; paths resolve against this script.
 
-    pwsh installer/build.ps1               build the proxy and the MSI from a clean tree
-    pwsh installer/build.ps1 -Dev          the same from a tree with uncommitted changes, for testing
-    pwsh installer/build.ps1 -Exe <path>   package a binary built elsewhere (cross-compiled on Linux)
+    powershell -ExecutionPolicy Bypass -File installer/build.ps1              build the proxy and the MSI from a clean tree
+    powershell -ExecutionPolicy Bypass -File installer/build.ps1 -Dev         the same from a tree with uncommitted changes, for testing
+    powershell -ExecutionPolicy Bypass -File installer/build.ps1 -Exe <path>  package a binary built elsewhere (cross-compiled on Linux)
 
 The version comes from Cargo.toml, and the binary reports it with the source revision it was
 built from (`web-access-proxy.exe --version`, the start of each run in the log, the Migration tab), so an

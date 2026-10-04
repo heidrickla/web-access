@@ -211,7 +211,7 @@ Future additions. RDP comes first. Design for each is in `docs/architecture.md`.
 
 `installer/` builds an MSI, deployable the way an organisation already deploys things (GPO, SCCM, Intune) with a real uninstall and upgrade path. On a Windows host with the Rust MSVC toolchain and the .NET SDK:
 
-    pwsh installer/build.ps1
+    powershell -ExecutionPolicy Bypass -File installer/build.ps1
 
 It builds the proxy, takes the version from `Cargo.toml`, stamps the source revision into the binary, and writes `installer/web-access-proxy-<version>.msi`. It refuses a tree with uncommitted changes unless given `-Dev`. A release is built from its tag, `v<version>`.
 
