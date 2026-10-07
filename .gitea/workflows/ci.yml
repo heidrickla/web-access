@@ -18,9 +18,11 @@ jobs:
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v5
+        timeout-minutes: 15
 
       # shell: bash runs with pipefail, so a failed download fails the step instead of feeding sh nothing.
       - name: toolchain (pinned)
+        timeout-minutes: 15
         shell: bash
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -30,6 +32,7 @@ jobs:
 
       # A release binary checked against its published digest, not a build on every push.
       - name: cargo-deny (pinned)
+        timeout-minutes: 15
         run: |
           v=0.20.2
           d=cargo-deny-$v-x86_64-unknown-linux-musl
@@ -38,16 +41,21 @@ jobs:
           tar -xzf "$d.tar.gz" --strip-components=1 -C "$HOME/.cargo/bin" "$d/cargo-deny"
 
       - name: format
+        timeout-minutes: 15
         run: cargo fmt --check
 
       - name: lint
+        timeout-minutes: 15
         run: cargo clippy --offline --locked --all-targets -- -D warnings
 
       - name: test
+        timeout-minutes: 15
         run: cargo test --offline --locked
 
       - name: page scripts
+        timeout-minutes: 15
         run: bash tests/js/run.sh
 
       - name: dependencies
+        timeout-minutes: 15
         run: cargo deny check
