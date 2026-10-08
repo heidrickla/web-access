@@ -36,7 +36,7 @@ mutate() { # name file sed-expr test-filter
 }
 
 mutate "admin guard admits everyone" src/web.rs 's/    if app.is_admin(&user) {/    if true {/' a_non_admin_is_refused_on_every_admin_route
-mutate "origin guard admits any origin" src/web.rs 's/if safe || same_origin(req.headers()) {/if true {/' a_cross_origin_post_is_refused
+mutate "origin guard admits any origin" src/web.rs 's/if safe || sso || same_origin(req.headers()) {/if true {/' a_cross_origin_post_is_refused
 mutate "tickets are reusable" src/auth.rs 's/\.remove(token)?;/.get(token).map(|i| Issued { ticket: i.ticket, minted: i.minted })?;/' a_ticket_is_spent_by_its_first_use
 mutate "credential AAD ignores the server" src/vault.rs 's/format!("credential\\0{sid}\\0{server_id}")/format!("credential\\0{sid}")/' a_credential_round_trips_and_is_bound_to_its_user_and_server
 mutate "assignment predicate always true" src/store.rs 's/"SELECT 1 FROM assignments WHERE user_id = ?1 AND server_id = ?2",/"SELECT 1 FROM servers WHERE ?1 = ?1 AND id = ?2",/' an_unassigned_server_is_refused
