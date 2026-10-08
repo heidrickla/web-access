@@ -74,3 +74,20 @@ ca_bundle = 'C:\ProgramData\web-access\directory-ca.pem'
 # command = ['C:\Program Files\Scanner\scan.exe', '/quiet', '{file}']
 # clean_exit_codes = [0]
 # detected_exit_codes = [1]
+
+# Single sign-on through the site's SAML 2.0 identity provider (ADFS, Entra ID), beside the password
+# sign-in. IT adds the proxy as a relying party from https://<proxy>/api/saml/metadata, signs the
+# assertion, leaves it unencrypted, and sends the account's SID as an attribute. The proxy finds
+# the account by that SID with the [directory] service_account, which this section requires.
+# [saml]
+# The address users open the proxy at.
+# url = "https://access.corp.example.com"
+# The identity provider's metadata, exported by IT. Read at start: restart the service after replacing it.
+# idp_metadata = 'C:\ProgramData\web-access\idp-metadata.xml'
+# The proxy's name at the identity provider. Default <url>/api/saml/metadata.
+# entity_id = "https://access.corp.example.com/api/saml/metadata"
+# The attribute carrying the SID. The default is ADFS's Primary SID claim; on Entra ID, IT maps a
+# claim from user.onpremisessecurityidentifier and this names it.
+# sid_attribute = "http://schemas.microsoft.com/ws/2008/06/identity/claims/primarysid"
+# Seconds of clock difference allowed between the proxy and the identity provider, at most 300.
+# clock_skew_secs = 180

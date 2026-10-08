@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<!-- Pattern facet with unknown \p{...} category. The regex engine
+     silently treats unknown categories as "match nothing", and \P{unknown}
+     as "match everything" - so restrictions using unknown property names
+     are ineffectual. Attacker-controlled schemas can bypass validation. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="s" type="hexOnly"/>
+  <xs:simpleType name="hexOnly">
+    <xs:restriction base="xs:string">
+      <!-- Intended: only hex digits. Actual: \P{unknowncategory} matches every char. -->
+      <xs:pattern value="\P{unknowncategory}+"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>

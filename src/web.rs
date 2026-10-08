@@ -102,6 +102,11 @@ pub const ASSETS: &[(&str, &str, &[u8])] = &[
         include_bytes!("../web/theme.js"),
     ),
     (
+        "/saml-done.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/saml-done.js"),
+    ),
+    (
         "/ironrdp_web.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../web/ironrdp_web.js"),
@@ -323,10 +328,15 @@ pub fn same_origin(headers: &HeaderMap) -> bool {
     }
 }
 
+/// The identity provider's POST arrives from its own origin. What it carries is checked instead:
+/// a signed assertion answering a request this browser's flow cookie names.
+const SSO_POST: &str = "/api/saml/acs";
+
 /// Every state-changing request must come from a page this proxy served.
 async fn origin_guard(req: Request, next: Next) -> Response {
     let safe = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if safe || same_origin(req.headers()) {
+    let sso = *req.method() == Method::POST && req.uri().path() == SSO_POST;
+    if safe || sso || same_origin(req.headers()) {
         next.run(req).await
     } else {
         ApiError::new(StatusCode::FORBIDDEN, "cross-origin request refused").into_response()
@@ -358,6 +368,10 @@ async fn security_headers(mut res: Response) -> Response {
 pub fn router(app: Shared) -> Router {
     Router::new()
         .route("/api/login", post(login))
+        .route("/api/sign-in-methods", get(crate::sso::methods))
+        .route("/api/saml/start", get(crate::sso::start))
+        .route(SSO_POST, post(crate::sso::acs))
+        .route("/api/saml/metadata", get(crate::sso::metadata))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/me/servers", get(my_servers))
@@ -387,6 +401,7 @@ pub fn router(app: Shared) -> Router {
 /// Each re-checks its caller under its own hold.
 pub const SELF_GATED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/login"),
+    ("POST", SSO_POST),
     ("POST", "/api/admin/users"),
     ("POST", "/api/admin/settings/directory-password"),
     ("POST", "/api/admin/migration/export"),
@@ -455,11 +470,13 @@ async fn gate_requests(State(app): State<Shared>, req: Request, next: Next) -> R
 pub const INSTANCE_HEADER: &str = "x-data-instance";
 
 /// Changes name rows by id, and ids are only meaningful in the database the page loaded them
-/// from. Sign-out names nothing, and the migration routes are what change the database.
+/// from. Sign-out names nothing, the identity provider's POST comes from no page of ours, and the
+/// migration routes are what change the database.
 fn needs_instance(method: &Method, path: &str) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
         && path.starts_with("/api/")
         && path != "/api/logout"
+        && path != SSO_POST
         && !path.starts_with("/api/admin/migration/")
 }
 
@@ -725,7 +742,7 @@ const CHANGED: &str = "the account changed during sign-in";
 
 /// A sign-in session for the row that was authenticated, and only that row: refused when its id
 /// has since been given to another row. Lasts as long as the Settings tab says at this moment.
-fn start_session(app: &App, user: &User) -> ApiResult<(String, i64, i64)> {
+pub(crate) fn start_session(app: &App, user: &User) -> ApiResult<(String, i64, i64)> {
     let token = auth::random_token();
     let lasts = settings::read(&app.store)?.signin_secs();
     let expires = now() + lasts;
@@ -855,7 +872,7 @@ async fn check_directory(
     }
 }
 
-fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult<User> {
+pub(crate) fn finish_directory(app: &App, account: &crate::directory::Account) -> ApiResult<User> {
     let user = match app.store.user_by_name(&account.username)? {
         Some(u) => u,
         None => match app.store.directory_user_by_sid(&account.sid)? {
@@ -1280,6 +1297,11 @@ pub mod tests {
     }
 
     fn build(key: [u8; 32], host: &str, top: &str, with_directory: bool) -> Shared {
+        Arc::new(build_app(key, host, top, with_directory, ""))
+    }
+
+    /// `extra` follows the directory section, so its first keys are the directory's.
+    fn build_app(key: [u8; 32], host: &str, top: &str, with_directory: bool, extra: &str) -> App {
         let dir =
             std::env::temp_dir().join(format!("web-access-test-{}", &auth::random_token()[..12]));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1289,7 +1311,7 @@ pub mod tests {
             ""
         };
         let text = format!(
-            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nadmins = [\"boss\"]\n{top}[tls]\nverify = \"insecure\"\n{directory_section}",
+            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nadmins = [\"boss\"]\n{top}[tls]\nverify = \"insecure\"\n{directory_section}{extra}",
             dir.to_string_lossy()
         );
         let cfg = Config::parse("test", &text).unwrap();
@@ -1299,6 +1321,26 @@ pub mod tests {
         let target_tls = crate::proxy::tls_setup(&cfg.tls).unwrap();
         let app = App::from_parts(cfg, store, vault, directory, target_tls, host.into(), false);
         crate::app::new_instance(&app.store).unwrap();
+        app
+    }
+
+    /// A proxy offering single sign-on against the identity provider of the SAML fixtures, its
+    /// clock at `now`.
+    pub fn test_app_sso(now: Option<i64>) -> Shared {
+        let mut app = build_app(
+            [9; 32],
+            "testhost",
+            "",
+            true,
+            "service_account = \"svc\"\n[saml]\nurl = \"https://access.example.test\"\nidp_metadata = \"unused\"\n",
+        );
+        let cfg = app.cfg.saml.clone().unwrap();
+        let idp =
+            crate::saml::parse_metadata(include_str!("../tests/fixtures/saml/idp-metadata.xml"))
+                .unwrap();
+        let mut sp = crate::saml::ServiceProvider::new(&cfg, idp);
+        sp.test_now = now;
+        app.saml = Some(sp);
         Arc::new(app)
     }
 

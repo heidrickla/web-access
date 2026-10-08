@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- Polynomial ReDoS via nested repetition (a*)*b against aaaa...X.
+     Matcher returns O(n^3) reachable positions; completes eventually for
+     small inputs but stalls for attacker-sized ones. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="s" type="vulnerableType"/>
+  <xs:simpleType name="vulnerableType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="(a*)*b"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>

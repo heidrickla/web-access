@@ -193,7 +193,7 @@ body > header {
 
 /* ---- controls ---------------------------------------------------------------------------- */
 
-button {
+button, a.button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -210,12 +210,16 @@ button {
   cursor: pointer;
   transition: border-color .12s ease, background .12s ease, color .12s ease, box-shadow .12s ease;
 }
-button:hover { border-color: var(--accent); background: var(--surface-3); }
-button:active { transform: translateY(1px); }
+button:hover, a.button:hover { border-color: var(--accent); background: var(--surface-3); }
+button:active, a.button:active { transform: translateY(1px); }
+/* A link that starts a full-page sign-in, drawn as a button. */
+a.button { text-decoration: none; box-sizing: border-box; }
+#sso { width: 100%; }
+.hint.or { margin: 10px 0 2px; text-align: center; }
 button:disabled { opacity: .5; cursor: default; transform: none; }
 button.ghost { background: transparent; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
-button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.primary, a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+button.primary:hover, a.button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); background: transparent; }
 button.danger:hover { background: var(--bad-soft); border-color: var(--bad); }
 

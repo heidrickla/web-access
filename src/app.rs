@@ -32,6 +32,8 @@ pub struct App {
     pub vault: Vault,
     /// None when only local accounts sign in.
     pub directory: Option<Directory>,
+    /// Single sign-on, when `[saml]` is configured.
+    pub saml: Option<crate::saml::ServiceProvider>,
     pub tickets: Tickets,
     pub live: LiveSessions,
     pub target_tls: TlsSetup,
@@ -84,7 +86,12 @@ impl App {
         let directory = cfg.directory.as_ref().map(Directory::new).transpose()?;
         let target_tls = tls_setup(&cfg.tls)?;
         let secure = cfg.https.is_some();
-        let app = Self::from_parts(
+        let saml = cfg
+            .saml
+            .as_ref()
+            .map(crate::saml::ServiceProvider::load)
+            .transpose()?;
+        let mut app = Self::from_parts(
             cfg,
             store,
             vault,
@@ -93,6 +100,7 @@ impl App {
             host_name(),
             secure,
         );
+        app.saml = saml;
         app.seed_from_config()?;
         if app.store.meta_get(META_INSTANCE)?.is_none() {
             new_instance(&app.store)?;
@@ -157,6 +165,7 @@ impl App {
             store,
             vault,
             directory,
+            saml: None,
             tickets: Tickets::default(),
             live: LiveSessions::default(),
             target_tls,

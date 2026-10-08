@@ -32,6 +32,10 @@
     <form id="login-form" class="card signin-card">
       <h2>Sign in</h2>
       <p class="hint">Use your network account to reach your servers.</p>
+      <div id="sso-offer" hidden>
+        <a id="sso" class="button primary" href="/api/saml/start">Sign in with single sign-on</a>
+        <p class="hint or">or with your password</p>
+      </div>
       <label>Username<input id="lu" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
       <label>Password<input id="lp" type="password" autocomplete="current-password" required></label>
       <p id="login-error" class="error" hidden></p>
@@ -137,7 +141,8 @@
 <dialog id="renew">
   <form id="renew-form">
     <h2>Renew your sign-in</h2>
-    <p class="note">Your sign-in ends in <span id="renew-left"></span>, and a desktop opened now would be disconnected then. Enter your password to renew it for 24 hours.</p>
+    <p class="note">Your sign-in ends in <span id="renew-left"></span>, and a desktop opened now would be disconnected then. Renew it to start a new sign-in.</p>
+    <p id="renew-sso-offer" hidden><a id="renew-sso" class="button" href="/api/saml/start">Renew with single sign-on</a> <span class="hint">returns here; open the server again after</span></p>
     <label>Password<input id="renew-pass" type="password" autocomplete="current-password" required></label>
     <p id="renew-error" class="error" hidden></p>
     <div class="actions">

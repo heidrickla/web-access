@@ -192,6 +192,21 @@ pub fn sid_to_string(bytes: &[u8]) -> Option<String> {
 /// An LDAP filter value matching a `S-1-5-21-...` SID in its binary form, each byte escaped;
 /// None for anything that is not one.
 pub fn sid_filter(sid: &str) -> Option<String> {
+    Some(
+        sid_bytes(sid)?
+            .iter()
+            .map(|b| format!("\\{b:02x}"))
+            .collect(),
+    )
+}
+
+/// A SID in the form `sid_to_string` gives, so two spellings of one SID compare equal; None for
+/// anything that is not a SID.
+pub fn canonical_sid(sid: &str) -> Option<String> {
+    sid_to_string(&sid_bytes(sid.trim())?)
+}
+
+fn sid_bytes(sid: &str) -> Option<Vec<u8>> {
     let mut parts = sid.strip_prefix("S-")?.split('-');
     let revision: u8 = parts.next()?.parse().ok()?;
     let authority: u64 = parts.next()?.parse().ok()?;
@@ -209,7 +224,7 @@ pub fn sid_filter(sid: &str) -> Option<String> {
     for s in subs {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
-    Some(bytes.iter().map(|b| format!("\\{b:02x}")).collect())
+    Some(bytes)
 }
 
 /// `accountExpires` is a FILETIME: 100 ns ticks since 1601. Zero and the maximum mean never.
@@ -435,6 +450,14 @@ impl Directory {
             .map_err(|e| DirError::Protocol(e.to_string()))?
             .success()
             .map_err(|e| DirError::Protocol(e.to_string()))?;
+        // A name or SID names one account. Two answers mean the filter is not what it should be,
+        // and picking either would sign someone in as an account the directory did not single out.
+        if entries.len() > 1 {
+            return Err(DirError::Protocol(format!(
+                "the directory returned {} accounts for one name",
+                entries.len()
+            )));
+        }
         let entry = match entries.into_iter().next() {
             Some(e) => SearchEntry::construct(e),
             None => return Ok(None),
@@ -505,6 +528,31 @@ impl Directory {
             .into_iter()
             .map(|(name, found)| found.map(|a| (name, a)))
             .collect()
+    }
+
+    /// The one account with this SID, read with the service account, for a sign-in an identity
+    /// provider vouched for. None when no account in the search base has it; the SID the
+    /// directory returns must be the one asked for.
+    pub async fn lookup_by_sid(
+        &self,
+        service_password: &str,
+        sid: &str,
+    ) -> Result<Option<Account>> {
+        let wanted =
+            canonical_sid(sid).ok_or_else(|| DirError::Protocol(format!("{sid} is not a SID")))?;
+        let found = self
+            .lookup_each(service_password, &[(wanted.clone(), Some(wanted.clone()))])
+            .await?
+            .pop()
+            .map(|(_, found)| found)
+            .unwrap_or(Ok(None))?;
+        match found {
+            Some(account) if account.sid != wanted => Err(DirError::Protocol(format!(
+                "asked for {wanted}, the directory answered {}",
+                account.sid
+            ))),
+            other => Ok(other),
+        }
     }
 
     /// As `lookup_many`, for `(username, SID)` pairs: an account with a SID is found by it, one

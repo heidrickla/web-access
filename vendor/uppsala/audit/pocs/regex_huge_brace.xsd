@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- Schema-side DoS: {n,m} with a huge upper bound. Compiler accepts
+     the pattern; matcher will loop up to m iterations (saturation
+     eventually kicks in, but CPU time is proportional to min(m, n)). -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="s" type="vulnerableType"/>
+  <xs:simpleType name="vulnerableType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="a{0,4000000000}"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>

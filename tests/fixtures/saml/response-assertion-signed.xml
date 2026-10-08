@@ -1,0 +1,26 @@
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r1" Version="2.0" IssueInstant="2026-10-08T12:00:00Z" Destination="https://access.example.test/api/saml/acs" InResponseTo="_req1"><saml:Issuer>https://idp.example.test/adfs/services/trust</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a1" Version="2.0" IssueInstant="2026-10-08T12:00:00Z"><saml:Issuer>https://idp.example.test/adfs/services/trust</saml:Issuer><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#_a1"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>Apz0MBsJVYWe/0ko9hpNCJ1n924Livr6iwYwhcd1srs=</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>BU/BJjYkaEw++SKR7fd99Hq9siS9bslwYudR/ta/Tt3sC439ftYQDynViqXvBrU5
+tC1Hntw57ZGB2P+OP7KZ0vi8RwYcP8vlLNanesZkqzuY42CY6j3dD4FwTAfVLfKQ
+h5yjeR1eOTevJCa5TJpmMbccCWmMBw4vB0pdeXx6Z9oY/G8bQ0iH1X3+PEbMk1Ej
+wsQpTTcwD54NsueMZHXuFgg3cCIpvxJvf7z1Fy+OKg+Sn0iYJ/X0fIL0rwISCf2U
+gYLsWi6qeiCRarQt0tr64LOUEopu3HDEKI3VRroWb0XgXJLga7Pvb7rVT6dh2vBv
+E8JYqFVrO9RY7gjcN1cdDQ==</ds:SignatureValue><ds:KeyInfo><ds:X509Data>
+<ds:X509Certificate>MIIDLTCCAhWgAwIBAgIUeN/fJAAMzibFnpWVTt8AmPF4+0swDQYJKoZIhvcNAQEL
+BQAwJTEjMCEGA1UEAwwaaWRwLmV4YW1wbGUudGVzdCBzaWduaW5nIGEwIBcNMjYx
+MDA4MDYzNjU1WhgPMjEyNjA5MTQwNjM2NTVaMCUxIzAhBgNVBAMMGmlkcC5leGFt
+cGxlLnRlc3Qgc2lnbmluZyBhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
+AQEAldpwg/XFAgHYsISq2raCFnZCVajiq1oHiIBrxCj/r64yQe4zuiFYVZKdhqxR
+8b9uWioYXLomttJprwzXEx3hh33jkYFQBzLjqIyAXCUgsYmJ0OZxyJmwMmrqCrz/
+i5kMd80YLy65uyonTyEFZs+c7d7x4TinGQKBv8Akwp/C2eV/IIKG89nnzax6uk5B
+RajVQm9pjFU9xq76SE9rYdRlhzRzPYHQZ2ViMZnO2FvC8pXSANgIsSj9aez0U8wm
+YCW7yL/oUZffRSVhw74faQa10EnsCrk4zouNJYOYT7u8KgdcMFeP3XCR/y9nPiCo
+FPl1p5cXC29FN43eSd46eOy9HwIDAQABo1MwUTAdBgNVHQ4EFgQUiL5HG+3CQm11
+ZdWGJdC/6hEaGV4wHwYDVR0jBBgwFoAUiL5HG+3CQm11ZdWGJdC/6hEaGV4wDwYD
+VR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAHEvFiITaAxZnn20vJtg3
+6tIXN2+AEq32D2QoUx0FpVV+WoswNEtPj4klg0+gLUP3GT+S1zVMwPW/sjXpmHZY
+0HoMYEgW4yvE4UCYj/DZf9RSlYzH3K4+sIZnp+IHeSAsSfTMDCYEbry2WRwMW584
+4KximI7f72Tiyab67ZKRTPekZuYIwA1qSquhPAK8GLUV2j4XRfSZNvJPcQAg+STX
+4QATGjl+hKWOHehkIaAikhuO7tjP8t8txB1p4+17IgJ121AU38yY4QFIkQ60icGv
+pluSkRIrtldeOyF7UQzwo4sjdaa+PC2UnsAJDfcl+019XCi8eOVviDR2xciktxq3
+Og==
+</ds:X509Certificate>
+</ds:X509Data></ds:KeyInfo></ds:Signature><saml:Subject><saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified">jdoe@corp.example.test</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData InResponseTo="_req1" NotOnOrAfter="2026-10-08T12:05:00Z" Recipient="https://access.example.test/api/saml/acs"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="2026-10-08T11:59:00Z" NotOnOrAfter="2026-10-08T13:00:00Z"><saml:AudienceRestriction><saml:Audience>https://access.example.test/api/saml/metadata</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AttributeStatement><saml:Attribute Name="http://schemas.microsoft.com/ws/2008/06/identity/claims/primarysid"><saml:AttributeValue>S-1-5-21-1004336348-1177238915-682003330-1105</saml:AttributeValue></saml:Attribute></saml:AttributeStatement><saml:AuthnStatement AuthnInstant="2026-10-08T12:00:00Z" SessionIndex="_a1"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement></saml:Assertion></samlp:Response>

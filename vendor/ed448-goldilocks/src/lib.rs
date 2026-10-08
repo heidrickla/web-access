@@ -1,0 +1,164 @@
+#![no_std]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(
+    feature = "getrandom",
+    doc = include_str!("../README.md")
+)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/RustCrypto/meta/master/logo.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/RustCrypto/meta/master/logo.svg"
+)]
+#![allow(non_snake_case)]
+#![forbid(unsafe_code)]
+#![warn(
+    clippy::unwrap_used,
+    clippy::mod_module_files,
+    missing_copy_implementations,
+    missing_debug_implementations,
+    missing_docs,
+    trivial_casts,
+    trivial_numeric_casts,
+    unused,
+    unused_attributes,
+    unused_imports,
+    unused_mut,
+    unused_must_use
+)]
+
+//! ## `serde` support
+//!
+//! When the `serde` feature of this crate is enabled, `Serialize` and
+//! `Deserialize` are impl'd for the following types:
+//!
+//! - [`CompressedDecaf`]
+//! - [`CompressedEdwardsY`]
+//! - [`EdwardsPoint`]
+//! - [`Scalar`]
+//! - [`SigningKey`]
+//! - [`VerifyingKey`]
+//!
+//! Please see type-specific documentation for more information.
+
+#[cfg(feature = "alloc")]
+#[macro_use]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(feature = "alloc")]
+use alloc::{boxed::Box, vec::Vec};
+
+// Internal macros. Must come first!
+#[macro_use]
+pub(crate) mod macros;
+
+pub use elliptic_curve;
+pub use hash2curve;
+pub use rand_core;
+pub use shake;
+pub use subtle;
+
+pub(crate) mod curve;
+pub(crate) mod decaf;
+pub(crate) mod edwards;
+pub(crate) mod field;
+pub(crate) mod montgomery;
+#[cfg(feature = "signing")]
+pub(crate) mod sign;
+
+pub(crate) use field::{GOLDILOCKS_BASE_POINT, TWISTED_EDWARDS_BASE_POINT};
+
+pub use decaf::{
+    AffinePoint as DecafAffinePoint, CompressedDecaf, DecafPoint, DecafScalar, DecafScalarBytes,
+    WideDecafScalarBytes,
+};
+pub use edwards::{
+    AffinePoint, CompressedEdwardsY, EdwardsPoint, EdwardsScalar, EdwardsScalarBytes,
+    WideEdwardsScalarBytes,
+};
+pub use field::{MODULUS_LIMBS, ORDER, Scalar, WIDE_ORDER};
+pub use montgomery::{MontgomeryPoint, ProjectiveMontgomeryPoint};
+#[cfg(feature = "signing")]
+pub use sign::*;
+
+use elliptic_curve::{
+    ByteOrder, Curve, PrimeCurve,
+    array::typenum::{U56, U57},
+    bigint::{ArrayEncoding, Odd, U448},
+    point::PointCompression,
+};
+use hash2curve::{ExpandMsgXof, GroupDigest};
+use shake::Shake256;
+
+/// Edwards448 curve.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Ed448;
+
+/// Serialized byte representation of an Ed448 field element.
+pub type Ed448FieldBytes = elliptic_curve::FieldBytes<Ed448>;
+
+/// Non-zero scalar of the Ed448 scalar
+pub type Ed448NonZeroScalar = elliptic_curve::NonZeroScalar<Ed448>;
+
+impl Curve for Ed448 {
+    type FieldBytesSize = U57;
+    type Uint = U448;
+
+    const ORDER: Odd<U448> = ORDER;
+    const FIELD_ENDIANNESS: ByteOrder = ByteOrder::LittleEndian;
+}
+
+impl PrimeCurve for Ed448 {}
+
+impl PointCompression for Ed448 {
+    const COMPRESS_POINTS: bool = true;
+}
+
+impl elliptic_curve::CurveArithmetic for Ed448 {
+    type AffinePoint = AffinePoint;
+    type ProjectivePoint = EdwardsPoint;
+    type Scalar = EdwardsScalar;
+}
+
+impl GroupDigest for Ed448 {
+    const HASH_TO_CURVE_ID: &[u8] = b"edwards448_XOF:SHAKE256_ELL2_RO_";
+    const ENCODE_TO_CURVE_ID: &[u8] = b"edwards448_XOF:SHAKE256_ELL2_NU_";
+
+    type ExpandMsg = ExpandMsgXof<Shake256>;
+}
+
+/// Decaf448 curve.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Decaf448;
+
+/// Bytes of the Decaf448 field
+pub type Decaf448FieldBytes = elliptic_curve::FieldBytes<Decaf448>;
+
+/// Non-zero scalar of the Decaf448 scalar
+pub type Decaf448NonZeroScalar = elliptic_curve::NonZeroScalar<Decaf448>;
+
+impl Curve for Decaf448 {
+    type FieldBytesSize = U56;
+    type Uint = U448;
+
+    const ORDER: Odd<U448> = ORDER;
+}
+
+impl PrimeCurve for Decaf448 {}
+
+impl PointCompression for Decaf448 {
+    const COMPRESS_POINTS: bool = true;
+}
+
+impl elliptic_curve::CurveArithmetic for Decaf448 {
+    type AffinePoint = DecafAffinePoint;
+    type ProjectivePoint = DecafPoint;
+    type Scalar = DecafScalar;
+}
+
+impl GroupDigest for Decaf448 {
+    const HASH_TO_CURVE_ID: &[u8] = b"decaf448_XOF:SHAKE256_D448MAP_RO_";
+    const ENCODE_TO_CURVE_ID: &[u8] = b"decaf448_XOF:SHAKE256_D448MAP_NU_";
+
+    type ExpandMsg = ExpandMsgXof<Shake256>;
+}

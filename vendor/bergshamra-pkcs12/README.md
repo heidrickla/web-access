@@ -1,0 +1,323 @@
+# Bergshamra
+
+XML Security library implementing the W3C XML Digital Signatures
+(XML-DSig), XML Encryption (XML-Enc), and XML Canonicalization (C14N)
+specifications. Document cryptography is selectable between RustCrypto and
+AWS-LC through Kryptering; XML parsing uses
+[Uppsala](https://crates.io/crates/uppsala) 0.10.1. Bergshamra 0.9.2 is
+released on September 28, 2026, and requires Rust 1.88.
+
+## Features
+
+- **XML Digital Signatures** — sign and verify (enveloped, enveloping, detached)
+- **XML Encryption** — encrypt and decrypt (element, content, key wrapping, key transport, multi-recipient)
+- **XML Canonicalization** — all 6 W3C C14N variants (inclusive/exclusive, with/without comments, 1.0/1.1) with document-subset filtering via XPath
+- **X.509 certificate chain** — validation with expiry, trust anchors, CRL revocation, chain building
+- **Post-quantum signatures** — ML-DSA (FIPS 204) and SLH-DSA (FIPS 205) with context strings
+- **EdDSA** — Ed25519 signatures (RFC 8032)
+- **Key agreement** — ECDH-ES (P-256/P-384/P-521), X25519, DH-ES (X9.42 finite-field)
+- **Key derivation** — ConcatKDF, HKDF (SHA-256/384/512), PBKDF2
+- **RSA-OAEP** — configurable digest (SHA-1/224/256/384/512), MGF1, and OAEPparams
+- **HMAC truncation** — HMACOutputLength with CVE-2009-0217 minimum length protection
+- **SAML support** — SAML v1.1 `AssertionID` attribute as default ID, `cid:` URI scheme for WS-Security MIME references
+- **CipherReference** — resolve encrypted content via URI with XPath and Base64 transforms
+- **XPath** — XPath, XPath Filter 2.0, XPointer for reference processing
+- **XSLT** — identity transform and minimal XSLT for document-subset operations
+- **OPC Relationship Transform** — for Office Open XML signatures (ECMA-376 Part 2)
+- **Key formats** — PEM, DER, PKCS#8 (plain and encrypted), PKCS#12, X.509 (PEM and DER), xmlsec keys.xml, raw symmetric keys
+- **KeyInfo resolution** — KeyName, X509Certificate (multi-cert chain with leaf detection), X509IssuerSerial, RSA/EC/DSA KeyValue, DEREncodedKeyValue, RetrievalMethod, EncryptedKey, KeyInfoReference
+- **`#![forbid(unsafe_code)]`** in each Bergshamra workspace crate; dependencies may use unsafe Rust
+
+### Supported algorithms
+
+| Category | Algorithms |
+|----------|-----------|
+| Digest | SHA-1, SHA-224/256/384/512, SHA3-224/256/384/512, MD5†, RIPEMD-160† |
+| Signature (RSA) | RSA PKCS#1 v1.5 (SHA-1/224/256/384/512, MD5†, RIPEMD-160†), RSA-PSS (SHA-1/224/256/384/512, SHA3-224/256/384/512) |
+| Signature (EC) | ECDSA (P-256/P-384/P-521 × SHA-1/224/256/384/512, SHA3-224/256/384/512, RIPEMD-160†) |
+| Signature (other) | DSA (SHA-1, SHA-256), Ed25519, HMAC (SHA-1/224/256/384/512, MD5†, RIPEMD-160†) |
+| Post-quantum | ML-DSA-44/65/87 (FIPS 204), SLH-DSA SHA2-128f/128s/192f/192s/256f/256s (FIPS 205) |
+| Block cipher | AES-128/192/256-CBC, AES-128/192/256-GCM, 3DES-CBC |
+| Key wrap | AES-KW-128/192/256 (RFC 3394), 3DES-KW (RFC 3217) |
+| Key transport | RSA PKCS#1 v1.5, RSA-OAEP (SHA-1/224/256/384/512 digest, MGF1-SHA-1/224/256/384/512) |
+| Key agreement | ECDH-ES (P-256/P-384/P-521), X25519, DH-ES (X9.42) |
+| Key derivation | ConcatKDF, HKDF (SHA-256/384/512), PBKDF2 |
+| C14N | Inclusive 1.0/1.1, Exclusive 1.0, each ± comments |
+| Transforms | Enveloped signature, Base64, XPath, XPath Filter 2.0, XSLT (identity), OPC Relationship |
+| Key formats | PEM, DER, PKCS#8, PKCS#12, X.509, xmlsec keys.xml, raw HMAC/AES/3DES |
+
+† MD5 and RIPEMD-160 are behind the `legacy-algorithms` feature flag.
+
+Exact support depends on the selected provider. See the
+[provider capability table](docs/provider-capabilities.md); unsupported
+parameter combinations fail deterministically and never fall back to another
+provider.
+
+## Cryptographic provider features
+
+The default feature set is `rustcrypto`, `legacy-algorithms`, `post-quantum`,
+and `pkcs11`, preserving the 0.7 software/PQ/HSM surface. Select alternate
+document providers with `--no-default-features`:
+
+```bash
+cargo build
+cargo build --no-default-features --features aws-lc,legacy-algorithms,pkcs11
+```
+
+Exactly one of `rustcrypto` or `aws-lc` is required. The `fips` feature
+selects AWS-LC, is incompatible with RustCrypto, and requires explicit
+`initialize_backend()` before cryptographic use. `--all-features` is
+intentionally invalid. AWS-LC builds are initially supported on Linux
+x86_64/aarch64.
+
+## xmlsec test suite compatibility
+
+Bergshamra's default RustCrypto configuration is tested against the full
+[xmlsec](https://www.aleksey.com/xmlsec/) interoperability test suite. These
+are the same tests used by the xmlsec1 C library, covering test vectors from
+the W3C, Merlin, Aleksey, IAIK, NIST, and Phaos interop suites.
+
+| Suite | Passed | Failed | Skipped |
+|-------|--------|--------|---------|
+| Enc   | 700    | 0      | 1       |
+| DSig  | 447    | 0      | 3       |
+| **Total** | **1147** | **0** | **4** |
+
+The three skipped DSig cases are GOST signature transform fixtures (GOST R
+34.10-2001, GOST R 34.10-2012-256, GOST R 34.10-2012-512) which require special
+OS cryptographic libraries not available in the RustCrypto ecosystem, thus
+outside Kryptering's algorithm contract. Alternate providers use focused
+capability and policy tests rather than this XMLSEC compatibility gate.
+
+The skipped Enc case is existing-document decryption of the
+`xmlenc11-interop-2012` DH-1024 fixture. Its subgroup order `q` is even and
+composite, which Kryptering rejects even with `legacy-algorithms`. The
+fixture's encryption and round-trip decryption phases use valid RFC 5114
+parameters and still run. Prime-subgroup validation remains enforced.
+
+A Python shim (`tests/xmlsec1-shim.py`) translates xmlsec1 CLI flags to
+bergshamra flags. The test runner explicitly skips the incompatible DH-1024
+decryption phase when using this shim; running against xmlsec1 retains the
+original fixture behavior.
+
+## Workspace crates
+
+| Crate | Purpose |
+|-------|---------|
+| `bergshamra-core` | Error types, algorithm URIs, XML namespace/element constants |
+| `bergshamra-xml` | DOM abstraction over Uppsala, NodeSet, XPath, XML writer |
+| `bergshamra-c14n` | All 6 W3C C14N variants with document-subset filtering |
+| `bergshamra-crypto` | Digest, signature, cipher, key wrap, key transport operations |
+| `bergshamra-keys` | Key loading (PEM/DER/PKCS#8/PKCS#12), KeysManager, KeyInfo resolution |
+| `bergshamra-transforms` | Transform pipeline (base64, enveloped, XPath, XSLT, URI handling) |
+| `bergshamra-dsig` | XML Digital Signature verification and creation |
+| `bergshamra-enc` | XML Encryption and decryption |
+| `bergshamra` | CLI binary and re-exports |
+
+Dependency flow: `core → xml → c14n → crypto → keys → transforms → dsig/enc → bergshamra`
+
+## Build & test
+
+```bash
+cargo build                    # Default RustCrypto build
+cargo build --release          # Release build (needed for integration tests)
+cargo test                     # Run all unit tests
+cargo clippy --workspace       # Lint
+cargo fmt --all -- --check     # Check formatting
+```
+
+### Integration tests (xmlsec test suite)
+
+```bash
+cd /path/to/bergshamra
+
+# Enc tests
+bash test-data/testrun.sh test-data/testEnc.sh openssl \
+    "$(pwd)/test-data" "$(pwd)/tests/xmlsec1-shim.py" pem
+
+# DSig tests
+bash test-data/testrun.sh test-data/testDSig.sh openssl \
+    "$(pwd)/test-data" "$(pwd)/tests/xmlsec1-shim.py" pem
+```
+
+## CLI usage
+
+```bash
+# Verify a signed document
+bergshamra verify --trusted ca.pem signed.xml
+
+# Sign a template
+bergshamra sign -k private.pem --output signed.xml template.xml
+
+# Decrypt
+bergshamra decrypt -k private.pem encrypted.xml
+
+# Encrypt
+bergshamra encrypt --cert recipient.pem --output encrypted.xml template.xml data.xml
+```
+
+Key loading options: `-k` (auto-detect PEM/DER), `-K NAME:FILE` (named key),
+`--pkcs12`, `--cert`, `--hmac-key`, `--aes-key`, `--keys-file` (xmlsec keys.xml),
+`--trusted` (CA cert), `--pwd` (password).
+
+## Library usage
+
+```rust
+let signed = bergshamra::sign(&ctx, template_xml)?;
+let signed = bergshamra::dsig::sign::sign_owned(&ctx, template_xml_string)?;
+```
+
+Document-native APIs use Uppsala 0.10 types. Callers that pass an
+`uppsala::Document` directly must also use Uppsala 0.10; the same types are
+available through the `bergshamra::xml` re-exports.
+
+Use `sign_owned` when the caller already owns a generated template `String` and
+wants to avoid the initial clone that the borrowed `sign` convenience wrapper
+performs.
+
+The 0.8.0 key, digest, and client changes are summarized in the
+[migration guide](docs/migration-0.8.md).
+
+## Security hardening
+
+XML Digital Signatures are a frequent target of attack. Bergshamra provides
+several layered protections — some always-on, some opt-in.
+
+### Duplicate ID rejection (always on)
+
+XML Signature Wrapping (XSW) attacks often rely on injecting a second element
+with the same `Id` attribute so that the signature verifies against one element
+while the application processes another. Bergshamra unconditionally rejects
+documents that contain duplicate ID values across any registered ID attribute
+(`Id`, `ID`, `id`, `AssertionID`, `xml:id`, and any names added via
+`DsigContext::add_id_attr`). Both `verify` and `sign` return an error if a
+duplicate is found.
+
+The lower-level `XmlDocument::build_id_map` helper also rejects duplicate ID
+values and returns `Err(Error::XmlStructure("duplicate ID: ...".into()))`
+instead of silently overwriting the earlier element.
+
+### Inspecting what was signed (`VerifyResult` metadata)
+
+A successful verification returns `VerifyResult::Valid` which carries:
+
+- **`signature_node`** — the `NodeId` of the `<Signature>` element that was
+  verified.
+- **`references`** — a `Vec<VerifiedReference>`, one per `<Reference>` in
+  `<SignedInfo>`. Each entry contains the URI string, the resolved target
+  node, and `digest_verified`.
+
+When `digest_verified` is `false`, the reference is currently a `cid:`
+attachment reference: its URI, transforms, and declared digest are still
+integrity-protected by the signed `<SignedInfo>`, but Bergshamra did not hash
+the external attachment bytes. When local digest coverage is explicitly disabled
+for detached-content workflows, use
+`VerifyResult::all_reference_digests_verified()` or
+`VerifyResult::has_unverified_references()` to check whether all reference
+digests were verified locally or whether any were not. Inspect the `references`
+list when you need per-reference detail.
+
+By default, verification requires local digest coverage: an otherwise valid
+`SignatureValue` is reported invalid when `<SignedInfo>` has no `<Reference>`
+elements or when any reference digest was not computed locally. Detached-content
+profiles that verify attachment bytes out-of-band can opt out with
+`DsigContext::with_require_reference_digests(false)` or the CLI flag
+`--allow-missing-reference-digests`.
+
+Detached bytes that Bergshamra should hash locally must be mapped explicitly
+with `DsigContext::add_url_map("URI", "file")` or CLI `--url-map URI=FILE`.
+Mappings match the URI exactly, or the same URI with a `#fragment` suffix.
+For XML-DSig compatibility, simple relative local file references are also
+resolved against the input directory/current working directory. Absolute paths
+URI schemes, and parent-directory traversal are rejected for local-file
+fallback, and detached bytes are redacted from verifier debug output so an
+invalid signature cannot print local file contents.
+
+You should always check that the signature covers the element you intend to
+consume. For example, a SAML Service Provider should verify that one of the
+references points to the `<Assertion>` it will process.
+
+### Strict verification mode (opt-in)
+
+Set `DsigContext::strict_verification = true` (or pass `--strict` on the CLI)
+to enforce positional constraints on reference targets. In strict mode every
+same-document reference must resolve to a node that is:
+
+- the **document element** (root), or
+- an **ancestor** of the `<Signature>` (the signed element wraps the signature
+  — the common enveloped pattern), or
+- a **sibling** of the `<Signature>` (both are children of the same parent).
+
+Any other position causes verification to fail. This is the strongest defence
+against XSW attacks and is recommended for SAML and WS-Security consumers
+where the document structure is well-known.
+
+### Trusted keys only (opt-in)
+
+Set `DsigContext::trusted_keys_only = true` to ignore inline keys embedded in
+`<KeyInfo>` (`<KeyValue>`, `<X509Certificate>`, etc.) and only use keys
+pre-loaded into the `KeysManager`. Without this, an attacker who controls the
+XML can embed their own key and sign with it — the signature will verify, but
+against the wrong key. This is essential for SAML Service Providers and any
+deployment where the signing key is known ahead of time.
+
+When trust anchors are configured, Bergshamra rejects raw inline `<KeyValue>`
+and `<DEREncodedKeyValue>` keys because they have no certificate chain to
+validate. Inline `<X509Data>` remains supported, but the certificate chain must
+validate to a configured anchor.
+
+Library callers that need xmlsec compatibility fixtures where trusted CA
+settings are combined with raw inline `KeyValue` test signatures can explicitly
+chain `.with_allow_raw_inline_keyinfo_with_trust_anchors(true)` on the
+`DsigContext` value. Do not enable that flag for normal verification of
+untrusted XML; prefer `DsigContext::new` for known-key protocols, or
+`DsigContext::new_permissive(keys).with_enabled_key_data_x509(true)` when
+inline signer certificates should chain to configured anchors. See
+`docs/adr/0007-raw-inline-keyinfo-trust-anchors.md` for the full policy.
+
+### HMAC output truncation (CVE-2009-0217)
+
+Set `DsigContext::hmac_min_out_len` to enforce a minimum `<HMACOutputLength>`
+in bits. A zero-length or very short HMAC is trivially forgeable.
+
+### XML Encryption PBKDF2 iteration limit
+
+XML Encryption documents can carry `<xenc11:IterationCount>` inside PBKDF2
+key-derivation parameters. Bergshamra caps that XML-controlled work factor
+before invoking PBKDF2. `EncContext::new()` uses
+`bergshamra_enc::context::DEFAULT_MAX_PBKDF2_ITERATIONS`; set
+`EncContext::max_pbkdf2_iterations` or use
+`EncContext::with_max_pbkdf2_iterations()` when a deployment needs a lower or
+higher CPU budget. A value of `0` rejects XML Encryption PBKDF2 usage.
+
+### Recommended configuration for SAML
+
+```rust
+let mut ctx = DsigContext::new(keys_manager);
+ctx.trusted_keys_only = true;     // reject inline keys
+ctx.strict_verification = true;   // reject unexpected reference positions
+ctx.verify_keys = true;           // validate the IdP certificate chain
+```
+
+Or on the CLI:
+
+```bash
+bergshamra verify --strict --trusted-keys-only --trusted idp-ca.pem signed-assertion.xml
+```
+
+## Security examples
+
+The [secexample](https://github.com/kushaldas/secexample) repository
+contains runnable demonstrations of three XML signature attacks and how
+bergshamra detects and rejects each one:
+
+1. **XML Signature Wrapping (XSW)** — relocates signed content to fool the application
+2. **Key Injection** — attacker signs with their own key embedded in `<KeyInfo>`
+3. **HMAC Truncation (CVE-2009-0217)** — reduces HMAC output to a brute-forceable length
+
+Each demo shows both a naive verifier that is vulnerable and a secure
+verifier using the defences described above.
+
+## License
+
+BSD-2-Clause License. See [LICENSE](LICENSE) for details.

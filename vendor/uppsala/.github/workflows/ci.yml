@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly fuzz smoke, Mondays 04:17 UTC (odd minute to dodge the rush).
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout uppsala
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Hand-crafted + unit test suites. Runs in seconds. The hand-crafted
+      # suites parse through a checked helper (tests/common/mod.rs) that
+      # asserts pull-parser/DOM agreement on every fixture, and
+      # pull_differential adds the dedicated pull-parser regression corpus.
+      - name: Unit and hand-crafted tests
+        run: cargo test --lib --test xml_conformance --test namespace_conformance --test xpath_conformance --test xsd_conformance --test serialization_conformance --test range_conformance --test xsd_composition --test pull_differential
+
+      # Security regression coverage. The fail-closed assertions run by
+      # default; `#[ignore]`-marked process-fatal reproducers in
+      # security_audit are skipped here and run manually with `-- --ignored`.
+      - name: Security regression tests
+        run: cargo test --test security_regressions --test hardening_regressions --test security_audit
+
+      # W3C conformance suites — the full XML test suite (~1 208 tests) and
+      # the three XSD test suites (NIST ~19 217, MS ~1 213, Sun ~199). All
+      # fully deterministic; split into named steps so the CI log shows
+      # per-suite pass counts instead of one opaque aggregate. Each family
+      # also runs a pull-parser agreement sweep: the substring filters below
+      # match both the validation test and its *_pull_agreement counterpart,
+      # and w3c_xmlconf includes w3c_pull_event_stream_agrees_with_dom_parser.
+      - name: W3C XML conformance
+        run: cargo test --test w3c_xmlconf -- --nocapture
+
+      - name: W3C XSD conformance (NIST Datatypes)
+        run: cargo test --test w3c_xsts xsts_nist_datatypes -- --nocapture
+
+      - name: W3C XSD conformance (MS DataTypes)
+        run: cargo test --test w3c_xsts xsts_ms_datatypes -- --nocapture
+
+      - name: W3C XSD conformance (Sun Combined)
+        run: cargo test --test w3c_xsts xsts_sun_combined -- --nocapture
+
+  # Extended corpus: security payloads, encoding matrix, and real-world
+  # dialects. The corpus is assembled from a pinned libxml2 clone plus locally
+  # generated samples; the security suite performs no I/O by construction (it
+  # asserts uppsala never resolves external entities / reads files).
+  corpus-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout uppsala
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-corpus-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-corpus-
+
+      # Fetch/assemble the corpus. libxml2 is cloned at the pin recorded in the
+      # script; go-fuzz-corpus is optional. This is the only networked step.
+      - name: Assemble corpus
+        run: sh scripts/fetch_corpus.sh
+
+      - name: Extended corpus tests (security / encoding / real-world)
+        run: cargo test --test security_corpus --test encoding_matrix --test realworld_corpus -- --nocapture
+
+  # Weekly (and on-demand) fuzz smoke: build every target and run it briefly as
+  # a no-crash check. Not on push/PR — only schedule + manual dispatch.
+  fuzz-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout uppsala
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Rust nightly + cargo-fuzz
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Assemble + import corpus
+        run: |
+          sh scripts/fetch_corpus.sh
+          ./audit/fuzz/scripts/seed-import.sh
+
+      # 60s per target; -1 exit on any crash fails the job.
+      - name: Fuzz smoke (60s/target)
+        run: |
+          set -e
+          targets=$(grep -oE 'fuzz_[a-z_]+' audit/fuzz/scripts/common.sh | sort -u)
+          for target in $targets; do
+            echo "== $target =="
+            cargo +nightly fuzz run --fuzz-dir audit/fuzz "$target" -- -max_total_time=60 -print_final_stats=1
+          done
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: audit/fuzz/artifacts/
+          if-no-files-found: ignore

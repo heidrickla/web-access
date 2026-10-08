@@ -1,0 +1,209 @@
+#![forbid(unsafe_code)]
+
+//! Parser for xmlsec's `keys.xml` format.
+//!
+//! The format uses a `<Keys xmlns="http://www.aleksey.com/xmlsec/2002">` root
+//! element containing multiple `<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">`
+//! children. Each KeyInfo has a `<KeyName>` and a `<KeyValue>` whose child
+//! element determines the key type:
+//!
+//! - `<HMACKeyValue xmlns="...aleksey...">` — base64 HMAC key
+//! - `<AESKeyValue xmlns="...aleksey...">` — base64 AES key
+//! - `<DESKeyValue xmlns="...aleksey...">` — base64 3DES key
+//! - `<RSAKeyValue>` — standard ds:RSAKeyValue (Modulus + Exponent)
+
+use crate::key::Key;
+use crate::loader;
+use bergshamra_core::Error;
+use uppsala::{Document, NodeId};
+
+const ALEKSEY_NS: &str = "http://www.aleksey.com/xmlsec/2002";
+const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+/// Parse an xmlsec `keys.xml` file and return all named keys.
+pub fn parse_keys_xml(xml: &str) -> Result<Vec<Key>, Error> {
+    let doc = uppsala::parse(xml).map_err(|e| Error::XmlParse(format!("keys.xml: {e}")))?;
+
+    let mut keys = Vec::new();
+
+    for node in doc.descendants(doc.root()) {
+        let elem = match doc.element(node) {
+            Some(e) => e,
+            None => continue,
+        };
+        let ns_uri = elem.name.namespace_uri.as_deref().unwrap_or("");
+        let local = &*elem.name.local_name;
+
+        // Each <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"> is one key entry
+        if ns_uri == DSIG_NS && local == "KeyInfo" {
+            if let Some(key) = parse_key_info_entry(node, &doc)? {
+                keys.push(key);
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
+/// Parse a single `<KeyInfo>` entry from keys.xml.
+fn parse_key_info_entry(key_info_node: NodeId, doc: &Document<'_>) -> Result<Option<Key>, Error> {
+    // Extract <KeyName>
+    let key_name = doc
+        .children(key_info_node)
+        .into_iter()
+        .find(|&n| {
+            doc.element(n)
+                .map(|e| {
+                    &*e.name.local_name == "KeyName"
+                        && e.name.namespace_uri.as_deref().unwrap_or("") == DSIG_NS
+                })
+                .unwrap_or(false)
+        })
+        .map(|n| doc.text_content_deep(n))
+        .map(|s| s.trim().to_owned());
+
+    // Extract <KeyValue>
+    let key_value_node = doc.children(key_info_node).into_iter().find(|&n| {
+        doc.element(n)
+            .map(|e| {
+                &*e.name.local_name == "KeyValue"
+                    && e.name.namespace_uri.as_deref().unwrap_or("") == DSIG_NS
+            })
+            .unwrap_or(false)
+    });
+
+    let key_value_node = match key_value_node {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+
+    // Determine key type from the child of <KeyValue>
+    for child in doc.children(key_value_node) {
+        let elem = match doc.element(child) {
+            Some(e) => e,
+            None => continue,
+        };
+        let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+        let child_local = &*elem.name.local_name;
+
+        let mut key = match (child_ns, child_local) {
+            (ALEKSEY_NS, "HMACKeyValue") => {
+                let b64 = doc.text_content_deep(child);
+                let b64 = b64.trim();
+                let bytes = decode_b64(b64, "HMACKeyValue")?;
+                loader::load_hmac_key(&bytes)?
+            }
+            (ALEKSEY_NS, "AESKeyValue") => {
+                let b64 = doc.text_content_deep(child);
+                let b64 = b64.trim();
+                let bytes = decode_b64(b64, "AESKeyValue")?;
+                loader::load_aes_key(&bytes)?
+            }
+            (ALEKSEY_NS, "DESKeyValue") => {
+                let b64 = doc.text_content_deep(child);
+                let b64 = b64.trim();
+                let bytes = decode_b64(b64, "DESKeyValue")?;
+                loader::load_des3_key(&bytes)?
+            }
+            (DSIG_NS, "RSAKeyValue") => {
+                // Re-use the existing RSAKeyValue parser
+                crate::keyinfo::parse_rsa_key_value(key_value_node, doc)?
+            }
+            _ => continue, // Skip DSAKeyValue and other unsupported types
+        };
+
+        if let Some(name) = &key_name {
+            key.name = Some(name.clone());
+        }
+        return Ok(Some(key));
+    }
+
+    Ok(None)
+}
+
+fn decode_b64(b64: &str, context: &str) -> Result<Vec<u8>, Error> {
+    use base64::Engine;
+    let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(&clean)
+        .map_err(|e| Error::Base64(format!("{context}: {e}")))
+}
+
+/// Load keys from an xmlsec keys.xml file path into a list of named keys.
+pub fn load_keys_file(path: &std::path::Path) -> Result<Vec<Key>, Error> {
+    let xml = std::fs::read_to_string(path)
+        .map_err(|e| Error::Other(format!("{}: {e}", path.display())))?;
+    parse_keys_xml(&xml)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_keys_xml() {
+        let keys_path = std::path::Path::new("../../test-data/keys/keys.xml");
+        if !keys_path.exists() {
+            eprintln!("skipping test: {keys_path:?} not found");
+            return;
+        }
+        #[cfg(feature = "aws-lc")]
+        {
+            let error = load_keys_file(keys_path)
+                .expect_err("AWS-LC must reject the fixture's 3DES key entry");
+            let message = error.to_string();
+            assert!(
+                message.contains("aws-lc")
+                    && message.contains("KeyImport(TripleDes)")
+                    && message.contains("unsupported"),
+                "expected deterministic AWS-LC 3DES rejection, got: {message}"
+            );
+        }
+
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let keys = load_keys_file(keys_path).expect("parse keys.xml");
+
+            // Should have: test-hmac-sha1, test-dsa (skipped), test-rsa,
+            // test-des, and test-aes128/192/256. DSA is unsupported, so 6 keys.
+            assert!(
+                keys.len() >= 6,
+                "expected at least 6 keys, got {}",
+                keys.len()
+            );
+
+            let hmac = keys
+                .iter()
+                .find(|k| k.name.as_deref() == Some("test-hmac-sha1"))
+                .unwrap();
+            assert_eq!(hmac.data.algorithm(), kryptering::KeyAlgorithm::Hmac);
+            assert_eq!(hmac.symmetric_key_bytes(), Some(b"secret".as_slice()));
+
+            for (name, length) in [
+                ("test-aes128", 16),
+                ("test-aes192", 24),
+                ("test-aes256", 32),
+            ] {
+                let key = keys
+                    .iter()
+                    .find(|key| key.name.as_deref() == Some(name))
+                    .unwrap();
+                assert_eq!(key.data.algorithm(), kryptering::KeyAlgorithm::Aes);
+                assert_eq!(key.symmetric_key_bytes().map(<[u8]>::len), Some(length));
+            }
+
+            let des = keys
+                .iter()
+                .find(|k| k.name.as_deref() == Some("test-des"))
+                .unwrap();
+            assert_eq!(des.data.algorithm(), kryptering::KeyAlgorithm::TripleDes);
+            assert_eq!(des.symmetric_key_bytes().map(<[u8]>::len), Some(24));
+
+            let rsa_key = keys
+                .iter()
+                .find(|k| k.name.as_deref() == Some("test-rsa"))
+                .unwrap();
+            assert_eq!(rsa_key.data.algorithm(), kryptering::KeyAlgorithm::Rsa);
+        }
+    }
+}

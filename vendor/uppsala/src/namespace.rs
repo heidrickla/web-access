@@ -1,0 +1,292 @@
+//! Namespaces in XML 1.0 (Third Edition) implementation.
+//!
+//! This module provides namespace prefix resolution with proper scoping.
+//! The [`NamespaceResolver`] maintains a stack of scopes, each of which maps
+//! prefixes to namespace URIs. When the parser enters an element with
+//! `xmlns` declarations a new scope is pushed, and when the element closes
+//! the scope is popped.
+
+use std::borrow::Cow;
+
+use crate::dom::{Document, NodeId, NodeKind};
+
+/// The XML namespace URI (`http://www.w3.org/XML/1998/namespace`),
+/// bound to the `xml` prefix by definition.
+pub const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+/// The XMLNS namespace URI (`http://www.w3.org/2000/xmlns/`),
+/// bound to the `xmlns` prefix by definition.
+pub const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// A single namespace scope that maps prefixes to namespace URIs.
+#[derive(Debug, Clone)]
+struct NamespaceScope<'a> {
+    /// Maps prefix (empty string for default namespace) to namespace URI.
+    bindings: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+}
+
+impl<'a> NamespaceScope<'a> {
+    fn new() -> Self {
+        NamespaceScope {
+            bindings: Vec::new(),
+        }
+    }
+}
+
+/// Resolves namespace prefixes to URIs, maintaining a stack of scopes.
+///
+/// The resolver always has the built-in `xml` prefix bound to
+/// `http://www.w3.org/XML/1998/namespace` and the `xmlns` prefix bound to
+/// `http://www.w3.org/2000/xmlns/`.
+#[derive(Debug, Clone)]
+pub struct NamespaceResolver<'a> {
+    scopes: Vec<NamespaceScope<'a>>,
+    default_namespace: Option<Cow<'a, str>>,
+    default_namespace_stack: Vec<Option<Cow<'a, str>>>,
+}
+
+impl<'a> NamespaceResolver<'a> {
+    /// Create a new resolver with the built-in `xml` and `xmlns` bindings.
+    pub fn new() -> Self {
+        let mut root_scope = NamespaceScope::new();
+        root_scope
+            .bindings
+            .push((Cow::Borrowed("xml"), Cow::Borrowed(XML_NAMESPACE)));
+        root_scope
+            .bindings
+            .push((Cow::Borrowed("xmlns"), Cow::Borrowed(XMLNS_NAMESPACE)));
+        NamespaceResolver {
+            scopes: vec![root_scope],
+            default_namespace: None,
+            default_namespace_stack: vec![None],
+        }
+    }
+
+    /// Push a new (empty) namespace scope. Call this when entering an element.
+    pub fn push_scope(&mut self) {
+        self.scopes.push(NamespaceScope::new());
+        self.default_namespace_stack
+            .push(self.default_namespace.clone());
+    }
+
+    /// Pop the current namespace scope. Call this when leaving an element.
+    pub fn pop_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+            self.default_namespace = self.default_namespace_stack.pop().unwrap_or(None);
+        }
+    }
+
+    /// Number of active scopes, including the root scope (so a resolver with no
+    /// element open reports `1`). Used to assert `push_scope`/`pop_scope`
+    /// balance in tests.
+    #[cfg(test)]
+    pub(crate) fn scope_depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Declare a namespace binding in the current scope.
+    ///
+    /// `prefix` is the empty string for a default namespace declaration.
+    ///
+    /// Per Namespaces in XML §3 the three bindings below are reserved
+    /// and cannot be declared by consumer code. The parser already
+    /// rejects them at source-level; this method silently ignores them
+    /// so the resolver's invariants cannot be broken by a caller that
+    /// constructs a resolver programmatically:
+    ///
+    /// * the prefix `xml` bound to anything other than
+    ///   `http://www.w3.org/XML/1998/namespace`
+    /// * the prefix `xmlns` (may never be declared)
+    /// * any prefix other than `xml` — including the default namespace —
+    ///   bound to `http://www.w3.org/XML/1998/namespace`
+    /// * any prefix bound to `http://www.w3.org/2000/xmlns/`
+    pub fn declare(&mut self, prefix: Cow<'a, str>, uri: Cow<'a, str>) {
+        if &*prefix == "xmlns" {
+            return;
+        }
+        if &*prefix == "xml" && &*uri != XML_NAMESPACE {
+            return;
+        }
+        if &*uri == XML_NAMESPACE && &*prefix != "xml" {
+            return;
+        }
+        if &*uri == XMLNS_NAMESPACE {
+            return;
+        }
+        if prefix.is_empty() {
+            self.default_namespace = if uri.is_empty() {
+                None
+            } else {
+                Some(uri.clone())
+            };
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.bindings.push((prefix, uri));
+        }
+    }
+
+    /// Resolve a prefixed name to a namespace URI.
+    ///
+    /// Searches from the innermost scope outward.
+    /// Returns the Cow so callers can clone cheaply if it's borrowed.
+    pub fn resolve(&self, prefix: &str) -> Option<&Cow<'a, str>> {
+        for scope in self.scopes.iter().rev() {
+            for (p, uri) in scope.bindings.iter().rev() {
+                if **p == *prefix {
+                    return Some(uri);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve the default namespace (empty prefix).
+    pub fn resolve_default(&self) -> Option<&Cow<'a, str>> {
+        self.default_namespace.as_ref()
+    }
+
+    /// Return all in-scope namespace bindings (prefix -> URI).
+    pub fn in_scope_namespaces(&self) -> Vec<(&str, &str)> {
+        let mut result: Vec<(&str, &str)> = Vec::new();
+        let mut seen_prefixes = std::collections::HashSet::new();
+        for scope in self.scopes.iter().rev() {
+            for (p, uri) in scope.bindings.iter().rev() {
+                if seen_prefixes.insert(&**p) {
+                    result.push((&**p, &**uri));
+                }
+            }
+        }
+        result
+    }
+
+    /// Return the depth of the namespace scope stack.
+    pub fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+}
+
+impl<'a> Default for NamespaceResolver<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Build a `NamespaceResolver` from a document by walking from a node up to
+/// the root, collecting all in-scope namespace declarations.
+pub fn build_resolver_for_node<'a>(
+    doc: &'a Document<'a>,
+    node_id: NodeId,
+) -> NamespaceResolver<'a> {
+    let mut resolver = NamespaceResolver::new();
+
+    // Collect ancestor chain (from root down to the node)
+    let mut chain = Vec::new();
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        chain.push(id);
+        current = doc.parent(id);
+    }
+    chain.reverse();
+
+    // Walk from root to node, pushing scopes
+    for &id in &chain {
+        if let Some(NodeKind::Element(elem)) = doc.node_kind(id) {
+            resolver.push_scope();
+            for (prefix, uri) in &elem.namespace_declarations {
+                resolver.declare(prefix.clone(), uri.clone());
+            }
+        }
+    }
+
+    resolver
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_prefix() {
+        let mut resolver = NamespaceResolver::new();
+        resolver.push_scope();
+        resolver.declare(
+            Cow::Owned("soap".to_string()),
+            Cow::Owned("http://www.w3.org/2003/05/soap-envelope".to_string()),
+        );
+        assert_eq!(
+            resolver.resolve("soap").map(|c| &**c),
+            Some("http://www.w3.org/2003/05/soap-envelope")
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_namespace() {
+        let mut resolver = NamespaceResolver::new();
+        resolver.push_scope();
+        resolver.declare(
+            Cow::Owned(String::new()),
+            Cow::Owned("http://example.com/default".to_string()),
+        );
+        assert_eq!(
+            resolver.resolve_default().map(|c| &**c),
+            Some("http://example.com/default")
+        );
+    }
+
+    #[test]
+    fn test_scope_shadowing() {
+        let mut resolver = NamespaceResolver::new();
+        resolver.push_scope();
+        resolver.declare(
+            Cow::Owned("ns".to_string()),
+            Cow::Owned("http://first.com".to_string()),
+        );
+        assert_eq!(
+            resolver.resolve("ns").map(|c| &**c),
+            Some("http://first.com")
+        );
+
+        resolver.push_scope();
+        resolver.declare(
+            Cow::Owned("ns".to_string()),
+            Cow::Owned("http://second.com".to_string()),
+        );
+        assert_eq!(
+            resolver.resolve("ns").map(|c| &**c),
+            Some("http://second.com")
+        );
+
+        resolver.pop_scope();
+        assert_eq!(
+            resolver.resolve("ns").map(|c| &**c),
+            Some("http://first.com")
+        );
+    }
+
+    #[test]
+    fn test_undeclare_default_namespace() {
+        let mut resolver = NamespaceResolver::new();
+        resolver.push_scope();
+        resolver.declare(
+            Cow::Owned(String::new()),
+            Cow::Owned("http://example.com".to_string()),
+        );
+        assert_eq!(
+            resolver.resolve_default().map(|c| &**c),
+            Some("http://example.com")
+        );
+
+        resolver.push_scope();
+        resolver.declare(Cow::Owned(String::new()), Cow::Owned(String::new()));
+        assert_eq!(resolver.resolve_default(), None);
+    }
+
+    #[test]
+    fn test_builtin_xml_prefix() {
+        let resolver = NamespaceResolver::new();
+        assert_eq!(
+            resolver.resolve("xml").map(|c| &**c),
+            Some("http://www.w3.org/XML/1998/namespace")
+        );
+    }
+}
