@@ -19,6 +19,9 @@ pub struct Config {
     /// Active Directory sign-in. Optional when local accounts are allowed.
     #[serde(default)]
     pub directory: Option<DirectoryConfig>,
+    /// Single sign-on through the site's SAML identity provider, beside the password sign-in.
+    #[serde(default)]
+    pub saml: Option<SamlConfig>,
     /// Accounts that are always administrators, so the management plane cannot lock itself out.
     #[serde(default)]
     pub admins: Vec<String>,
@@ -57,6 +60,7 @@ const KNOWN: &[(&str, &[&str])] = &[
             "https",
             "tls",
             "directory",
+            "saml",
             "admins",
             "allow_local_accounts",
             "data_dir",
@@ -91,6 +95,16 @@ const KNOWN: &[(&str, &[&str])] = &[
             "service_account",
             "timeout_secs",
             "check_interval_secs",
+        ],
+    ),
+    (
+        "saml",
+        &[
+            "url",
+            "idp_metadata",
+            "entity_id",
+            "sid_attribute",
+            "clock_skew_secs",
         ],
     ),
     ("target", &["id", "host", "port"]),
@@ -263,6 +277,71 @@ pub struct DirectoryConfig {
     pub check_interval_secs: u64,
 }
 
+/// The site's SAML 2.0 identity provider.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SamlConfig {
+    /// The address users open the proxy at, such as `https://access.example.com`. The assertion
+    /// consumer service is `<url>/api/saml/acs`.
+    pub url: String,
+    /// The identity provider's metadata file, exported by IT. Read at start.
+    pub idp_metadata: String,
+    /// This proxy's name at the identity provider. Default `<url>/api/saml/metadata`.
+    #[serde(default)]
+    pub entity_id: Option<String>,
+    /// The attribute that carries the account's SID.
+    #[serde(default = "default_sid_attribute")]
+    pub sid_attribute: String,
+    /// Clock difference allowed between this proxy and the identity provider, at most 300.
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_secs: u64,
+}
+
+impl SamlConfig {
+    fn base(&self) -> &str {
+        self.url.trim_end_matches('/')
+    }
+
+    pub fn acs_url(&self) -> String {
+        format!("{}/api/saml/acs", self.base())
+    }
+
+    pub fn entity_id(&self) -> String {
+        self.entity_id
+            .clone()
+            .unwrap_or_else(|| format!("{}/api/saml/metadata", self.base()))
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let rest = self
+            .url
+            .strip_prefix("https://")
+            .ok_or("url must start with https://: the sign-in cookie needs a secure page")?;
+        if rest.trim_end_matches('/').is_empty() || self.url.contains(['?', '#', ' ']) {
+            return Err(
+                "url must be the address users open, such as https://access.example.com".into(),
+            );
+        }
+        if self.idp_metadata.trim().is_empty() {
+            return Err("idp_metadata names no file".into());
+        }
+        if self.sid_attribute.trim().is_empty() {
+            return Err("sid_attribute is empty".into());
+        }
+        if self.clock_skew_secs > 300 {
+            return Err("clock_skew_secs must be at most 300".into());
+        }
+        Ok(())
+    }
+}
+
+fn default_sid_attribute() -> String {
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/primarysid".into()
+}
+
+fn default_clock_skew() -> u64 {
+    180
+}
+
 fn default_timeout() -> u64 {
     10
 }
@@ -315,6 +394,8 @@ pub enum ConfigError {
     Scan(String),
     #[error("directory: {0}")]
     Directory(String),
+    #[error("saml: {0}")]
+    Saml(String),
 }
 
 impl Config {
@@ -357,6 +438,16 @@ impl Config {
             return Err(ConfigError::AuditDays);
         }
         self.scan.check().map_err(ConfigError::Scan)?;
+        if let Some(s) = &self.saml {
+            s.check().map_err(ConfigError::Saml)?;
+            if self.service_account().is_none() {
+                return Err(ConfigError::Saml(
+                    "single sign-on finds accounts with the directory's service account; set \
+                     [directory] service_account"
+                        .into(),
+                ));
+            }
+        }
         let Some(d) = &self.directory else {
             if self.allow_local_accounts {
                 return Ok(());
@@ -521,7 +612,7 @@ verify = "insecure"
             .lines()
             .map(|l| {
                 l.strip_prefix("# ")
-                    .filter(|r| r.contains(" = "))
+                    .filter(|r| r.contains(" = ") || (r.starts_with('[') && r.ends_with(']')))
                     .unwrap_or(l)
             })
             .map(|l| format!("{l}\n"))
@@ -538,6 +629,45 @@ verify = "insecure"
             c.allow_local_accounts,
             "the commented keys were not uncommented"
         );
+        assert!(
+            c.saml.is_some(),
+            "the commented [saml] section was not read"
+        );
+    }
+
+    const SAML: &str =
+        "\n[saml]\nurl = \"https://access.corp.example.com/\"\nidp_metadata = \"idp.xml\"\n";
+
+    #[test]
+    fn single_sign_on_names_its_endpoints_from_the_url() {
+        let text = GOOD.replace("[directory]\n", "[directory]\nservice_account = \"svc\"\n") + SAML;
+        let s = Config::parse("t", &text).unwrap().saml.unwrap();
+        assert_eq!(s.acs_url(), "https://access.corp.example.com/api/saml/acs");
+        assert_eq!(
+            s.entity_id(),
+            "https://access.corp.example.com/api/saml/metadata"
+        );
+        assert_eq!(s.clock_skew_secs, 180);
+        assert!(s.sid_attribute.ends_with("/primarysid"));
+    }
+
+    #[test]
+    fn single_sign_on_needs_https_a_service_account_and_a_small_skew() {
+        let with_service =
+            GOOD.replace("[directory]\n", "[directory]\nservice_account = \"svc\"\n");
+        for bad in [
+            GOOD.to_owned() + SAML,
+            with_service.clone() + &SAML.replace("https://", "http://"),
+            with_service.clone() + &SAML.replace("/\"\n", "/?x=1\"\n"),
+            with_service.clone() + SAML + "clock_skew_secs = 301\n",
+            with_service.clone() + &SAML.replace("\"idp.xml\"", "\"\""),
+        ] {
+            assert!(
+                matches!(Config::parse("t", &bad), Err(ConfigError::Saml(_))),
+                "accepted: {bad}"
+            );
+        }
+        assert!(Config::parse("t", &(with_service + SAML + "clock_skew_secs = 300\n")).is_ok());
     }
 
     #[test]

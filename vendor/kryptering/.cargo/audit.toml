@@ -1,0 +1,43 @@
+# cargo-audit allow-list.
+#
+# Each entry documents *why* the advisory is ignored, what the upstream
+# fix looks like, and who has to move for kryptering to drop the entry.
+# The CI workflow at .github/workflows/audit.yml runs `cargo audit
+# --deny warnings` so this file is authoritative — an undocumented
+# transitive regression will break the build.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
+    # Severity 5.9 (medium). No fixed upgrade is available in the 0.9.x
+    # line; verified 2026-06-27: kryptering is already on rsa 0.9.10,
+    # the latest stable 0.9.x release, and crates.io only offers rsa
+    # 0.10.0-rc.x pre-releases beyond that. Kryptering's threat model
+    # for its direct consumers (server-side RSA private operations) does
+    # include this risk;
+    # callers for whom timing-side-channel resistance is load-bearing
+    # should route RSA private operations through an HSM via
+    # kryptering::pkcs11 rather than relying on the software path.
+    # Upstream: https://github.com/RustCrypto/RSA/issues/19
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0097 — rand 0.8.5 "unsound with a custom logger using
+    # rand::rng()". Pulled in transitively via num-bigint-dig (which rsa
+    # 0.9 and dsa 0.6 use) and also directly. The unsound pattern
+    # requires a caller to install a custom `log::Log` implementation
+    # that itself calls `rand::rng()`; kryptering installs no logger
+    # and does not reach for `rand::rng()` in any such context. The fix
+    # is in rand 0.9, but num-bigint-dig pins rand 0.8, so even bumping
+    # our direct dep would not remove the transitive 0.8 pull. Revisit
+    # when rsa / dsa / num-bigint-dig move to rand 0.9.
+    "RUSTSEC-2026-0097",
+
+    # Note — ml-dsa advisory posture:
+    # RUSTSEC-2025-0144 (timing side-channel in ML-DSA decomposition, fixed
+    # by replacing hardware division with constant-time Barrett reduction)
+    # is patched in ml-dsa >= 0.1.0-rc.3. Kryptering tracks ml-dsa 0.1.0
+    # (the stable final, >= the patched version), so this advisory does not
+    # fire against our Cargo.lock and needs no ignore entry. Revisit only if
+    # ml-dsa is ever pinned backward to < 0.1.0-rc.3.
+    # Upstream: https://github.com/RustCrypto/signatures/security/advisories/GHSA-hcp2-x6j4-29j7
+]

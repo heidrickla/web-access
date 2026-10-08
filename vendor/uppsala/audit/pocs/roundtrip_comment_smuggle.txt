@@ -1,0 +1,6 @@
+Round-trip injection via programmatically constructed comment.
+A DOM comment node whose text contains `-->` is serialized verbatim by
+`Document::to_xml()` / `XmlWriter::comment()`, producing output where the
+comment terminates early and subsequent chars become markup.
+
+Reproducer in tests/security_audit.rs::roundtrip_comment_smuggle.

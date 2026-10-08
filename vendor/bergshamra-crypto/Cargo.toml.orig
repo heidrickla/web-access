@@ -1,0 +1,28 @@
+[package]
+name = "bergshamra-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Cryptographic algorithm implementations for Bergshamra XML Security library"
+
+[features]
+default = ["rustcrypto", "legacy-algorithms", "post-quantum"]
+rustcrypto = ["kryptering/rustcrypto"]
+aws-lc = ["kryptering/aws-lc"]
+fips = ["aws-lc", "kryptering/fips"]
+legacy-algorithms = ["kryptering/legacy"]
+post-quantum = ["kryptering/post-quantum"]
+pkcs11 = ["kryptering/pkcs11"]
+
+[dependencies]
+bergshamra-core.workspace = true
+kryptering.workspace = true
+
+[dev-dependencies]
+hex = "0.4"
+rand.workspace = true
+rsa.workspace = true
+x25519-dalek.workspace = true

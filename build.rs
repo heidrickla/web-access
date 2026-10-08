@@ -11,6 +11,7 @@ const FILES: &[&str] = &[
     "app.js",
     "admin.js",
     "theme.js",
+    "saml-done.js",
     "ironrdp_web.js",
     "ironrdp_web_bg.wasm",
     "notices.html",

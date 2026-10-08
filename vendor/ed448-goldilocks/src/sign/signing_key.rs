@@ -1,0 +1,482 @@
+//! Much of this code is borrowed from Thomas Pornin's [CRRL Project](https://github.com/pornin/crrl/blob/main/src/ed448.rs)
+//! and adapted to mirror `ed25519-dalek`'s API.
+
+use crate::{sign::expanded::ExpandedSecretKey, *};
+use core::fmt::{self, Debug, Formatter};
+use elliptic_curve::{
+    common::Generate,
+    rand_core::TryCryptoRng,
+    zeroize::{Zeroize, ZeroizeOnDrop},
+};
+use shake::digest::{
+    Digest, ExtendableOutput, FixedOutput, FixedOutputReset, HashMarker, Update, XofReader,
+    common::BlockSizeUser, consts::U64, typenum::IsEqual,
+};
+use signature::Error;
+use subtle::{Choice, ConstantTimeEq};
+
+#[cfg(feature = "pkcs8")]
+use ::ed448::pkcs8::{KeypairBytes, PublicKeyBytes};
+
+/// Ed448 secret key as defined in [RFC8032 § 5.2.5]
+///
+/// The private key is 57 octets (448 bits, 56 bytes) long.
+pub type SecretKey = EdwardsScalarBytes;
+
+/// Signing hash trait for Ed448ph
+pub trait PreHash {
+    /// Fill the given `out` buffer with the hash bytes
+    fn fill_bytes(&mut self, out: &mut [u8]);
+}
+
+/// Signing pre-hasher for Ed448ph with a fixed output size
+#[derive(Debug)]
+pub struct PreHasherXmd<HashT>
+where
+    HashT: BlockSizeUser + Default + FixedOutput + FixedOutputReset + Update + HashMarker,
+    HashT::OutputSize: IsEqual<U64>,
+{
+    hasher: HashT,
+}
+
+impl<HashT> From<HashT> for PreHasherXmd<HashT>
+where
+    HashT: BlockSizeUser + Default + FixedOutput + FixedOutputReset + Update + HashMarker,
+    HashT::OutputSize: IsEqual<U64>,
+{
+    fn from(hasher: HashT) -> Self {
+        Self::new(hasher)
+    }
+}
+
+impl<HashT> PreHasherXmd<HashT>
+where
+    HashT: BlockSizeUser + Default + FixedOutput + FixedOutputReset + Update + HashMarker,
+    HashT::OutputSize: IsEqual<U64>,
+{
+    /// Create a new [`PreHasherXmd`] from a `HashT`
+    pub fn new(hasher: HashT) -> Self {
+        Self { hasher }
+    }
+}
+
+impl<HashT> PreHash for PreHasherXmd<HashT>
+where
+    HashT: BlockSizeUser + Default + FixedOutput + FixedOutputReset + Update + HashMarker,
+    HashT::OutputSize: IsEqual<U64>,
+{
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        out.copy_from_slice(self.hasher.finalize_reset().as_slice());
+    }
+}
+
+/// Signing pre-hasher for Ed448ph with a xof output
+pub struct PreHasherXof<HashT>
+where
+    HashT: Default + ExtendableOutput + Update,
+{
+    reader: <HashT as ExtendableOutput>::Reader,
+}
+
+impl<HashT> Debug for PreHasherXof<HashT>
+where
+    HashT: Default + ExtendableOutput + Update,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningPreHasherXof")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<HashT> PreHash for PreHasherXof<HashT>
+where
+    HashT: Default + ExtendableOutput + Update,
+{
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        self.reader.read(out);
+    }
+}
+
+impl<HashT> From<HashT> for PreHasherXof<HashT>
+where
+    HashT: Default + ExtendableOutput + Update,
+{
+    fn from(hasher: HashT) -> Self {
+        Self::new(hasher)
+    }
+}
+
+impl<HashT> PreHasherXof<HashT>
+where
+    HashT: Default + ExtendableOutput + Update,
+{
+    /// Create a new [`PreHasherXof`] from a `HashT`
+    pub fn new(hasher: HashT) -> Self {
+        Self {
+            reader: hasher.finalize_xof(),
+        }
+    }
+}
+
+/// Signing key for Ed448
+#[derive(Clone)]
+pub struct SigningKey {
+    pub(crate) secret: ExpandedSecretKey,
+}
+
+impl Debug for SigningKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("verifying_key", &self.secret.public_key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Generate for SigningKey {
+    fn try_generate_from_rng<R: TryCryptoRng + ?Sized>(rng: &mut R) -> Result<Self, R::Error> {
+        let mut secret_scalar = SecretKey::default();
+        rng.try_fill_bytes(secret_scalar.as_mut())?;
+        assert!(!secret_scalar.iter().all(|&v| v == 0));
+        Ok(Self {
+            secret: ExpandedSecretKey::from(&secret_scalar),
+        })
+    }
+}
+
+impl Zeroize for SigningKey {
+    fn zeroize(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl Drop for SigningKey {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SigningKey {}
+
+impl ConstantTimeEq for SigningKey {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.secret.seed.ct_eq(&other.secret.seed)
+    }
+}
+
+impl Eq for SigningKey {}
+
+impl PartialEq for SigningKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).into()
+    }
+}
+
+impl From<SecretKey> for SigningKey {
+    fn from(secret_scalar: SecretKey) -> Self {
+        Self::from(&secret_scalar)
+    }
+}
+
+impl From<&SecretKey> for SigningKey {
+    fn from(secret_scalar: &SecretKey) -> Self {
+        Self {
+            secret: ExpandedSecretKey::from(secret_scalar),
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl TryFrom<Vec<u8>> for SigningKey {
+    type Error = &'static str;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_slice())
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl TryFrom<&Vec<u8>> for SigningKey {
+    type Error = &'static str;
+
+    fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_slice())
+    }
+}
+
+impl TryFrom<&[u8]> for SigningKey {
+    type Error = &'static str;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() != SECRET_KEY_LENGTH {
+            return Err("Invalid length for a signing key");
+        }
+        Ok(Self::from(
+            EdwardsScalarBytes::try_from(value).expect("Invalid length"),
+        ))
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl TryFrom<Box<[u8]>> for SigningKey {
+    type Error = &'static str;
+
+    fn try_from(value: Box<[u8]>) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_ref())
+    }
+}
+
+impl<D> signature::DigestSigner<D, Signature> for SigningKey
+where
+    D: Default + FixedOutput + HashMarker + Update,
+{
+    fn try_sign_digest<F: Fn(&mut D) -> Result<(), Error>>(
+        &self,
+        f: F,
+    ) -> Result<Signature, Error> {
+        let mut digest = D::new();
+        f(&mut digest)?;
+        let sig = self.secret.sign_prehashed(&[], &digest.finalize())?;
+        Ok(sig.into())
+    }
+}
+
+impl signature::hazmat::PrehashSigner<Signature> for SigningKey {
+    fn sign_prehash(&self, prehash: &[u8]) -> Result<Signature, Error> {
+        let sig = self.secret.sign_prehashed(&[], prehash)?;
+        Ok(sig.into())
+    }
+}
+
+impl signature::Signer<Signature> for SigningKey {
+    fn try_sign(&self, msg: &[u8]) -> Result<Signature, Error> {
+        let sig = self.secret.sign_raw(msg)?;
+        Ok(sig.into())
+    }
+}
+
+impl<D> signature::DigestSigner<D, Signature> for Context<'_, '_, SigningKey>
+where
+    D: Default + FixedOutput + HashMarker + Update,
+{
+    fn try_sign_digest<F: Fn(&mut D) -> Result<(), Error>>(
+        &self,
+        f: F,
+    ) -> Result<Signature, Error> {
+        let mut digest = D::new();
+        f(&mut digest)?;
+        let sig = self
+            .key
+            .secret
+            .sign_prehashed(self.value, &digest.finalize())?;
+        Ok(sig.into())
+    }
+}
+
+impl signature::hazmat::PrehashSigner<Signature> for Context<'_, '_, SigningKey> {
+    fn sign_prehash(&self, prehash: &[u8]) -> Result<Signature, Error> {
+        let sig = self.key.secret.sign_prehashed(self.value, prehash)?;
+        Ok(sig.into())
+    }
+}
+
+impl signature::Signer<Signature> for Context<'_, '_, SigningKey> {
+    fn try_sign(&self, msg: &[u8]) -> Result<Signature, Error> {
+        let sig = self.key.secret.sign_ctx(self.value, msg)?;
+        Ok(sig.into())
+    }
+}
+
+impl<D> signature::DigestVerifier<D, Signature> for SigningKey
+where
+    D: Default + FixedOutput + HashMarker + Update,
+{
+    fn verify_digest<F: Fn(&mut D) -> Result<(), Error>>(
+        &self,
+        f: F,
+        signature: &Signature,
+    ) -> Result<(), Error> {
+        <VerifyingKey as signature::DigestVerifier<D, Signature>>::verify_digest(
+            &self.secret.public_key,
+            f,
+            signature,
+        )
+    }
+}
+
+impl signature::Verifier<Signature> for SigningKey {
+    fn verify(&self, msg: &[u8], signature: &Signature) -> Result<(), Error> {
+        self.secret.public_key.verify_raw(signature, msg)
+    }
+}
+
+#[cfg(all(feature = "alloc", feature = "pkcs8"))]
+impl pkcs8::EncodePrivateKey for SigningKey {
+    fn to_pkcs8_der(&self) -> pkcs8::Result<pkcs8::SecretDocument> {
+        KeypairBytes::from(self).to_pkcs8_der()
+    }
+}
+
+#[cfg(all(feature = "alloc", feature = "pkcs8"))]
+impl pkcs8::spki::DynSignatureAlgorithmIdentifier for SigningKey {
+    fn signature_algorithm_identifier(
+        &self,
+    ) -> pkcs8::spki::Result<pkcs8::spki::AlgorithmIdentifierOwned> {
+        // See https://datatracker.ietf.org/doc/html/rfc8410 for id-Ed448
+        Ok(pkcs8::spki::AlgorithmIdentifier {
+            oid: super::ALGORITHM_OID,
+            parameters: None,
+        })
+    }
+}
+
+#[cfg(feature = "pkcs8")]
+impl TryFrom<KeypairBytes> for SigningKey {
+    type Error = pkcs8::Error;
+
+    fn try_from(value: KeypairBytes) -> Result<Self, Self::Error> {
+        Self::try_from(&value)
+    }
+}
+
+#[cfg(feature = "pkcs8")]
+impl TryFrom<&KeypairBytes> for SigningKey {
+    type Error = pkcs8::Error;
+
+    fn try_from(value: &KeypairBytes) -> Result<Self, Self::Error> {
+        let signing_key =
+            SigningKey::from(SecretKey::try_from(&value.secret_key[..]).expect("invalid length"));
+
+        if let Some(public_bytes) = &value.public_key {
+            let verifying_key = VerifyingKey::from_bytes(public_bytes.as_ref())
+                .map_err(|_| pkcs8::KeyError::Invalid)?;
+            if signing_key.verifying_key() != verifying_key {
+                return Err(pkcs8::KeyError::Invalid.into());
+            }
+        }
+        Ok(signing_key)
+    }
+}
+
+#[cfg(feature = "pkcs8")]
+impl From<&SigningKey> for KeypairBytes {
+    fn from(signing_key: &SigningKey) -> Self {
+        KeypairBytes {
+            secret_key: signing_key.to_bytes().into(),
+            public_key: Some(PublicKeyBytes(signing_key.verifying_key().to_bytes())),
+        }
+    }
+}
+
+#[cfg(feature = "pkcs8")]
+impl TryFrom<pkcs8::PrivateKeyInfoRef<'_>> for SigningKey {
+    type Error = pkcs8::Error;
+
+    fn try_from(value: pkcs8::PrivateKeyInfoRef<'_>) -> Result<Self, Self::Error> {
+        KeypairBytes::try_from(value)?.try_into()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serdect::serde::Serialize for SigningKey {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serdect::serde::Serializer,
+    {
+        serdect::array::serialize_hex_lower_or_bin(&self.secret.seed, s)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serdect::serde::Deserialize<'de> for SigningKey {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serdect::serde::Deserializer<'de>,
+    {
+        let mut bytes = SecretKey::default();
+        serdect::array::deserialize_hex_or_bin(&mut bytes, d)?;
+        Ok(SigningKey::from(bytes))
+    }
+}
+
+impl SigningKey {
+    /// Serialize this [`SigningKey`] as bytes.
+    pub fn to_bytes(&self) -> SecretKey {
+        self.secret.seed
+    }
+
+    /// Serialize this [`SigningKey`] as a byte reference.
+    pub fn as_bytes(&self) -> &SecretKey {
+        &self.secret.seed
+    }
+
+    /// Return the clamped [`EdwardsScalar`] for this [`SigningKey`].
+    ///
+    /// This is the scalar that is actually used for signing.
+    /// Be warned, this is secret material that should be handled with care.
+    pub fn to_scalar(&self) -> EdwardsScalar {
+        self.secret.scalar
+    }
+
+    /// Get the [`VerifyingKey`] for this [`SigningKey`].
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.secret.public_key
+    }
+
+    /// Create a signing context that can be used for Ed448ph with
+    /// [`signature::DigestSigner`]
+    pub fn with_context<'k, 'v>(&'k self, context: &'v [u8]) -> Context<'k, 'v, Self> {
+        Context {
+            key: self,
+            value: context,
+        }
+    }
+
+    /// Sign a `message` with this [`SigningKey`] using the Ed448 algorithm
+    /// defined in [RFC8032 §5.2](https://datatracker.ietf.org/doc/html/rfc8032#section-5.2).
+    pub fn sign_raw(&self, message: &[u8]) -> Signature {
+        let sig = self
+            .secret
+            .sign_raw(message)
+            .expect("to succeed since no context is provided");
+        sig.into()
+    }
+
+    /// Sign a `message` in the given `context` with this [`SigningKey`] using the Ed448ph algorithm
+    /// defined in [RFC8032 §5.2](https://datatracker.ietf.org/doc/html/rfc8032#section-5.2).
+    pub fn sign_ctx(&self, context: &[u8], message: &[u8]) -> Result<Signature, Error> {
+        let sig = self.secret.sign_ctx(context, message)?;
+        Ok(sig.into())
+    }
+
+    /// Sign a `prehashed_message` with this [`SigningKey`] using the
+    /// Ed448ph algorithm defined in [RFC8032 §5.2](https://datatracker.ietf.org/doc/html/rfc8032#section-5.2).
+    pub fn sign_prehashed<D>(
+        &self,
+        context: Option<&[u8]>,
+        mut prehashed_message: D,
+    ) -> Result<Signature, Error>
+    where
+        D: PreHash,
+    {
+        let mut m = [0u8; 64];
+        prehashed_message.fill_bytes(&mut m);
+        let sig = self
+            .secret
+            .sign_prehashed(context.unwrap_or_default(), &m)?;
+        Ok(sig.into())
+    }
+}
+
+#[cfg(all(feature = "getrandom", feature = "serde"))]
+#[test]
+fn serialization() {
+    let signing_key = SigningKey::generate();
+
+    let bytes = serde_bare::to_vec(&signing_key).unwrap();
+    let signing_key2: SigningKey = serde_bare::from_slice(&bytes).unwrap();
+    assert_eq!(signing_key, signing_key2);
+
+    let string = serde_json::to_string(&signing_key).unwrap();
+    let signing_key3: SigningKey = serde_json::from_str(&string).unwrap();
+    assert_eq!(signing_key, signing_key3);
+}

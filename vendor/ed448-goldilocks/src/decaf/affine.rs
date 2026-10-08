@@ -1,0 +1,207 @@
+use crate::decaf::points::DecafPointRepr;
+use crate::{
+    Decaf448FieldBytes, DecafPoint, DecafScalar, ORDER,
+    curve::twedwards::affine::AffinePoint as InnerAffinePoint, field::FieldElement,
+};
+use elliptic_curve::{
+    CurveGroup, Error, Generate, ctutils,
+    group::{CurveAffine, GroupEncoding},
+    ops::{Mul, MulVartime, Neg},
+    point::{AffineCoordinates, NonIdentity},
+    zeroize::DefaultIsZeroes,
+};
+use rand_core::TryCryptoRng;
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
+
+/// Affine point on the twisted curve
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AffinePoint(pub(crate) InnerAffinePoint);
+
+impl AffinePoint {
+    /// The identity point
+    pub const IDENTITY: Self = Self(InnerAffinePoint::IDENTITY);
+
+    /// Convert to DecafPoint
+    pub fn to_decaf(&self) -> DecafPoint {
+        DecafPoint(self.0.to_extended())
+    }
+
+    /// The X coordinate
+    pub fn x(&self) -> [u8; 56] {
+        self.0.x.to_bytes()
+    }
+
+    /// The Y coordinate
+    pub fn y(&self) -> [u8; 56] {
+        self.0.y.to_bytes()
+    }
+}
+
+impl ConstantTimeEq for AffinePoint {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.x.ct_eq(&other.0.x) & self.0.y.ct_eq(&other.0.y)
+    }
+}
+
+impl ConditionallySelectable for AffinePoint {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        Self(InnerAffinePoint {
+            x: FieldElement::conditional_select(&a.0.x, &b.0.x, choice),
+            y: FieldElement::conditional_select(&a.0.y, &b.0.y, choice),
+        })
+    }
+}
+
+impl ctutils::CtEq for AffinePoint {
+    fn ct_eq(&self, other: &Self) -> ctutils::Choice {
+        ConstantTimeEq::ct_eq(self, other).into()
+    }
+}
+
+impl ctutils::CtSelect for AffinePoint {
+    fn ct_select(&self, other: &Self, choice: ctutils::Choice) -> Self {
+        ConditionallySelectable::conditional_select(self, other, choice.into())
+    }
+}
+
+impl PartialEq for AffinePoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).into()
+    }
+}
+
+impl Eq for AffinePoint {}
+
+impl AffineCoordinates for AffinePoint {
+    type FieldRepr = Decaf448FieldBytes;
+
+    fn from_coordinates(x: &Self::FieldRepr, y: &Self::FieldRepr) -> CtOption<Self> {
+        let point = Self(InnerAffinePoint {
+            x: FieldElement::from_bytes(&x.0),
+            y: FieldElement::from_bytes(&y.0),
+        });
+
+        CtOption::new(
+            point,
+            point.0.is_on_curve() & (point * DecafScalar::new(*ORDER)).ct_eq(&DecafPoint::IDENTITY),
+        )
+    }
+
+    fn x(&self) -> Self::FieldRepr {
+        Decaf448FieldBytes::from(self.x())
+    }
+
+    fn y(&self) -> Self::FieldRepr {
+        Decaf448FieldBytes::from(self.y())
+    }
+
+    fn x_is_odd(&self) -> Choice {
+        self.0.x.is_negative()
+    }
+
+    fn y_is_odd(&self) -> Choice {
+        self.0.y.is_negative()
+    }
+}
+
+impl CurveAffine for AffinePoint {
+    type Curve = DecafPoint;
+    type Scalar = DecafScalar;
+
+    fn identity() -> AffinePoint {
+        Self::IDENTITY
+    }
+
+    fn generator() -> AffinePoint {
+        DecafPoint::GENERATOR.to_affine()
+    }
+
+    fn is_identity(&self) -> Choice {
+        self.to_decaf().is_identity()
+    }
+
+    fn to_curve(&self) -> DecafPoint {
+        self.to_decaf()
+    }
+}
+
+impl DefaultIsZeroes for AffinePoint {}
+
+impl Generate for AffinePoint {
+    fn try_generate_from_rng<R: TryCryptoRng + ?Sized>(rng: &mut R) -> Result<Self, R::Error> {
+        DecafPoint::try_generate_from_rng(rng).map(Into::into)
+    }
+}
+
+impl GroupEncoding for AffinePoint {
+    type Repr = DecafPointRepr;
+
+    fn from_bytes(bytes: &Self::Repr) -> CtOption<Self> {
+        DecafPoint::from_bytes(bytes).map(|point| point.to_affine())
+    }
+
+    fn from_bytes_unchecked(bytes: &Self::Repr) -> CtOption<Self> {
+        // No unchecked conversion possible for compressed points
+        Self::from_bytes(bytes)
+    }
+
+    fn to_bytes(&self) -> Self::Repr {
+        self.to_decaf().to_bytes()
+    }
+}
+
+/// The constant-time alternative is available at [`NonIdentity::new()`].
+impl TryFrom<AffinePoint> for NonIdentity<AffinePoint> {
+    type Error = Error;
+
+    fn try_from(affine_point: AffinePoint) -> Result<Self, Error> {
+        NonIdentity::new(affine_point).into_option().ok_or(Error)
+    }
+}
+
+impl From<NonIdentity<AffinePoint>> for AffinePoint {
+    fn from(affine: NonIdentity<AffinePoint>) -> Self {
+        affine.to_point()
+    }
+}
+
+impl Mul<&DecafScalar> for &AffinePoint {
+    type Output = DecafPoint;
+
+    #[inline]
+    fn mul(self, scalar: &DecafScalar) -> DecafPoint {
+        self.to_decaf() * scalar
+    }
+}
+
+impl MulVartime<DecafScalar> for AffinePoint {
+    #[inline]
+    fn mul_vartime(self, scalar: DecafScalar) -> DecafPoint {
+        self.mul_vartime(&scalar)
+    }
+}
+
+impl MulVartime<&DecafScalar> for AffinePoint {
+    #[inline]
+    fn mul_vartime(self, scalar: &DecafScalar) -> DecafPoint {
+        // TODO(tarcieri): optimized vartime implementation
+        self.to_decaf() * scalar
+    }
+}
+
+impl MulVartime<&DecafScalar> for &AffinePoint {
+    #[inline]
+    fn mul_vartime(self, scalar: &DecafScalar) -> DecafPoint {
+        (*self).mul_vartime(scalar)
+    }
+}
+
+define_mul_variants!(LHS = AffinePoint, RHS = DecafScalar, Output = DecafPoint);
+
+impl Neg for AffinePoint {
+    type Output = AffinePoint;
+
+    fn neg(self) -> Self::Output {
+        self.to_decaf().neg().to_affine()
+    }
+}

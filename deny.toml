@@ -1,7 +1,11 @@
 # cargo deny check: advisories, licenses, bans, sources.
 
 [advisories]
-ignore = []
+ignore = [
+    # rsa, through bergshamra-keys: the Marvin attack recovers a private key from decryption timing.
+    # The proxy holds no RSA private key and only verifies SAML signatures with the IdP's public keys.
+    { id = "RUSTSEC-2023-0071", reason = "public-key verification only; no RSA private key in the process" },
+]
 
 [licenses]
 allow = [

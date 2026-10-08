@@ -133,6 +133,17 @@ async function showList() {
 
 $('retry').addEventListener('click', showList);
 
+// Single sign-on is offered beside the password when the proxy has an identity provider. Its links
+// leave the page for the identity provider and come back to the list.
+fetch('/api/sign-in-methods', { cache: 'no-store' })
+  .then(res => (res.ok ? res.json() : null))
+  .then(methods => {
+    const sso = Boolean(methods && methods.sso);
+    $('sso-offer').hidden = !sso;
+    $('renew-sso-offer').hidden = !sso;
+  })
+  .catch(() => { /* the password sign-in works the same without it */ });
+
 $('login-form').addEventListener('submit', async ev => {
   ev.preventDefault();
   const go = $('login-go');

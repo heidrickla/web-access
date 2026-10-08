@@ -1,0 +1,209 @@
+use crate::{DecafAffinePoint, DecafScalar, curve::scalar_mul::double_and_add};
+use core::{borrow::Borrow, iter::Sum};
+use elliptic_curve::{
+    CurveGroup,
+    ops::{Add, AddAssign, Mul, MulAssign, MulByGeneratorVartime, MulVartime, Neg, Sub, SubAssign},
+};
+
+use super::DecafPoint;
+
+/// Scalar Mul Operations
+impl Mul<&DecafScalar> for &DecafPoint {
+    type Output = DecafPoint;
+
+    fn mul(self, scalar: &DecafScalar) -> DecafPoint {
+        // XXX: We can do better than double and add
+        DecafPoint(double_and_add(&self.0, scalar.bits()).to_extended())
+    }
+}
+
+impl MulVartime<DecafScalar> for DecafPoint {
+    fn mul_vartime(self, scalar: DecafScalar) -> DecafPoint {
+        MulVartime::mul_vartime(&self, &scalar)
+    }
+}
+
+impl MulVartime<&DecafScalar> for DecafPoint {
+    fn mul_vartime(self, scalar: &DecafScalar) -> DecafPoint {
+        MulVartime::mul_vartime(&self, scalar)
+    }
+}
+
+impl MulVartime<&DecafScalar> for &DecafPoint {
+    fn mul_vartime(self, scalar: &DecafScalar) -> DecafPoint {
+        // TODO(tarcieri): optimized vartime implementation
+        self * scalar
+    }
+}
+
+impl MulByGeneratorVartime for DecafPoint {}
+
+define_mul_variants!(LHS = DecafPoint, RHS = DecafScalar, Output = DecafPoint);
+
+impl<'s> MulAssign<&'s DecafScalar> for DecafPoint {
+    fn mul_assign(&mut self, scalar: &'s DecafScalar) {
+        *self = *self * scalar;
+    }
+}
+impl MulAssign<DecafScalar> for DecafPoint {
+    fn mul_assign(&mut self, scalar: DecafScalar) {
+        *self = *self * scalar;
+    }
+}
+
+// Point addition
+
+impl Add<&DecafPoint> for &DecafPoint {
+    type Output = DecafPoint;
+
+    fn add(self, other: &DecafPoint) -> DecafPoint {
+        DecafPoint(self.0.add_extended(&other.0).to_extended())
+    }
+}
+
+impl Add<&DecafAffinePoint> for &DecafPoint {
+    type Output = DecafPoint;
+
+    fn add(self, rhs: &DecafAffinePoint) -> Self::Output {
+        self + DecafPoint(rhs.0.to_extended())
+    }
+}
+
+impl Add<&DecafPoint> for &DecafAffinePoint {
+    type Output = DecafPoint;
+
+    fn add(self, rhs: &DecafPoint) -> Self::Output {
+        DecafPoint(self.0.to_extended()) + rhs
+    }
+}
+
+define_add_variants!(LHS = DecafPoint, RHS = DecafPoint, Output = DecafPoint);
+define_add_variants!(
+    LHS = DecafPoint,
+    RHS = DecafAffinePoint,
+    Output = DecafPoint
+);
+define_add_variants!(
+    LHS = DecafAffinePoint,
+    RHS = DecafPoint,
+    Output = DecafPoint
+);
+
+impl AddAssign<&DecafPoint> for DecafPoint {
+    fn add_assign(&mut self, other: &DecafPoint) {
+        *self = *self + other;
+    }
+}
+impl AddAssign for DecafPoint {
+    fn add_assign(&mut self, other: DecafPoint) {
+        *self = *self + other;
+    }
+}
+
+impl AddAssign<&DecafAffinePoint> for DecafPoint {
+    fn add_assign(&mut self, other: &DecafAffinePoint) {
+        *self = *self + *other;
+    }
+}
+
+impl AddAssign<&DecafPoint> for DecafAffinePoint {
+    fn add_assign(&mut self, rhs: &DecafPoint) {
+        *self = (DecafPoint(self.0.to_extended()) + rhs).to_affine();
+    }
+}
+
+define_add_assign_variants!(LHS = DecafPoint, RHS = DecafAffinePoint);
+define_add_assign_variants!(LHS = DecafAffinePoint, RHS = DecafPoint);
+
+// Point Subtraction
+
+impl Sub<&DecafPoint> for &DecafPoint {
+    type Output = DecafPoint;
+
+    fn sub(self, other: &DecafPoint) -> DecafPoint {
+        DecafPoint(self.0.sub_extended(&other.0).to_extended())
+    }
+}
+
+impl Sub<&DecafAffinePoint> for &DecafPoint {
+    type Output = DecafPoint;
+
+    fn sub(self, rhs: &DecafAffinePoint) -> Self::Output {
+        self - DecafPoint(rhs.0.to_extended())
+    }
+}
+
+impl Sub<&DecafPoint> for &DecafAffinePoint {
+    type Output = DecafPoint;
+
+    fn sub(self, rhs: &DecafPoint) -> Self::Output {
+        DecafPoint(self.0.to_extended()) - rhs
+    }
+}
+
+define_sub_variants!(LHS = DecafPoint, RHS = DecafPoint, Output = DecafPoint);
+define_sub_variants!(
+    LHS = DecafPoint,
+    RHS = DecafAffinePoint,
+    Output = DecafPoint
+);
+define_sub_variants!(
+    LHS = DecafAffinePoint,
+    RHS = DecafPoint,
+    Output = DecafPoint
+);
+
+impl SubAssign<&DecafPoint> for DecafPoint {
+    fn sub_assign(&mut self, other: &DecafPoint) {
+        *self = *self - other;
+    }
+}
+impl SubAssign for DecafPoint {
+    fn sub_assign(&mut self, other: DecafPoint) {
+        *self = *self - other;
+    }
+}
+
+impl SubAssign<&DecafAffinePoint> for DecafPoint {
+    fn sub_assign(&mut self, other: &DecafAffinePoint) {
+        *self = *self - *other;
+    }
+}
+
+impl SubAssign<&DecafPoint> for DecafAffinePoint {
+    fn sub_assign(&mut self, rhs: &DecafPoint) {
+        *self = (DecafPoint(self.0.to_extended()) - rhs).to_affine();
+    }
+}
+
+define_sub_assign_variants!(LHS = DecafPoint, RHS = DecafAffinePoint);
+define_sub_assign_variants!(LHS = DecafAffinePoint, RHS = DecafPoint);
+
+// Point Negation
+
+impl Neg for &DecafPoint {
+    type Output = DecafPoint;
+
+    fn neg(self) -> DecafPoint {
+        DecafPoint(self.0.negate())
+    }
+}
+impl Neg for DecafPoint {
+    type Output = DecafPoint;
+
+    fn neg(self) -> DecafPoint {
+        (&self).neg()
+    }
+}
+
+impl<T> Sum<T> for DecafPoint
+where
+    T: Borrow<DecafPoint>,
+{
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = T>,
+    {
+        iter.fold(Self::IDENTITY, |acc, item| acc + item.borrow())
+    }
+}

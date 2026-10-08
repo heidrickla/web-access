@@ -1,0 +1,5395 @@
+#![forbid(unsafe_code)]
+
+//! XML-DSig signature verification.
+//!
+//! Processing order per spec Section 3.2:
+//! 1. Parse `<Signature>`, register ID attributes
+//! 2. Read `<SignedInfo>`: CanonicalizationMethod, SignatureMethod
+//! 3. For each `<Reference>`: resolve URI, run transforms, compute digest, compare
+//! 4. Resolve signing key from `<KeyInfo>`
+//! 5. Canonicalize `<SignedInfo>`
+//! 6. Verify `<SignatureValue>`
+
+use crate::context::{
+    local_reference_relative_path, read_existing_relative_file, url_map_matches, DsigContext,
+};
+use bergshamra_c14n::C14nMode;
+use bergshamra_core::{algorithm, ns, Error};
+use bergshamra_crypto::digest;
+use bergshamra_xml::nodeset::NodeSet;
+use bergshamra_xml::xpath;
+use std::collections::HashMap;
+use uppsala::{Document, NodeId, NodeKind, XmlWriter};
+
+/// Metadata about a single verified `<Reference>`.
+///
+/// Marked `#[non_exhaustive]`: construct it via the verifier rather than a
+/// struct literal, and match with `..`. This lets future fields be added
+/// without a breaking change for downstream code.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct VerifiedReference {
+    /// The URI attribute from the `<Reference>` element.
+    pub uri: String,
+    /// The resolved target node (if a same-document reference).
+    pub resolved_node: Option<NodeId>,
+    /// Whether the digest was actually computed and verified.
+    ///
+    /// This is `false` for `cid:` URI references (WS-Security MIME attachments),
+    /// which are skipped because the referenced content is outside the XML document.
+    /// Callers that process `cid:` references **must** verify attachment digests
+    /// separately.
+    pub digest_verified: bool,
+}
+
+/// Information about the key that was used to verify the signature.
+#[derive(Debug, Clone)]
+pub struct VerifiedKeyInfo {
+    /// Algorithm name (e.g., "RSA", "EC-P256", "HMAC").
+    pub algorithm: String,
+    /// Key name if resolved from KeysManager by name.
+    pub key_name: Option<String>,
+    /// DER-encoded X.509 certificate chain (leaf first), if present.
+    pub x509_chain: Vec<Vec<u8>>,
+}
+
+/// Result of signature verification.
+#[derive(Debug, Clone)]
+pub enum VerifyResult {
+    /// Signature is valid.
+    Valid {
+        /// The `<Signature>` element that was verified.
+        signature_node: NodeId,
+        /// The verified references and their resolved targets.
+        references: Vec<VerifiedReference>,
+        /// Information about the signing key used for verification.
+        key_info: VerifiedKeyInfo,
+    },
+    /// Signature is invalid.
+    Invalid {
+        /// Human-readable reason describing the verification failure.
+        reason: String,
+    },
+}
+
+impl VerifyResult {
+    /// Returns `true` when signature verification completed successfully.
+    ///
+    /// This checks only the outer signature result. Call
+    /// [`VerifyResult::all_reference_digests_verified`] as well when your
+    /// protocol requires every `<Reference>` digest to have been computed from
+    /// local bytes, because valid signatures can contain external `cid:`
+    /// references that Bergshamra reports but does not hash itself.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(self, VerifyResult::Valid { .. })
+    }
+
+    /// Returns `true` if the signature is valid but at least one `<Reference>`
+    /// digest was **not** computed and verified locally.
+    ///
+    /// In practice this means the document contains a `cid:` reference (a
+    /// WS-Security MIME attachment): the reference's URI, transforms, and
+    /// declared digest are integrity-protected by the signed `<SignedInfo>`,
+    /// but Bergshamra did not hash the external attachment bytes. Such callers
+    /// **must** verify the attachment digest out-of-band.
+    ///
+    /// Always `false` for [`VerifyResult::Invalid`].
+    #[must_use]
+    pub fn has_unverified_references(&self) -> bool {
+        matches!(
+            self,
+            VerifyResult::Valid { references, .. }
+                if references.iter().any(|r| !r.digest_verified)
+        )
+    }
+
+    /// Returns `true` only if the signature is valid, has at least one
+    /// `<Reference>`, and **every** reference digest was computed and verified
+    /// locally.
+    ///
+    /// Note the non-empty requirement: a `Valid` result with no references
+    /// provides no local digest coverage, so this returns `false` for it (as
+    /// well as for [`VerifyResult::Invalid`]). This is the inverse of
+    /// [`Self::has_unverified_references`] *except* for the zero-reference case,
+    /// where both methods return `false`.
+    #[must_use]
+    pub fn all_reference_digests_verified(&self) -> bool {
+        matches!(
+            self,
+            VerifyResult::Valid { references, .. }
+                if !references.is_empty() && references.iter().all(|r| r.digest_verified)
+        )
+    }
+}
+
+/// Return the reference-coverage policy failure for an otherwise valid signature.
+///
+/// `SignatureValue` authenticates `<SignedInfo>`, but payload integrity depends
+/// on a non-empty `<Reference>` list and every listed digest being verified
+/// locally. This helper keeps the software and HSM verifier paths on the same
+/// fail-closed policy.
+fn reference_digest_policy_failure(
+    ctx: &DsigContext,
+    references: &[VerifiedReference],
+) -> Option<&'static str> {
+    if !ctx.require_reference_digests {
+        return None;
+    }
+    if references.is_empty()
+        || references
+            .iter()
+            .all(|reference| !reference.digest_verified)
+    {
+        return Some("no Reference digests were verified locally");
+    }
+    if references
+        .iter()
+        .any(|reference| !reference.digest_verified)
+    {
+        return Some("one or more Reference digests were not verified locally");
+    }
+    None
+}
+
+/// Verify a signed XML document.
+///
+/// Verifies the **first** `<Signature>` element in document order. Documents that
+/// carry more than one signature -- for example a SAML Response signed at both
+/// the Response and the Assertion level -- should use [`verify_all`], which
+/// verifies every signature and exposes the references each one covers. A caller
+/// that must confirm a *specific* object is signed (such as the consumed
+/// Assertion) cannot rely on [`verify`] alone, because the object's signature
+/// may not be the first in the document.
+pub fn verify(ctx: &DsigContext, xml: &str) -> Result<VerifyResult, Error> {
+    let doc = uppsala::parse(xml).map_err(|e| Error::XmlParse(e.to_string()))?;
+    verify_document_with_source(ctx, &doc, Some(xml))
+}
+
+/// Verify the first `<Signature>` element in an already-parsed document.
+///
+/// This avoids reparsing XML for callers that already hold an `uppsala::Document`.
+/// Same-document C14N reference paths operate directly on the DOM. Less common
+/// transform paths serialize the current document lazily only when the generic
+/// transform pipeline requires XML text.
+pub fn verify_document(ctx: &DsigContext, doc: &Document<'_>) -> Result<VerifyResult, Error> {
+    verify_document_with_source(ctx, doc, None)
+}
+
+/// Verify the first `<Signature>` element using an already-parsed document and
+/// the source XML text it was parsed from.
+///
+/// Supplying `source_xml` lets generic transform fallbacks borrow the original
+/// input instead of serializing the document. Call this only when `source_xml`
+/// represents the current document state.
+pub fn verify_document_with_source(
+    ctx: &DsigContext,
+    doc: &Document<'_>,
+    source_xml: Option<&str>,
+) -> Result<VerifyResult, Error> {
+    let id_map = build_verify_id_map(ctx, doc)?;
+
+    // Find the first <Signature> element.
+    let sig_node = find_element(doc, ns::DSIG, ns::node::SIGNATURE)
+        .ok_or_else(|| Error::MissingElement("Signature".into()))?;
+
+    verify_signature_node(ctx, doc, source_xml, sig_node, &id_map)
+}
+
+/// Verify **every** `<Signature>` element in the document, returning one
+/// [`VerifyResult`] per signature in document order.
+///
+/// Enveloped SAML responses are commonly signed in more than one place (the
+/// Response element and each Assertion). [`verify`] reports only the first
+/// signature, so a caller that must confirm a particular object is covered could
+/// otherwise miss a perfectly valid signature that is not first in document
+/// order. This function verifies each signature independently and lets the
+/// caller decide which verified references it requires.
+///
+/// `Err` is returned only for *document-level* failures: a parse error, a
+/// duplicate-ID conflict while building the ID map, or no `<Signature>` element
+/// at all ([`Error::MissingElement`]). A *per-signature* structural or
+/// processing failure (missing `SignedInfo`, unsupported algorithm, malformed
+/// base64, a key that cannot be resolved, an XSW position violation, etc.) is
+/// **not** propagated — it is reported as a [`VerifyResult::Invalid`] entry for
+/// that signature so it cannot short-circuit and hide a valid signature
+/// elsewhere in the document. This is what makes "verify every signature"
+/// meaningful: one malformed signature among several must not blind the caller
+/// to the others. Callers must therefore inspect each entry rather than assume
+/// uniform success; the returned vector may mix [`VerifyResult::Valid`] and
+/// [`VerifyResult::Invalid`].
+pub fn verify_all(ctx: &DsigContext, xml: &str) -> Result<Vec<VerifyResult>, Error> {
+    let doc = uppsala::parse(xml).map_err(|e| Error::XmlParse(e.to_string()))?;
+    verify_all_document_with_source(ctx, &doc, Some(xml))
+}
+
+/// Verify every `<Signature>` element in an already-parsed document.
+pub fn verify_all_document(
+    ctx: &DsigContext,
+    doc: &Document<'_>,
+) -> Result<Vec<VerifyResult>, Error> {
+    verify_all_document_with_source(ctx, doc, None)
+}
+
+/// Verify every `<Signature>` element using an already-parsed document and,
+/// optionally, the source XML text it was parsed from.
+pub fn verify_all_document_with_source(
+    ctx: &DsigContext,
+    doc: &Document<'_>,
+    source_xml: Option<&str>,
+) -> Result<Vec<VerifyResult>, Error> {
+    let id_map = build_verify_id_map(ctx, doc)?;
+
+    let sig_nodes = find_all_elements(doc, ns::DSIG, ns::node::SIGNATURE);
+    if sig_nodes.is_empty() {
+        return Err(Error::MissingElement("Signature".into()));
+    }
+
+    let mut results = Vec::with_capacity(sig_nodes.len());
+    for sig_node in sig_nodes {
+        // A per-signature error must not abort verification of the rest: report
+        // it as Invalid for this signature and continue. Document-level errors
+        // are handled above, before the loop.
+        let result = match verify_signature_node(ctx, doc, source_xml, sig_node, &id_map) {
+            Ok(result) => result,
+            Err(e) => VerifyResult::Invalid {
+                reason: format!("signature could not be processed: {e}"),
+            },
+        };
+        results.push(result);
+    }
+    Ok(results)
+}
+
+/// Build the element-ID map used during verification, seeding the default SAML /
+/// XML id attribute names plus any extra names configured on the context.
+fn build_verify_id_map(
+    ctx: &DsigContext,
+    doc: &Document<'_>,
+) -> Result<std::collections::HashMap<String, NodeId>, Error> {
+    let mut id_attrs: Vec<&str> = vec!["Id", "ID", "id", "AssertionID"];
+    let extra: Vec<&str> = ctx.id_attrs.iter().map(|s| s.as_str()).collect();
+    id_attrs.extend(extra);
+    build_id_map(doc, &id_attrs)
+}
+
+/// Verify a single `<Signature>` element (`sig_node`) inside an already-parsed
+/// document. Shared by [`verify`] (first signature) and [`verify_all`] (each
+/// signature).
+fn verify_signature_node(
+    ctx: &DsigContext,
+    doc: &Document<'_>,
+    xml: Option<&str>,
+    sig_node: NodeId,
+    id_map: &std::collections::HashMap<String, NodeId>,
+) -> Result<VerifyResult, Error> {
+    // Find <SignedInfo>
+    let signed_info = find_child_element(doc, sig_node, ns::DSIG, ns::node::SIGNED_INFO)
+        .ok_or_else(|| Error::MissingElement("SignedInfo".into()))?;
+
+    // Read CanonicalizationMethod
+    let c14n_method_node = find_child_element(
+        doc,
+        signed_info,
+        ns::DSIG,
+        ns::node::CANONICALIZATION_METHOD,
+    )
+    .ok_or_else(|| Error::MissingElement("CanonicalizationMethod".into()))?;
+    let c14n_uri = doc
+        .element(c14n_method_node)
+        .and_then(|e| e.get_attribute(ns::attr::ALGORITHM))
+        .ok_or_else(|| Error::MissingAttribute("Algorithm on CanonicalizationMethod".into()))?;
+    let c14n_mode = C14nMode::from_uri(c14n_uri)
+        .ok_or_else(|| Error::UnsupportedAlgorithm(format!("C14N: {c14n_uri}")))?;
+
+    // Read SignatureMethod
+    let sig_method_node =
+        find_child_element(doc, signed_info, ns::DSIG, ns::node::SIGNATURE_METHOD)
+            .ok_or_else(|| Error::MissingElement("SignatureMethod".into()))?;
+    let sig_method_uri = doc
+        .element(sig_method_node)
+        .and_then(|e| e.get_attribute(ns::attr::ALGORITHM))
+        .ok_or_else(|| Error::MissingAttribute("Algorithm on SignatureMethod".into()))?;
+
+    // Parse HMACOutputLength for HMAC truncation (CVE-2009-0217)
+    let hmac_output_length_bits: Option<usize> =
+        if bergshamra_crypto::sign::is_hmac_algorithm(sig_method_uri) {
+            if let Some(len_node) =
+                find_child_element(doc, sig_method_node, ns::DSIG, ns::node::HMAC_OUTPUT_LENGTH)
+            {
+                let len_text = element_text(doc, len_node).unwrap_or("").trim();
+                let bits: usize = len_text
+                    .parse()
+                    .map_err(|_| Error::XmlStructure("invalid HMACOutputLength value".into()))?;
+                // Validate: must be a multiple of 8
+                if !bits.is_multiple_of(8) {
+                    return Ok(VerifyResult::Invalid {
+                        reason: "HMACOutputLength must be a multiple of 8".into(),
+                    });
+                }
+                // Validate minimum truncation per W3C recommendation (CVE-2009-0217)
+                // Only enforce when hmac_min_out_len is explicitly set (matching xmlsec behavior)
+                if ctx.hmac_min_out_len > 0 && bits < ctx.hmac_min_out_len {
+                    return Ok(VerifyResult::Invalid {
+                        reason: format!(
+                            "HMACOutputLength {bits} bits is below minimum {} bits (CVE-2009-0217)",
+                            ctx.hmac_min_out_len
+                        ),
+                    });
+                }
+                Some(bits)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // Extract PQ context string from <MLDSAContextString> or <SLHDSAContextString>
+    let pq_context: Option<Vec<u8>> = if bergshamra_crypto::sign::is_pq_algorithm(sig_method_uri) {
+        let ctx_node = find_child_element(
+            doc,
+            sig_method_node,
+            ns::XMLSEC_PQ,
+            ns::node::MLDSA_CONTEXT_STRING,
+        )
+        .or_else(|| {
+            find_child_element(
+                doc,
+                sig_method_node,
+                ns::XMLSEC_PQ,
+                ns::node::SLHDSA_CONTEXT_STRING,
+            )
+        });
+        if let Some(cn) = ctx_node {
+            let b64 = element_text(doc, cn).unwrap_or("").trim();
+            if b64.is_empty() {
+                None
+            } else {
+                use base64::Engine;
+                let engine = base64::engine::general_purpose::STANDARD;
+                let decoded = engine
+                    .decode(b64)
+                    .map_err(|e| Error::Base64(format!("PQ context string: {e}")))?;
+                Some(decoded)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Read exc-C14N PrefixList if applicable
+    let inclusive_prefixes = read_inclusive_prefixes(doc, c14n_method_node);
+
+    // 3. Verify each Reference
+    let references = find_child_elements(doc, signed_info, ns::DSIG, ns::node::REFERENCE);
+    let mut verified_refs = Vec::with_capacity(references.len());
+    for reference in &references {
+        let (mismatch, vref) = verify_reference(
+            *reference,
+            doc,
+            id_map,
+            xml,
+            sig_node,
+            &ctx.url_maps,
+            ctx.debug,
+            ctx.base_dir.as_deref(),
+        )?;
+        verified_refs.push(vref);
+        if let Some(reason) = mismatch {
+            return Ok(VerifyResult::Invalid {
+                reason: format!("Reference digest failed: {reason}"),
+            });
+        }
+    }
+
+    // 3b. Strict mode: validate reference target positions
+    if ctx.strict_verification {
+        for vref in &verified_refs {
+            if let Some(target) = vref.resolved_node {
+                validate_reference_position(doc, sig_node, target)?;
+            }
+        }
+    }
+
+    // 5. Canonicalize <SignedInfo>
+    // We need to canonicalize the SignedInfo element as a document subset
+    let signed_info_ns = NodeSet::tree_without_comments(signed_info, doc);
+    let c14n_signed_info = bergshamra_c14n::canonicalize_doc(
+        doc,
+        c14n_mode,
+        Some(&signed_info_ns),
+        &inclusive_prefixes,
+    )?;
+
+    if ctx.debug {
+        eprintln!("== PreSigned data - start buffer:");
+        eprint!("{}", String::from_utf8_lossy(&c14n_signed_info));
+        eprintln!("\n== PreSigned data - end buffer");
+    }
+
+    // 6. Verify SignatureValue
+    let sig_value_node = find_child_element(doc, sig_node, ns::DSIG, ns::node::SIGNATURE_VALUE)
+        .ok_or_else(|| Error::MissingElement("SignatureValue".into()))?;
+    let sig_value_b64 = element_text(doc, sig_value_node).unwrap_or("").trim();
+    let sig_value_clean: String = sig_value_b64
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let sig_value = engine
+        .decode(&sig_value_clean)
+        .map_err(|e| Error::Base64(format!("SignatureValue: {e}")))?;
+
+    // Validate HMAC truncation length against decoded signature
+    if let Some(bits) = hmac_output_length_bits {
+        let expected_bytes = bits / 8;
+        if sig_value.len() != expected_bytes {
+            return Ok(VerifyResult::Invalid {
+                reason: format!(
+                    "SignatureValue length {} bytes does not match HMACOutputLength {} bits ({} bytes)",
+                    sig_value.len(), bits, expected_bytes
+                ),
+            });
+        }
+    }
+
+    // HSM verifier path — key material stays on the HSM.
+    if let Some(ref hsm_verifier) = ctx.hsm_verifier {
+        // Cross-check the verifier's algorithm against the XML <SignatureMethod>
+        // URI. The HSM verifier always verifies with its own configured
+        // algorithm; if that disagrees with what the document declares, a naive
+        // pass would report `Valid` for a signature over an algorithm the XML
+        // never claimed (or silently accept an algorithm-confusion attempt).
+        // Treat a mismatch as an invalid signature rather than a hard error so
+        // callers get a normal verification verdict.
+        let verifier_uri =
+            bergshamra_crypto::sign::kryptering_algorithm_uri(hsm_verifier.algorithm());
+        if verifier_uri != Some(sig_method_uri) {
+            return Ok(VerifyResult::Invalid {
+                reason: format!(
+                    "SignatureMethod {sig_method_uri} does not match HSM verifier algorithm {:?} (URI {})",
+                    hsm_verifier.algorithm(),
+                    verifier_uri.unwrap_or("<unmapped>"),
+                ),
+            });
+        }
+        let valid = hsm_verifier
+            .verify(&c14n_signed_info, &sig_value)
+            .map_err(crate::map_kryptering_err)?;
+
+        return if valid {
+            if let Some(reason) = reference_digest_policy_failure(ctx, &verified_refs) {
+                Ok(VerifyResult::Invalid {
+                    reason: reason.to_owned(),
+                })
+            } else {
+                Ok(VerifyResult::Valid {
+                    signature_node: sig_node,
+                    references: verified_refs,
+                    key_info: VerifiedKeyInfo {
+                        algorithm: format!("{:?}", hsm_verifier.algorithm()),
+                        key_name: None,
+                        x509_chain: Vec::new(),
+                    },
+                })
+            }
+        } else {
+            Ok(VerifyResult::Invalid {
+                reason: "signature value verification failed (HSM)".into(),
+            })
+        };
+    }
+
+    // Software key path — resolve key from KeyInfo / KeysManager.
+
+    // 4. Resolve signing key
+    // When trusted_keys_only is set, skip inline key extraction and only use
+    // keys from the KeysManager. This is the secure mode for SAML: we only
+    // trust pre-configured IdP keys, not whatever cert an attacker embeds.
+    let key_info_node = find_child_element(doc, sig_node, ns::DSIG, ns::node::KEY_INFO);
+    let mut key_from_x509 = false;
+    let mut key_from_raw_inline_keyinfo = false;
+    let mut key_from_manager = false;
+    // extracted_key holds ownership when key is extracted from inline KeyInfo.
+    // The initial `None` is overwritten in every branch before being read, but
+    // the variable must be declared here so the borrow in the `else if` branch
+    // lives long enough.
+    #[allow(unused_assignments)]
+    let mut extracted_key: Option<bergshamra_keys::Key> = None;
+    let key = if ctx.trusted_keys_only {
+        // Secure mode: only use keys from the manager, never inline keys
+        if let Some(ki) = key_info_node {
+            let effective_ki = resolve_key_info_reference(doc, ki, id_map).unwrap_or(ki);
+            let k =
+                bergshamra_keys::keyinfo::resolve_key_info(effective_ki, doc, &ctx.keys_manager)
+                    .or_else(|_| ctx.keys_manager.first_key())?;
+            if ctx.debug {
+                eprintln!(
+                    "== Key: resolved from manager (trusted_keys_only) ({})",
+                    k.data.algorithm_name()
+                );
+            }
+            key_from_manager = true;
+            k
+        } else {
+            let k = ctx.keys_manager.first_key()?;
+            if ctx.debug {
+                eprintln!(
+                    "== Key: first key from manager (trusted_keys_only) ({})",
+                    k.data.algorithm_name()
+                );
+            }
+            key_from_manager = true;
+            k
+        }
+    } else if let Some(ki) = key_info_node {
+        // Standard mode: try inline KeyValue (RSA/EC public key embedded in XML),
+        // then try EncryptedKey unwrap, then fall back to KeysManager lookup.
+        let effective_ki = resolve_key_info_reference(doc, ki, id_map).unwrap_or(ki);
+        let prefer_anchorable_inline_key = !ctx.insecure
+            && ctx.keys_manager.has_trusted_certs()
+            && !ctx.allow_raw_inline_keyinfo_with_trust_anchors;
+        let inline_key = if prefer_anchorable_inline_key {
+            bergshamra_keys::keyinfo::extract_x509_key_value(effective_ki, doc)
+                .or_else(|| bergshamra_keys::keyinfo::extract_key_value(effective_ki, doc))
+        } else {
+            bergshamra_keys::keyinfo::extract_key_value(effective_ki, doc)
+        };
+        extracted_key = if let Some(key) = inline_key {
+            // `extract_key_value` accepts both certificate-backed `<X509Data>`
+            // and raw inline key material (`<KeyValue>` / `<DEREncodedKeyValue>`).
+            // Under an anchored policy we prefer `<X509Data>` first, so a raw
+            // key does not block a later certificate chain that can satisfy the
+            // configured anchors.
+            key_from_raw_inline_keyinfo = key.x509_chain.is_empty();
+            Some(key)
+        } else {
+            try_unwrap_encrypted_key(doc, effective_ki, &ctx.keys_manager).ok()
+        }
+        .or_else(|| {
+            try_resolve_retrieval_method(doc, effective_ki, ctx.base_dir.as_deref(), &ctx.url_maps)
+        })
+        .or_else(|| try_resolve_retrieval_method_inline(doc, effective_ki, id_map));
+        if let Some(ref ek) = extracted_key {
+            if ctx.debug {
+                eprintln!(
+                    "== Key: extracted inline key ({})",
+                    ek.data.algorithm_name()
+                );
+            }
+            // Check if this key came from an X509Certificate
+            if !ek.x509_chain.is_empty() {
+                key_from_x509 = true;
+            }
+            ek
+        } else {
+            let k =
+                bergshamra_keys::keyinfo::resolve_key_info(effective_ki, doc, &ctx.keys_manager)?;
+            if ctx.debug {
+                eprintln!(
+                    "== Key: resolved from manager ({})",
+                    k.data.algorithm_name()
+                );
+            }
+            key_from_manager = true;
+            k
+        }
+    } else {
+        let k = ctx.keys_manager.first_key()?;
+        if ctx.debug {
+            eprintln!(
+                "== Key: first key from manager ({})",
+                k.data.algorithm_name()
+            );
+        }
+        key_from_manager = true;
+        k
+    };
+
+    // 4b. X.509 certificate chain validation
+    if !ctx.insecure {
+        // When the caller has configured trust anchors, any key that carries an
+        // X.509 chain — including an inline <X509Certificate> an attacker may
+        // have embedded — must chain to one of those anchors, even if neither
+        // `enabled_key_data_x509` nor `verify_keys` is set. Without this clause a
+        // signature could verify against an attacker-supplied cert while the
+        // configured anchors are silently ignored (CVE-class trust bypass).
+        let has_trusted_anchors = ctx.keys_manager.has_trusted_certs();
+        if has_trusted_anchors
+            && key_from_raw_inline_keyinfo
+            && !ctx.allow_raw_inline_keyinfo_with_trust_anchors
+        {
+            return Err(Error::Key(
+                "raw inline KeyInfo key is not trusted when trust anchors are configured".into(),
+            ));
+        }
+
+        let needs_x509_validation = (ctx.enabled_key_data_x509 && key_from_x509)
+            || (ctx.verify_keys && key_from_manager && !key.x509_chain.is_empty())
+            || (has_trusted_anchors && !key.x509_chain.is_empty());
+
+        if needs_x509_validation && !key.x509_chain.is_empty() {
+            let config = bergshamra_keys::x509::CertValidationConfig {
+                trusted_certs: ctx.keys_manager.trusted_certs(),
+                untrusted_certs: ctx.keys_manager.untrusted_certs(),
+                crls: ctx.keys_manager.crls(),
+                verification_time: ctx.verification_time.as_deref(),
+                skip_time_checks: ctx.skip_time_checks,
+            };
+            // The first cert in x509_chain is the leaf
+            let leaf_der = &key.x509_chain[0];
+            bergshamra_keys::x509::validate_cert_chain(leaf_der, &key.x509_chain, &config)?;
+            if ctx.debug {
+                eprintln!("== X.509 certificate chain: valid");
+            }
+        } else if ctx.enabled_key_data_x509 && !key_from_x509 && !key_from_manager {
+            // enabled-key-data x509 was requested but no X509 data found
+            // This is not an error by itself — the test framework handles this
+        }
+    }
+
+    let signing_key = key
+        .to_signing_key()?
+        .ok_or_else(|| Error::Key("no signing key available".into()))?;
+
+    let sig_alg = bergshamra_crypto::sign::from_uri_with_context(sig_method_uri, pq_context)?;
+    // When the XML carries an <HMACOutputLength> (parsed earlier and already
+    // checked against the CVE-2009-0217 floor in ctx.hmac_min_out_len), route
+    // through verify_truncated so the signature can be shorter than the
+    // full HMAC. For every other algorithm the default impl reduces to the
+    // usual verify() path.
+    let valid = if let Some(bits) = hmac_output_length_bits {
+        sig_alg.verify_truncated(&signing_key, &c14n_signed_info, &sig_value, bits / 8)?
+    } else {
+        sig_alg.verify(&signing_key, &c14n_signed_info, &sig_value)?
+    };
+
+    if valid {
+        if let Some(reason) = reference_digest_policy_failure(ctx, &verified_refs) {
+            return Ok(VerifyResult::Invalid {
+                reason: reason.to_owned(),
+            });
+        }
+        Ok(VerifyResult::Valid {
+            signature_node: sig_node,
+            references: verified_refs,
+            key_info: VerifiedKeyInfo {
+                algorithm: key.data.algorithm_name().to_owned(),
+                key_name: key.name.clone(),
+                x509_chain: key.x509_chain.clone(),
+            },
+        })
+    } else {
+        Ok(VerifyResult::Invalid {
+            reason: "signature value verification failed".into(),
+        })
+    }
+}
+
+/// Verify a single <Reference> element.
+///
+/// Returns `Ok((None, vref))` if the digest matches, `Ok((Some(reason), vref))` if it
+/// does not match. The `VerifiedReference` carries the URI and resolved target node.
+#[allow(clippy::too_many_arguments)]
+fn verify_reference(
+    reference: NodeId,
+    doc: &Document<'_>,
+    id_map: &HashMap<String, NodeId>,
+    xml: Option<&str>,
+    sig_node: NodeId,
+    url_maps: &[(String, String)],
+    debug: bool,
+    base_dir: Option<&str>,
+) -> Result<(Option<String>, VerifiedReference), Error> {
+    // Read URI attribute
+    let uri = doc
+        .element(reference)
+        .and_then(|e| e.get_attribute(ns::attr::URI))
+        .unwrap_or("");
+
+    // Skip cid: URIs — these reference MIME attachments outside the XML document
+    // (common in WS-Security). The caller must verify attachment digests separately.
+    // See docs/adr/0002-cid-uri-scheme-skip.md
+    if uri.starts_with("cid:") {
+        return Ok((
+            None,
+            VerifiedReference {
+                uri: uri.to_owned(),
+                resolved_node: None,
+                digest_verified: false,
+            },
+        ));
+    }
+
+    // Read DigestMethod
+    let digest_method_node = find_child_element(doc, reference, ns::DSIG, ns::node::DIGEST_METHOD)
+        .ok_or_else(|| Error::MissingElement("DigestMethod".into()))?;
+    let digest_uri = doc
+        .element(digest_method_node)
+        .and_then(|e| e.get_attribute(ns::attr::ALGORITHM))
+        .ok_or_else(|| Error::MissingAttribute("Algorithm on DigestMethod".into()))?;
+
+    // Read expected DigestValue
+    let digest_value_node = find_child_element(doc, reference, ns::DSIG, ns::node::DIGEST_VALUE)
+        .ok_or_else(|| Error::MissingElement("DigestValue".into()))?;
+    let expected_b64 = element_text(doc, digest_value_node).unwrap_or("").trim();
+    let expected_clean: String = expected_b64
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let expected_digest = engine
+        .decode(&expected_clean)
+        .map_err(|e| Error::Base64(format!("DigestValue: {e}")))?;
+
+    // Read transforms once, then try the narrow same-document C14N fast path.
+    // In debug mode we deliberately skip the streaming digest fast path because
+    // callers asked to see the exact pre-digest bytes.
+    let transforms_node = find_child_element(doc, reference, ns::DSIG, ns::node::TRANSFORMS);
+    if !debug {
+        if let Some((computed, resolved_node)) =
+            try_fast_reference_digest(doc, id_map, uri, sig_node, transforms_node, digest_uri)?
+        {
+            let vref = VerifiedReference {
+                uri: uri.to_owned(),
+                resolved_node,
+                digest_verified: true,
+            };
+            return Ok(compare_reference_digest(
+                uri,
+                computed,
+                &expected_digest,
+                vref,
+            ));
+        }
+    }
+
+    let (bytes, resolved_node, debug_pre_digest_bytes) = if let Some((bytes, resolved_node)) =
+        try_fast_reference_bytes(doc, id_map, uri, sig_node, transforms_node)?
+    {
+        (bytes, resolved_node, true)
+    } else {
+        // Resolve URI and get initial data for the generic transform pipeline.
+        let owned_xml;
+        let xml_text = match xml {
+            Some(xml) => xml,
+            None => {
+                owned_xml = doc.to_xml();
+                &owned_xml
+            }
+        };
+        let resolved = resolve_reference_uri(uri, doc, id_map, xml_text, url_maps, base_dir)?;
+        let (mut data, resolved_node, debug_pre_digest_bytes) = match resolved {
+            ResolvedUri::Xml {
+                xml_text,
+                node_set,
+                resolved_node,
+            } => (
+                bergshamra_transforms::TransformData::xml_borrowed(xml_text, node_set),
+                resolved_node,
+                true,
+            ),
+            ResolvedUri::Binary {
+                bytes,
+                debug_pre_digest_bytes,
+            } => (
+                bergshamra_transforms::TransformData::Binary(bytes),
+                None,
+                debug_pre_digest_bytes,
+            ),
+        };
+
+        if let Some(transforms) = transforms_node {
+            for transform_node in doc.children(transforms) {
+                let is_transform_elem = doc
+                    .element(transform_node)
+                    .is_some_and(|e| e.name.local_name.as_ref() == ns::node::TRANSFORM);
+                if !is_transform_elem {
+                    continue;
+                }
+                let transform_uri = doc
+                    .element(transform_node)
+                    .and_then(|e| e.get_attribute(ns::attr::ALGORITHM))
+                    .unwrap_or("");
+
+                data = apply_transform(transform_uri, data, transform_node, sig_node, doc)?;
+            }
+        }
+
+        (data.to_binary()?, resolved_node, debug_pre_digest_bytes)
+    };
+
+    let vref = VerifiedReference {
+        uri: uri.to_owned(),
+        resolved_node,
+        digest_verified: true,
+    };
+
+    if debug {
+        eprintln!("== PreDigest data - start buffer (URI={uri}):");
+        if debug_pre_digest_bytes {
+            eprint!("{}", String::from_utf8_lossy(&bytes));
+        } else {
+            eprintln!("[external reference bytes redacted: {} bytes]", bytes.len());
+        }
+        eprintln!("\n== PreDigest data - end buffer");
+    }
+
+    // Compute digest
+    let computed = digest::digest(digest_uri, &bytes)?;
+    Ok(compare_reference_digest(
+        uri,
+        computed,
+        &expected_digest,
+        vref,
+    ))
+}
+
+/// Resolved URI data — either XML (same-document) or raw binary (external).
+enum ResolvedUri<'a> {
+    /// Same-document XML data. The XML text borrows the original verifier input
+    /// instead of allocating a second full string for the transform pipeline.
+    Xml {
+        /// Original XML input buffer.
+        xml_text: &'a str,
+        /// Optional node-set selected by URI resolution.
+        node_set: Option<NodeSet>,
+        /// The node that this reference resolved to (for same-document ID refs).
+        resolved_node: Option<NodeId>,
+    },
+    /// External or mapped URI bytes.
+    Binary {
+        /// Detached bytes read from a caller-mapped or local relative source.
+        bytes: Vec<u8>,
+        /// Whether verifier debug output may print the bytes before the outer
+        /// signature is known to be valid.
+        debug_pre_digest_bytes: bool,
+    },
+}
+
+/// Compare a computed reference digest with the expected digest and return the
+/// verifier's per-reference result shape.
+///
+/// The `VerifiedReference` is returned in both success and failure cases so the
+/// caller can include coverage metadata in error reporting.
+fn compare_reference_digest(
+    uri: &str,
+    computed: Vec<u8>,
+    expected_digest: &[u8],
+    vref: VerifiedReference,
+) -> (Option<String>, VerifiedReference) {
+    if computed == expected_digest {
+        (None, vref)
+    } else {
+        (
+            Some(format!(
+                "URI={uri}: expected digest does not match computed digest"
+            )),
+            vref,
+        )
+    }
+}
+
+/// C14N sink that feeds canonical bytes into a digest stream.
+///
+/// Verification only needs the digest result on the fast path, so this avoids
+/// holding the full canonicalized reference bytes unless `--debug` requested
+/// them.
+struct ReferenceDigestSink {
+    inner: Box<dyn digest::DigestAlgorithm>,
+}
+
+impl ReferenceDigestSink {
+    /// Create a digest sink for an XML Security digest algorithm URI.
+    fn new(uri: &str) -> Result<Self, Error> {
+        Ok(Self {
+            inner: digest::from_uri(uri)?,
+        })
+    }
+
+    /// Finalize the digest stream and return the computed digest bytes.
+    fn finalize(self) -> Result<Vec<u8>, Error> {
+        self.inner.finalize()
+    }
+}
+
+impl bergshamra_c14n::C14nSink for ReferenceDigestSink {
+    /// Feed canonicalized bytes into the underlying digest.
+    fn write(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
+}
+
+/// Fast-path reference bytes plus the resolved same-document node, when known.
+type FastReferenceBytes = (Vec<u8>, Option<NodeId>);
+
+/// Fast-path selected node-set plus the resolved same-document node, when known.
+type FastReferenceNodeSet = (Option<NodeSet>, Option<NodeId>);
+
+/// Canonicalization mode, InclusiveNamespaces PrefixList, and selected node-set.
+type FastC14nParams = (C14nMode, Vec<String>, Option<NodeSet>);
+
+/// Compute a reference digest through the streaming fast C14N path.
+///
+/// Returns `Ok(None)` when the URI or transform list is not eligible for the
+/// fast path. The caller must then execute the generic XML-DSig transform
+/// pipeline.
+fn try_fast_reference_digest(
+    doc: &Document<'_>,
+    id_map: &HashMap<String, NodeId>,
+    uri: &str,
+    sig_node: NodeId,
+    transforms_node: Option<NodeId>,
+    digest_uri: &str,
+) -> Result<Option<FastReferenceBytes>, Error> {
+    let Some((node_set, resolved_node)) = fast_reference_node_set(doc, id_map, uri)? else {
+        return Ok(None);
+    };
+    let Some((c14n_mode, inclusive_prefixes, node_set)) =
+        fast_reference_c14n_params(doc, sig_node, node_set, transforms_node)?
+    else {
+        return Ok(None);
+    };
+
+    let mut sink = ReferenceDigestSink::new(digest_uri)?;
+    bergshamra_c14n::canonicalize_doc_to(
+        doc,
+        c14n_mode,
+        node_set.as_ref(),
+        &inclusive_prefixes,
+        &mut sink,
+    )?;
+    Ok(Some((sink.finalize()?, resolved_node)))
+}
+
+/// Return canonicalized reference bytes through the fast path.
+///
+/// This is used when debug output is enabled, because the verifier must print
+/// the pre-digest buffer before hashing it. Non-debug verification uses
+/// [`try_fast_reference_digest`] to avoid allocating this buffer.
+fn try_fast_reference_bytes(
+    doc: &Document<'_>,
+    id_map: &HashMap<String, NodeId>,
+    uri: &str,
+    sig_node: NodeId,
+    transforms_node: Option<NodeId>,
+) -> Result<Option<FastReferenceBytes>, Error> {
+    let Some((node_set, resolved_node)) = fast_reference_node_set(doc, id_map, uri)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = try_fast_reference_c14n_bytes(doc, sig_node, node_set, transforms_node)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((bytes, resolved_node)))
+}
+
+/// Resolve a same-document URI into the node-set shape used by the fast path.
+///
+/// Returns:
+///
+/// - `Ok(None)` for external or unsupported URI forms.
+/// - `Ok(Some((None, None)))` for `#xpointer(/)`, meaning the whole parsed
+///   document is selected and there is no specific resolved element.
+/// - `Ok(Some((Some(node_set), resolved_node)))` for empty URI, bare `#id`, and
+///   `#xpointer(id(...))`.
+///
+/// The returned `resolved_node` is preserved for strict XSW position checks.
+fn fast_reference_node_set(
+    doc: &Document<'_>,
+    id_map: &HashMap<String, NodeId>,
+    uri: &str,
+) -> Result<Option<FastReferenceNodeSet>, Error> {
+    if uri.is_empty() {
+        return Ok(Some((Some(NodeSet::all_without_comments(doc)), None)));
+    }
+
+    let Some(fragment) = xpath::parse_same_document_ref(uri) else {
+        return Ok(None);
+    };
+
+    if fragment == "xpointer(/)" {
+        return Ok(Some((None, None)));
+    }
+
+    // Per W3C: bare `#id` excludes comments, `#xpointer(id('...'))` includes them.
+    let is_xpointer = xpath::parse_xpointer_id(fragment).is_some();
+    let id = xpath::parse_xpointer_id(fragment).unwrap_or(fragment);
+    let resolved_node = xpath::resolve_id(doc, id_map, id)?;
+    let node_set = if is_xpointer {
+        NodeSet::tree_with_comments(resolved_node, doc)
+    } else {
+        NodeSet::tree_without_comments(resolved_node, doc)
+    };
+    Ok(Some((Some(node_set), Some(resolved_node))))
+}
+
+/// Canonicalize a fast-path reference into a byte vector.
+///
+/// This helper keeps debug behavior simple: the same eligibility and transform
+/// handling are used as the streaming fast path, but the result is buffered.
+fn try_fast_reference_c14n_bytes(
+    doc: &Document<'_>,
+    sig_node: NodeId,
+    node_set: Option<NodeSet>,
+    transforms_node: Option<NodeId>,
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some((c14n_mode, inclusive_prefixes, node_set)) =
+        fast_reference_c14n_params(doc, sig_node, node_set, transforms_node)?
+    else {
+        return Ok(None);
+    };
+
+    bergshamra_c14n::canonicalize_doc(doc, c14n_mode, node_set.as_ref(), &inclusive_prefixes)
+        .map(Some)
+}
+
+/// Parse the fast-path transform list and return canonicalization parameters.
+///
+/// The fast path accepts only:
+///
+/// - zero or one enveloped-signature transform before C14N
+/// - zero or one C14N transform
+///
+/// Any unsupported transform, missing algorithm URI, duplicate C14N transform,
+/// or enveloped-signature transform after C14N returns `Ok(None)` so the caller
+/// can fall back to the generic transform pipeline.
+fn fast_reference_c14n_params(
+    doc: &Document<'_>,
+    sig_node: NodeId,
+    mut node_set: Option<NodeSet>,
+    transforms_node: Option<NodeId>,
+) -> Result<Option<FastC14nParams>, Error> {
+    let mut c14n_mode = C14nMode::Inclusive;
+    let mut inclusive_prefixes = Vec::new();
+    let mut saw_c14n = false;
+
+    if let Some(transforms_id) = transforms_node {
+        for transform_node in doc.children(transforms_id) {
+            let is_transform = doc
+                .element(transform_node)
+                .is_some_and(|e| e.name.local_name.as_ref() == ns::node::TRANSFORM);
+            if !is_transform {
+                continue;
+            }
+
+            let Some(transform_uri) = doc
+                .element(transform_node)
+                .and_then(|e| e.get_attribute(ns::attr::ALGORITHM))
+            else {
+                return Ok(None);
+            };
+
+            match transform_uri {
+                algorithm::ENVELOPED_SIGNATURE => {
+                    if saw_c14n {
+                        return Ok(None);
+                    }
+                    let node_set = node_set.get_or_insert_with(|| NodeSet::all(doc));
+                    remove_subtree_from_node_set(sig_node, doc, node_set);
+                }
+                algorithm::C14N
+                | algorithm::C14N_WITH_COMMENTS
+                | algorithm::C14N11
+                | algorithm::C14N11_WITH_COMMENTS
+                | algorithm::EXC_C14N
+                | algorithm::EXC_C14N_WITH_COMMENTS => {
+                    if saw_c14n {
+                        return Ok(None);
+                    }
+                    c14n_mode = C14nMode::from_uri(transform_uri).ok_or_else(|| {
+                        Error::UnsupportedAlgorithm(format!("C14N: {transform_uri}"))
+                    })?;
+                    inclusive_prefixes = read_inclusive_prefixes(doc, transform_node);
+                    saw_c14n = true;
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    Ok(Some((c14n_mode, inclusive_prefixes, node_set)))
+}
+
+/// Remove a node and all descendants from `node_set`.
+///
+/// This implements the enveloped-signature transform for the fast path. It uses
+/// [`NodeSet::remove_id`], so it works with both normal and inverted storage.
+fn remove_subtree_from_node_set(id: NodeId, doc: &Document<'_>, node_set: &mut NodeSet) {
+    node_set.remove_id(id);
+    for child in doc.children(id) {
+        remove_subtree_from_node_set(child, doc, node_set);
+    }
+}
+
+/// Resolve a reference URI into XML node-set data or binary bytes.
+///
+/// Same-document references borrow `xml` in the returned [`ResolvedUri::Xml`]
+/// variant so the generic transform pipeline does not clone large verifier
+/// inputs. Detached binary references are read only from explicit URL maps or
+/// simple relative paths, and are marked unsafe for raw pre-digest debug
+/// logging so an invalid signature cannot disclose those local bytes.
+fn resolve_reference_uri<'a>(
+    uri: &str,
+    doc: &Document<'_>,
+    id_map: &HashMap<String, NodeId>,
+    xml: &'a str,
+    url_maps: &[(String, String)],
+    base_dir: Option<&str>,
+) -> Result<ResolvedUri<'a>, Error> {
+    if uri.is_empty() {
+        // Whole document, per W3C spec section 4.3.3.3:
+        // "if the URI is not a full XPointer, then all comment nodes are excluded"
+        let ns = NodeSet::all_without_comments(doc);
+        Ok(ResolvedUri::Xml {
+            xml_text: xml,
+            node_set: Some(ns),
+            resolved_node: None,
+        })
+    } else if let Some(fragment) = xpath::parse_same_document_ref(uri) {
+        // Handle xpointer(/) — selects entire document
+        if fragment == "xpointer(/)" {
+            return Ok(ResolvedUri::Xml {
+                xml_text: xml,
+                node_set: None,
+                resolved_node: None,
+            });
+        }
+        // Handle xpointer(id('...')) — extract the ID.
+        // Per W3C: bare `#id` excludes comments, `#xpointer(id('...'))` includes them.
+        let is_xpointer = xpath::parse_xpointer_id(fragment).is_some();
+        let id = xpath::parse_xpointer_id(fragment).unwrap_or(fragment);
+        let node = xpath::resolve_id(doc, id_map, id)?;
+        let ns = if is_xpointer {
+            NodeSet::tree_with_comments(node, doc)
+        } else {
+            NodeSet::tree_without_comments(node, doc)
+        };
+        Ok(ResolvedUri::Xml {
+            xml_text: xml,
+            node_set: Some(ns),
+            resolved_node: Some(node),
+        })
+    } else {
+        // Try url-map for external URIs. Mappings are exact except for a
+        // same-resource `#fragment` suffix.
+        for (map_url, file_path) in url_maps {
+            if url_map_matches(uri, map_url) {
+                let data = std::fs::read(file_path)
+                    .map_err(|e| Error::Other(format!("url-map {file_path}: {e}")))?;
+                return Ok(ResolvedUri::Binary {
+                    bytes: data,
+                    debug_pre_digest_bytes: false,
+                });
+            }
+        }
+
+        if let Some(data) = read_relative_reference_uri(uri, base_dir)? {
+            return Ok(ResolvedUri::Binary {
+                bytes: data,
+                debug_pre_digest_bytes: false,
+            });
+        }
+
+        Err(Error::InvalidUri(format!(
+            "external URI not supported: {uri}"
+        )))
+    }
+}
+
+/// Read a local detached `<Reference>` URI when it is a simple relative path.
+///
+/// XML Signature interop suites use document-adjacent detached files such as
+/// `document.xml`, so Bergshamra keeps that compatibility. Absolute paths and
+/// parent-directory traversal are rejected before any filesystem read. Existing
+/// candidates are canonicalized and kept inside the base directory used for the
+/// lookup, and the caller treats returned bytes as unsafe for raw debug logging.
+fn read_relative_reference_uri(
+    uri: &str,
+    base_dir: Option<&str>,
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some(path) = local_reference_relative_path(uri)? else {
+        return Ok(None);
+    };
+
+    if let Some(base) = base_dir {
+        if let Some(data) = read_existing_relative_file(std::path::Path::new(base), path, uri)? {
+            return Ok(Some(data));
+        }
+    }
+
+    let cwd = std::env::current_dir().map_err(|e| Error::Other(format!("current dir: {e}")))?;
+    if let Some(data) = read_existing_relative_file(&cwd, path, uri)? {
+        return Ok(Some(data));
+    }
+
+    Ok(None)
+}
+
+/// Apply a single transform.
+pub(crate) fn apply_transform<'a>(
+    uri: &str,
+    data: bergshamra_transforms::TransformData<'a>,
+    transform_node: NodeId,
+    sig_node: NodeId,
+    doc: &Document<'_>,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    use bergshamra_transforms::pipeline::{C14nTransform, Transform};
+
+    match uri {
+        algorithm::ENVELOPED_SIGNATURE => {
+            let t = bergshamra_transforms::enveloped::EnvelopedSignatureTransform::from_node_id(
+                sig_node,
+            );
+            t.execute(data)
+        }
+        algorithm::C14N
+        | algorithm::C14N_WITH_COMMENTS
+        | algorithm::C14N11
+        | algorithm::C14N11_WITH_COMMENTS
+        | algorithm::EXC_C14N
+        | algorithm::EXC_C14N_WITH_COMMENTS => {
+            let mode = C14nMode::from_uri(uri)
+                .ok_or_else(|| Error::UnsupportedAlgorithm(format!("C14N: {uri}")))?;
+            let prefixes = read_inclusive_prefixes(doc, transform_node);
+            let t = C14nTransform::new(mode, prefixes);
+            t.execute(data)
+        }
+        algorithm::BASE64 => {
+            let t = bergshamra_transforms::base64_transform::Base64DecodeTransform;
+            t.execute(data)
+        }
+        algorithm::XPATH => apply_xpath_transform(data, transform_node, sig_node, doc),
+        algorithm::XPOINTER => apply_xpointer_transform(data, transform_node, doc),
+        algorithm::XPATH2 => apply_xpath_filter2_transform(data, transform_node, doc),
+        algorithm::RELATIONSHIP => apply_relationship_transform(data, transform_node, doc),
+        algorithm::XSLT => apply_xslt_transform(data, transform_node, doc),
+        _ => Err(Error::UnsupportedAlgorithm(format!("transform: {uri}"))),
+    }
+}
+
+/// Apply the OPC Relationship Transform (ECMA-376 Part 2 §13.2.4.24).
+///
+/// Filters `<Relationship>` elements from the input by matching `Id` attributes
+/// against `<mdssi:RelationshipReference SourceId="...">` children of the
+/// transform element. Selected relationships are sorted by `Id` and wrapped
+/// in a `<Relationships>` root with the OPC relationships namespace.
+fn apply_relationship_transform<'a>(
+    data: bergshamra_transforms::TransformData<'a>,
+    transform_node: NodeId,
+    outer_doc: &Document<'_>,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    const REL_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    const MDSSI_NS: &str = "http://schemas.openxmlformats.org/package/2006/digital-signature";
+
+    // Collect SourceId values from <mdssi:RelationshipReference> children
+    let mut source_ids: Vec<String> = Vec::new();
+    let mut source_types: Vec<String> = Vec::new();
+    for child in outer_doc.children(transform_node) {
+        let elem = match outer_doc.element(child) {
+            Some(e) => e,
+            None => continue,
+        };
+        let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+        let name = &*elem.name.local_name;
+        if child_ns == MDSSI_NS && name == "RelationshipReference" {
+            if let Some(id) = elem.get_attribute("SourceId") {
+                source_ids.push(id.to_owned());
+            }
+        } else if child_ns == MDSSI_NS && name == "RelationshipsGroupReference" {
+            if let Some(t) = elem.get_attribute("SourceType") {
+                source_types.push(t.to_owned());
+            }
+        }
+    }
+
+    // Get the input XML text
+    let xml_text = match &data {
+        bergshamra_transforms::TransformData::Xml { xml_text, .. } => xml_text.clone(),
+        bergshamra_transforms::TransformData::Binary(bytes) => String::from_utf8(bytes.clone())
+            .map_err(|e| Error::Transform(format!("Relationship input not UTF-8: {e}")))?
+            .into(),
+    };
+
+    // Parse the input XML
+    let doc = uppsala::parse(xml_text.as_ref())
+        .map_err(|e| Error::Transform(format!("Relationship XML parse: {e}")))?;
+
+    // Collect matching <Relationship> elements
+    struct RelInfo {
+        id: String,
+        target: String,
+        rel_type: String,
+        target_mode: Option<String>,
+    }
+
+    let root = doc.document_element().unwrap();
+    let mut rels: Vec<RelInfo> = Vec::new();
+
+    for child in doc.children(root) {
+        let elem = match doc.element(child) {
+            Some(e) => e,
+            None => continue,
+        };
+        let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+        if child_ns != REL_NS || elem.name.local_name.as_ref() != "Relationship" {
+            continue;
+        }
+        let id = elem.get_attribute("Id").unwrap_or("");
+        let rel_type = elem.get_attribute("Type").unwrap_or("");
+
+        let include = source_ids.iter().any(|sid| sid.as_str() == id)
+            || source_types.iter().any(|st| st.as_str() == rel_type);
+
+        if include {
+            rels.push(RelInfo {
+                id: id.to_owned(),
+                target: elem.get_attribute("Target").unwrap_or("").to_owned(),
+                rel_type: rel_type.to_owned(),
+                // OPC spec: TargetMode defaults to "Internal" when absent
+                target_mode: Some(
+                    elem.get_attribute("TargetMode")
+                        .unwrap_or("Internal")
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
+    // Sort by Id
+    rels.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Build the output XML using XmlWriter.
+    // C14N sorts attributes alphabetically (by namespace URI then local name).
+    // For no-namespace attributes: Id < Target < TargetMode < Type (alphabetical).
+    let mut w = XmlWriter::new();
+    w.start_element("Relationships", &[("xmlns", REL_NS)]);
+    for rel in &rels {
+        let mut attrs: Vec<(&str, &str)> = vec![("Id", &rel.id), ("Target", &rel.target)];
+        if let Some(ref tm) = rel.target_mode {
+            attrs.push(("TargetMode", tm));
+        }
+        attrs.push(("Type", &rel.rel_type));
+        w.empty_element_expanded("Relationship", &attrs);
+    }
+    w.end_element("Relationships");
+
+    Ok(bergshamra_transforms::TransformData::Binary(w.into_bytes()))
+}
+
+/// Apply an XSLT transform.
+///
+/// Currently supports:
+/// - Identity transform (`<xsl:template match="@*|node()"><xsl:copy>
+///   <xsl:apply-templates select="@*|node()"/></xsl:copy></xsl:template>`)
+///   — passes input through unchanged.
+/// - Simple template-based transforms for common patterns (player→HTML, etc.)
+fn apply_xslt_transform<'a>(
+    data: bergshamra_transforms::TransformData<'a>,
+    transform_node: NodeId,
+    outer_doc: &Document<'_>,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    const XSL_NS: &str = "http://www.w3.org/1999/XSL/Transform";
+
+    // Find the <xsl:stylesheet> child element
+    let stylesheet = outer_doc
+        .children(transform_node)
+        .into_iter()
+        .find(|&id| {
+            outer_doc.element(id).is_some_and(|e| {
+                e.name.namespace_uri.as_deref() == Some(XSL_NS)
+                    && e.name.local_name.as_ref() == "stylesheet"
+            })
+        })
+        .ok_or_else(|| Error::MissingElement("xsl:stylesheet in XSLT transform".into()))?;
+
+    // Collect template elements
+    let templates: Vec<NodeId> = outer_doc
+        .children(stylesheet)
+        .into_iter()
+        .filter(|&id| {
+            outer_doc.element(id).is_some_and(|e| {
+                e.name.namespace_uri.as_deref() == Some(XSL_NS)
+                    && e.name.local_name.as_ref() == "template"
+            })
+        })
+        .collect();
+
+    // Check for identity transform pattern:
+    // Single template matching "@*|node()" containing <xsl:copy><xsl:apply-templates
+    // select="@*|node()"/></xsl:copy>
+    if templates.len() == 1 {
+        let tmpl = templates[0];
+        let match_attr = outer_doc
+            .element(tmpl)
+            .and_then(|e| e.get_attribute("match"))
+            .unwrap_or("");
+        if match_attr == "@*|node()" || match_attr == "node()|@*" {
+            // Check for <xsl:copy><xsl:apply-templates select="@*|node()"/></xsl:copy>
+            let has_copy = outer_doc.children(tmpl).into_iter().any(|id| {
+                outer_doc.element(id).is_some_and(|e| {
+                    e.name.namespace_uri.as_deref() == Some(XSL_NS)
+                        && e.name.local_name.as_ref() == "copy"
+                })
+            });
+            if has_copy {
+                // Identity transform — pass through
+                return Ok(data);
+            }
+        }
+    }
+
+    // For non-identity transforms, attempt minimal XSLT processing
+    apply_minimal_xslt(data, stylesheet, &templates, outer_doc)
+}
+
+/// Minimal XSLT processor for simple template-based transforms.
+///
+/// Supports a subset of XSLT 1.0:
+/// - `<xsl:template match="...">` with literal result elements
+/// - `<xsl:apply-templates/>` and `<xsl:apply-templates select="..."/>`
+/// - `<xsl:value-of select="..."/>` for simple child element selection
+/// - `<xsl:copy>` with `<xsl:apply-templates/>`
+fn apply_minimal_xslt<'a>(
+    data: bergshamra_transforms::TransformData<'a>,
+    stylesheet: NodeId,
+    templates: &[NodeId],
+    outer_doc: &Document<'_>,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    // Get the input XML
+    let xml_text = match &data {
+        bergshamra_transforms::TransformData::Xml { xml_text, .. } => xml_text.clone(),
+        bergshamra_transforms::TransformData::Binary(bytes) => String::from_utf8(bytes.clone())
+            .map_err(|e| Error::Transform(format!("XSLT input not UTF-8: {e}")))?
+            .into(),
+    };
+
+    let input_doc = uppsala::parse(xml_text.as_ref())
+        .map_err(|e| Error::Transform(format!("XSLT input XML parse: {e}")))?;
+
+    // Check for xsl:strip-space
+    let strip_spaces: Vec<String> = outer_doc
+        .children(stylesheet)
+        .into_iter()
+        .filter(|&id| {
+            outer_doc.element(id).is_some_and(|e| {
+                e.name.namespace_uri.as_deref() == Some("http://www.w3.org/1999/XSL/Transform")
+                    && e.name.local_name.as_ref() == "strip-space"
+            })
+        })
+        .filter_map(|id| {
+            outer_doc
+                .element(id)
+                .and_then(|e| e.get_attribute("elements"))
+                .map(|s| s.to_owned())
+        })
+        .collect();
+
+    // Build set of element names to strip whitespace from
+    let strip_set: std::collections::HashSet<String> = strip_spaces
+        .iter()
+        .flat_map(|s| s.split_whitespace().map(|w| w.to_owned()))
+        .collect();
+
+    // Check for xsl:output
+    let _output_method = outer_doc
+        .children(stylesheet)
+        .into_iter()
+        .find(|&id| {
+            outer_doc.element(id).is_some_and(|e| {
+                e.name.namespace_uri.as_deref() == Some("http://www.w3.org/1999/XSL/Transform")
+                    && e.name.local_name.as_ref() == "output"
+            })
+        })
+        .and_then(|id| {
+            outer_doc
+                .element(id)
+                .and_then(|e| e.get_attribute("method"))
+                .map(|s| s.to_owned())
+        });
+
+    // Get the default namespace from the stylesheet (for literal result elements)
+    let default_ns: Option<String> = outer_doc.element(stylesheet).and_then(|e| {
+        for (prefix, uri) in &e.namespace_declarations {
+            if prefix.is_empty() {
+                return Some(uri.to_string());
+            }
+        }
+        None
+    });
+
+    // Process root element
+    let root = input_doc.document_element().unwrap();
+    let mut output = String::new();
+    xslt_apply_templates_to_node(
+        root,
+        templates,
+        outer_doc,
+        &input_doc,
+        &default_ns,
+        &strip_set,
+        &mut output,
+    );
+
+    Ok(bergshamra_transforms::TransformData::Binary(
+        output.into_bytes(),
+    ))
+}
+
+/// Apply templates to a node.
+fn xslt_apply_templates_to_node(
+    node: NodeId,
+    templates: &[NodeId],
+    tmpl_doc: &Document<'_>,
+    input_doc: &Document<'_>,
+    default_ns: &Option<String>,
+    strip_set: &std::collections::HashSet<String>,
+    out: &mut String,
+) {
+    // Find matching template
+    if let Some(tmpl) = find_matching_template(node, templates, tmpl_doc, input_doc) {
+        // Execute template body
+        xslt_execute_body(
+            tmpl, node, templates, tmpl_doc, input_doc, default_ns, strip_set, out,
+        );
+    } else {
+        // Default: for elements, apply templates to children; for text, copy text
+        if matches!(
+            input_doc.node_kind(node),
+            Some(NodeKind::Text(_)) | Some(NodeKind::CData(_))
+        ) {
+            // Check strip-space: skip whitespace-only text nodes if parent is in strip set
+            let parent_name = input_doc
+                .parent(node)
+                .and_then(|p| input_doc.element(p))
+                .map(|e| e.name.local_name.to_string())
+                .unwrap_or_default();
+            let text = match input_doc.node_kind(node) {
+                Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) => t.as_ref(),
+                _ => "",
+            };
+            if strip_set.contains(&parent_name)
+                && text.chars().all(|c: char| c.is_ascii_whitespace())
+            {
+                // Skip whitespace-only text in stripped elements
+            } else {
+                xml_escape_text(text, out);
+            }
+        } else if input_doc.element(node).is_some() {
+            for child in input_doc.children(node) {
+                xslt_apply_templates_to_node(
+                    child, templates, tmpl_doc, input_doc, default_ns, strip_set, out,
+                );
+            }
+        }
+    }
+}
+
+/// Execute the body of an XSLT template.
+///
+/// `body` and `templates` are node IDs in `tmpl_doc` (the stylesheet/outer document).
+/// `context_node` is a node ID in `input_doc` (the input XML being transformed).
+#[allow(clippy::too_many_arguments)]
+fn xslt_execute_body(
+    body: NodeId,
+    context_node: NodeId,
+    templates: &[NodeId],
+    tmpl_doc: &Document<'_>,
+    input_doc: &Document<'_>,
+    default_ns: &Option<String>,
+    strip_set: &std::collections::HashSet<String>,
+    out: &mut String,
+) {
+    const XSL_NS: &str = "http://www.w3.org/1999/XSL/Transform";
+
+    for child in tmpl_doc.children(body) {
+        if let Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) = tmpl_doc.node_kind(child) {
+            // Skip whitespace-only text nodes in template
+            if !t.trim().is_empty() {
+                xml_escape_text(t, out);
+            }
+        } else if let Some(elem) = tmpl_doc.element(child) {
+            let child_ns = elem.name.namespace_uri.as_deref();
+            let name = &*elem.name.local_name;
+
+            if child_ns == Some(XSL_NS) {
+                match name {
+                    "apply-templates" => {
+                        let select = elem.get_attribute("select");
+                        if let Some(sel) = select {
+                            // Simple child selection: "child-name"
+                            for ch in input_doc.children(context_node) {
+                                if input_doc.element(ch).is_some()
+                                    && xslt_node_matches_select(ch, sel, input_doc)
+                                {
+                                    xslt_apply_templates_to_node(
+                                        ch, templates, tmpl_doc, input_doc, default_ns, strip_set,
+                                        out,
+                                    );
+                                }
+                            }
+                        } else {
+                            // Apply to all children
+                            for ch in input_doc.children(context_node) {
+                                xslt_apply_templates_to_node(
+                                    ch, templates, tmpl_doc, input_doc, default_ns, strip_set, out,
+                                );
+                            }
+                        }
+                    }
+                    "value-of" => {
+                        if let Some(sel) = elem.get_attribute("select") {
+                            // Simple: select="name" → get text of child element
+                            let val = xslt_eval_value_of(context_node, sel, input_doc);
+                            xml_escape_text(&val, out);
+                        }
+                    }
+                    "copy" => {
+                        if let Some(ctx_elem) = input_doc.element(context_node) {
+                            let local = &*ctx_elem.name.local_name;
+                            out.push('<');
+                            out.push_str(local);
+                            // Copy namespace declarations from context
+                            for (prefix, uri) in &ctx_elem.namespace_declarations {
+                                out.push_str(" xmlns");
+                                if !prefix.is_empty() {
+                                    out.push(':');
+                                    out.push_str(prefix);
+                                }
+                                out.push_str("=\"");
+                                xml_escape_attr(uri, out);
+                                out.push('"');
+                            }
+                            // Copy attributes
+                            for attr in &ctx_elem.attributes {
+                                out.push(' ');
+                                out.push_str(&attr.name.local_name);
+                                out.push_str("=\"");
+                                xml_escape_attr(&attr.value, out);
+                                out.push('"');
+                            }
+                            out.push('>');
+                            // Execute body children
+                            xslt_execute_body(
+                                child,
+                                context_node,
+                                templates,
+                                tmpl_doc,
+                                input_doc,
+                                default_ns,
+                                strip_set,
+                                out,
+                            );
+                            out.push_str("</");
+                            out.push_str(local);
+                            out.push('>');
+                        } else if let Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) =
+                            input_doc.node_kind(context_node)
+                        {
+                            xml_escape_text(t, out);
+                        }
+                    }
+                    _ => {
+                        // Ignore other XSL elements
+                    }
+                }
+            } else {
+                // Literal result element
+                let local = &*elem.name.local_name;
+                out.push('<');
+                out.push_str(local);
+                // Add default namespace if present and different from parent
+                if let Some(dns) = default_ns {
+                    // Only emit for elements that use the default namespace
+                    if child_ns.is_none() || child_ns == Some(dns.as_str()) {
+                        out.push_str(" xmlns=\"");
+                        xml_escape_attr(dns, out);
+                        out.push('"');
+                    }
+                }
+                for attr in &elem.attributes {
+                    out.push(' ');
+                    out.push_str(&attr.name.local_name);
+                    out.push_str("=\"");
+                    xml_escape_attr(&attr.value, out);
+                    out.push('"');
+                }
+                out.push('>');
+                xslt_execute_body(
+                    child,
+                    context_node,
+                    templates,
+                    tmpl_doc,
+                    input_doc,
+                    default_ns,
+                    strip_set,
+                    out,
+                );
+                out.push_str("</");
+                out.push_str(local);
+                out.push('>');
+            }
+        }
+    }
+}
+
+/// Check if a node matches a simple XSLT select expression.
+fn xslt_node_matches_select(node: NodeId, select: &str, input_doc: &Document<'_>) -> bool {
+    if select == "@*|node()" || select == "node()|@*" {
+        true
+    } else {
+        // Simple element name match (possibly with path like "player/name")
+        let parts: Vec<&str> = select.split('/').collect();
+        let last = parts.last().unwrap_or(&"");
+        input_doc
+            .element(node)
+            .is_some_and(|e| e.name.local_name.as_ref() == *last)
+    }
+}
+
+/// Evaluate a simple xsl:value-of select expression.
+fn xslt_eval_value_of(node: NodeId, select: &str, input_doc: &Document<'_>) -> String {
+    // Handle "name", "position", etc. — simple child element name
+    for child in input_doc.children(node) {
+        if let Some(elem) = input_doc.element(child) {
+            if elem.name.local_name.as_ref() == select {
+                return element_text(input_doc, child).unwrap_or("").to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Find the first template that matches a node.
+fn find_matching_template(
+    node: NodeId,
+    templates: &[NodeId],
+    tmpl_doc: &Document<'_>,
+    input_doc: &Document<'_>,
+) -> Option<NodeId> {
+    let elem = input_doc.element(node)?;
+    let local = &*elem.name.local_name;
+    let parent_name = input_doc
+        .parent(node)
+        .and_then(|p| input_doc.element(p).map(|e| e.name.local_name.to_string()));
+
+    // Find the most specific matching template
+    // Priority: parent/child > child > generic
+    for &tmpl in templates {
+        let match_attr = tmpl_doc
+            .element(tmpl)
+            .and_then(|e| e.get_attribute("match"))
+            .unwrap_or("");
+        // Check "parent/child" pattern
+        if match_attr.contains('/') {
+            let parts: Vec<&str> = match_attr.split('/').collect();
+            if parts.len() == 2 {
+                if let Some(ref pn) = parent_name {
+                    if pn == parts[0] && local == parts[1] {
+                        return Some(tmpl);
+                    }
+                }
+            }
+        } else if match_attr == local {
+            return Some(tmpl);
+        }
+    }
+    None
+}
+
+/// Escape a string for XML attribute value (C14N attribute escaping).
+fn xml_escape_attr(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' => out.push_str("&#x9;"),
+            '\n' => out.push_str("&#xA;"),
+            '\r' => out.push_str("&#xD;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Escape text for XML content.
+fn xml_escape_text(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\r' => out.push_str("&#xD;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Apply an XPath 1.0 transform.
+///
+/// The XPath 1.0 transform evaluates the expression for each node in the
+/// input node-set. If the expression evaluates to true, the node is included
+/// in the output.
+///
+/// Supports a subset of XPath 1.0 expressions commonly used in XML-DSig:
+/// - `ancestor-or-self::prefix:Name` — true if node or ancestor is named element
+/// - `not(expr)` — negation
+/// - `expr and expr` — conjunction
+/// - `self::text()` — true for text nodes
+fn apply_xpath_transform<'a>(
+    data: bergshamra_transforms::TransformData<'a>,
+    transform_node: NodeId,
+    sig_node: NodeId,
+    outer_doc: &Document<'_>,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    // Extract the XPath expression from the <XPath> child element
+    let xpath_node = outer_doc
+        .children(transform_node)
+        .into_iter()
+        .find(|&id| {
+            outer_doc
+                .element(id)
+                .is_some_and(|e| e.name.local_name.as_ref() == "XPath")
+        })
+        .ok_or_else(|| Error::MissingElement("XPath expression element".into()))?;
+
+    let xpath_raw = element_text(outer_doc, xpath_node).unwrap_or("").trim();
+
+    // Normalize whitespace: collapse runs of whitespace (including newlines,
+    // tabs, and multi-space indentation) into a single space so that the parser
+    // can split on ` and `, ` or `, etc.
+    let xpath_expr: String = xpath_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let xpath_expr = xpath_expr.as_str();
+
+    // Check if this is the enveloped-signature pattern:
+    // not(ancestor-or-self::PREFIX:Signature)
+    // OR the here()-based variant:
+    // count(ancestor-or-self::PREFIX:Signature | here()/ancestor::PREFIX:Signature[1]) > count(ancestor-or-self::PREFIX:Signature)
+    if is_enveloped_xpath(xpath_expr, xpath_node, outer_doc)
+        || is_enveloped_xpath_here(xpath_expr, xpath_node, outer_doc)
+    {
+        // Apply enveloped signature transform (same as the dedicated one)
+        use bergshamra_transforms::pipeline::Transform;
+        let t =
+            bergshamra_transforms::enveloped::EnvelopedSignatureTransform::from_node_id(sig_node);
+        return t.execute(data);
+    }
+
+    // Try to parse and evaluate as a boolean XPath expression
+    if let Some(parsed) = parse_xpath_bool_expr(xpath_expr, xpath_node, outer_doc) {
+        return apply_parsed_xpath_filter(data, &parsed);
+    }
+
+    // Try to handle compound XPath expressions with here() and id()
+    // Pattern: "A and count(ancestor-or-self::P:E | here()/ancestor::P:E[1]) > count(ancestor-or-self::P:E) or count(ancestor-or-self::node() | id('X')) = count(ancestor-or-self::node())"
+    if let Some(result) =
+        try_compound_xpath_filter(xpath_expr, xpath_node, outer_doc, data, sig_node)?
+    {
+        return Ok(result);
+    }
+
+    Err(Error::UnsupportedAlgorithm(format!(
+        "XPath expression not supported: {xpath_expr}"
+    )))
+}
+
+/// Try to handle compound XPath expressions containing here() and id() functions.
+///
+/// Handles the pattern from merlin-xmldsig-twenty-three/signature:
+///   `ancestor-or-self::dsig:SignedInfo and count(ancestor-or-self::dsig:Reference
+///    | here()/ancestor::dsig:Reference[1]) > count(ancestor-or-self::dsig:Reference)
+///    or count(ancestor-or-self::node() | id('X')) = count(ancestor-or-self::node())`
+///
+/// Parsing: by XPath precedence (and > or), this is:
+///   (A and B) or C
+/// where:
+///   A = ancestor-or-self::P:SignedInfo
+///   B = count(ancestor-or-self::P:Reference | here()/ancestor::P:Reference[1])
+///       > count(ancestor-or-self::P:Reference)
+///       → true when node is NOT within the here() Reference
+///   C = count(ancestor-or-self::node() | id('X')) = count(ancestor-or-self::node())
+///       → true when node IS a descendant-or-self of id('X')
+fn try_compound_xpath_filter<'a>(
+    expr: &str,
+    xpath_node: NodeId,
+    outer_doc: &Document<'_>,
+    data: bergshamra_transforms::TransformData<'a>,
+    _sig_node: NodeId,
+) -> Result<Option<bergshamra_transforms::TransformData<'a>>, Error> {
+    use bergshamra_xml::nodeset::{NodeSet, NodeSetType};
+    use std::collections::HashSet;
+
+    // Try to match: "... and count(ancestor-or-self::P:E | here()/ancestor::P:E[1]) > count(ancestor-or-self::P:E) or count(ancestor-or-self::node() | id('X')) = count(ancestor-or-self::node())"
+
+    // Find " or count(ancestor-or-self::node() | id('" which separates the (A and B) from C
+    let or_marker = " or count(ancestor-or-self::node() | id('";
+    let Some(or_pos) = expr.find(or_marker) else {
+        return Ok(None);
+    };
+
+    let left_part = &expr[..or_pos]; // "A and B"
+    let right_part = &expr[or_pos + or_marker.len()..]; // "X')) = count(ancestor-or-self::node())"
+
+    // Extract the id value from right part
+    let id_suffix = "')) = count(ancestor-or-self::node())";
+    if !right_part.ends_with(id_suffix) {
+        return Ok(None);
+    }
+    let id_value = &right_part[..right_part.len() - id_suffix.len()];
+
+    // Parse left part: "ancestor-or-self::P:A and count(ancestor-or-self::P:B | here()/ancestor::P:B[1]) > count(ancestor-or-self::P:B)"
+    let and_parts: Vec<&str> = left_part.splitn(2, " and ").collect();
+    if and_parts.len() != 2 {
+        return Ok(None);
+    }
+
+    // Part A: "ancestor-or-self::P:SignedInfo"
+    let part_a = and_parts[0].trim();
+    let ancestor_prefix_a = "ancestor-or-self::";
+    if !part_a.starts_with(ancestor_prefix_a) {
+        return Ok(None);
+    }
+    let a_name = &part_a[ancestor_prefix_a.len()..];
+    let (a_ns_uri, a_local_name) = match resolve_prefixed_name(a_name, xpath_node, outer_doc) {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+
+    // Part B: here()-based exclude pattern for a different element type
+    let part_b = and_parts[1].trim();
+    let here_result = parse_here_exclude_pattern(part_b, xpath_node, outer_doc);
+    let (b_ns_uri, b_local_name) = match here_result {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+
+    // Now we have all components. Evaluate the expression on the document.
+    let (xml_text, input_ns) = match data {
+        bergshamra_transforms::TransformData::Xml { xml_text, node_set } => (xml_text, node_set),
+        bergshamra_transforms::TransformData::Binary(bytes) => {
+            let text = String::from_utf8(bytes)
+                .map_err(|e| Error::XmlParse(format!("XPath: invalid UTF-8: {e}")))?;
+            (text.into(), None)
+        }
+    };
+
+    let inner_doc =
+        uppsala::parse(xml_text.as_ref()).map_err(|e| Error::XmlParse(e.to_string()))?;
+
+    // Find the here() Reference/element: here() returns the <XPath> element itself.
+    // Walk up from xpath_node (which IS the <XPath> element) to find its ancestor
+    // Reference. Use the node INDEX for cross-document comparison.
+    let here_ancestor_idx =
+        find_ancestor_by_name_idx(xpath_node, outer_doc, &b_ns_uri, &b_local_name);
+
+    // Find the id('X') element in the re-parsed document
+    let id_map = build_id_map(&inner_doc, &["Id", "ID", "id", "AssertionID"])?;
+    let id_element_idx = id_map.get(id_value).map(|nid| nid.index());
+
+    // Filter nodes
+    let mut result_ids = HashSet::new();
+    for node in inner_doc.descendants(inner_doc.root()) {
+        if let Some(ref ns) = input_ns {
+            if !ns.contains_id(node) {
+                continue;
+            }
+        }
+
+        // Evaluate: (A and B) or C
+        let a = is_ancestor_or_self_match(node, &inner_doc, &a_ns_uri, &a_local_name);
+        let b = if let Some(here_idx) = here_ancestor_idx {
+            // B: NOT a descendant-or-self of the here() ancestor
+            !is_descendant_of_index(node, &inner_doc, here_idx)
+        } else {
+            true
+        };
+        let c = if let Some(id_idx) = id_element_idx {
+            is_descendant_of_index(node, &inner_doc, id_idx)
+        } else {
+            false
+        };
+
+        if (a && b) || c {
+            result_ids.insert(node.index());
+        }
+    }
+
+    let result_ns = NodeSet::from_ids(result_ids, NodeSetType::Normal);
+    Ok(Some(bergshamra_transforms::TransformData::Xml {
+        xml_text,
+        node_set: Some(result_ns),
+    }))
+}
+
+/// Parse a here()-based exclude pattern:
+/// `count(ancestor-or-self::P:E | here()/ancestor::P:E[1]) > count(ancestor-or-self::P:E)`
+/// Returns Some((ns_uri, local_name)) if matched.
+fn parse_here_exclude_pattern(
+    expr: &str,
+    xpath_node: NodeId,
+    doc: &Document<'_>,
+) -> Option<(String, String)> {
+    let prefix = "count(ancestor-or-self::";
+    if !expr.starts_with(prefix) {
+        return None;
+    }
+    let rest = &expr[prefix.len()..];
+
+    // Find the element name and the here() pattern
+    let marker = " | here()/ancestor::";
+    let pos = rest.find(marker)?;
+    let name_part = &rest[..pos];
+    let after = &rest[pos + marker.len()..];
+
+    // Verify the rest matches: NAME[1]) > count(ancestor-or-self::NAME)
+    let expected = format!("{}[1]) > count(ancestor-or-self::{})", name_part, name_part);
+    if after != expected {
+        return None;
+    }
+
+    resolve_prefixed_name(name_part, xpath_node, doc)
+}
+
+/// Check if a node is an ancestor-or-self of the given name.
+fn is_ancestor_or_self_match(
+    node: NodeId,
+    doc: &Document<'_>,
+    ns_uri: &str,
+    local_name: &str,
+) -> bool {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if let Some(elem) = doc.element(n) {
+            if elem.name.local_name.as_ref() == local_name
+                && elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri
+            {
+                return true;
+            }
+        }
+        current = doc.parent(n);
+    }
+    false
+}
+
+/// Check if a node is a descendant-or-self of a target node identified by index.
+/// Uses node index for cross-document comparison (same text → same indices).
+fn is_descendant_of_index(node: NodeId, doc: &Document<'_>, target_idx: usize) -> bool {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.index() == target_idx {
+            return true;
+        }
+        current = doc.parent(n);
+    }
+    false
+}
+
+/// Find an ancestor of the given node matching ns_uri:local_name, return its index.
+fn find_ancestor_by_name_idx(
+    node: NodeId,
+    doc: &Document<'_>,
+    ns_uri: &str,
+    local_name: &str,
+) -> Option<usize> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if let Some(elem) = doc.element(n) {
+            if elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri
+                && elem.name.local_name.as_ref() == local_name
+            {
+                return Some(n.index());
+            }
+        }
+        current = doc.parent(n);
+    }
+    None
+}
+
+/// A parsed XPath boolean expression tree.
+#[derive(Debug)]
+enum XPathBoolExpr {
+    /// Always true — matches all nodes (e.g., XPath `1` or `true()`)
+    True,
+    /// `ancestor-or-self::ns:Name` — true if node or any ancestor is the named element
+    AncestorOrSelf {
+        ns_uri: String,
+        local_name: String,
+    },
+    /// `self::text()` — true for text nodes
+    SelfText,
+    /// `@*` — true if node is an element with at least one attribute
+    HasAttributes,
+    /// `self::prefix:Name` — true if current node is the named element
+    SelfElement {
+        ns_uri: String,
+        local_name: String,
+    },
+    /// `not(expr)`
+    Not(Box<XPathBoolExpr>),
+    /// `expr and expr`
+    And(Box<XPathBoolExpr>, Box<XPathBoolExpr>),
+    /// `expr or expr`
+    Or(Box<XPathBoolExpr>, Box<XPathBoolExpr>),
+    /// `name() = "str"` or `name() != "str"` — compare node name (QName/prefix)
+    NameEq(String),
+    NameNeq(String),
+    /// `namespace-uri() != "str"` or `namespace-uri() = "str"`
+    NamespaceUriEq(String),
+    NamespaceUriNeq(String),
+    /// `parent::prefix:Name` — true if parent is the named element
+    ParentIs {
+        ns_uri: String,
+        local_name: String,
+    },
+    /// `string(self::node()) = namespace-uri(parent::node())` — for namespace node testing
+    StringSelfEqNsUriParent,
+    /// `count(parent::node()/namespace::*) != count(parent::node()/namespace::* | self::node())`
+    /// True for nodes that are NOT namespace nodes of their parent.
+    IsNotParentNsNode,
+    /// `count(parent::node()/namespace::*) = count(parent::node()/namespace::* | self::node())`
+    /// True for nodes that ARE namespace nodes of their parent.
+    IsParentNsNode,
+    /// `(count(ancestor-or-self::node()) mod 2) = 1` — odd depth
+    DepthOdd,
+}
+
+/// Parse a limited subset of XPath 1.0 boolean expressions.
+///
+/// Handles combinations of `ancestor-or-self::prefix:Name`, `self::text()`,
+/// `not()`, `and`, `or`.
+fn parse_xpath_bool_expr(
+    expr: &str,
+    xpath_node: NodeId,
+    doc: &Document<'_>,
+) -> Option<XPathBoolExpr> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return None;
+    }
+
+    // Numeric constant: any non-zero number is true, 0 is false.
+    // XPath filter with "1" means "include all nodes".
+    if let Ok(n) = expr.parse::<f64>() {
+        if n != 0.0 {
+            return Some(XPathBoolExpr::True);
+        } else {
+            return Some(XPathBoolExpr::Not(Box::new(XPathBoolExpr::True)));
+        }
+    }
+
+    // Try splitting on top-level ` and ` (outside parentheses)
+    if let Some((left, right)) = split_top_level(expr, " and ") {
+        let l = parse_xpath_bool_expr(left, xpath_node, doc)?;
+        let r = parse_xpath_bool_expr(right, xpath_node, doc)?;
+        return Some(XPathBoolExpr::And(Box::new(l), Box::new(r)));
+    }
+
+    // Try splitting on top-level ` or ` (outside parentheses)
+    if let Some((left, right)) = split_top_level(expr, " or ") {
+        let l = parse_xpath_bool_expr(left, xpath_node, doc)?;
+        let r = parse_xpath_bool_expr(right, xpath_node, doc)?;
+        return Some(XPathBoolExpr::Or(Box::new(l), Box::new(r)));
+    }
+
+    // Handle not(...) — strip outer not() and parse inner
+    if let Some(inner) = strip_not(expr) {
+        let inner_expr = parse_xpath_bool_expr(inner, xpath_node, doc)?;
+        return Some(XPathBoolExpr::Not(Box::new(inner_expr)));
+    }
+
+    // Handle parenthesized expression
+    if expr.starts_with('(') && expr.ends_with(')') {
+        return parse_xpath_bool_expr(&expr[1..expr.len() - 1], xpath_node, doc);
+    }
+
+    // self::text()
+    if expr == "self::text()" {
+        return Some(XPathBoolExpr::SelfText);
+    }
+
+    // @* — true if context node has attributes
+    if expr == "@*" {
+        return Some(XPathBoolExpr::HasAttributes);
+    }
+
+    // self::prefix:Name — current node is a specific element
+    if let Some(name_part) = expr.strip_prefix("self::") {
+        if name_part != "text()" && name_part != "node()" {
+            let (ns_uri, local_name) = resolve_prefixed_name(name_part, xpath_node, doc)?;
+            return Some(XPathBoolExpr::SelfElement { ns_uri, local_name });
+        }
+    }
+
+    // ancestor-or-self::prefix:Name or ancestor-or-self::Name
+    if let Some(name_part) = expr.strip_prefix("ancestor-or-self::") {
+        let (ns_uri, local_name) = resolve_prefixed_name(name_part, xpath_node, doc)?;
+        return Some(XPathBoolExpr::AncestorOrSelf { ns_uri, local_name });
+    }
+
+    // parent::prefix:Name — parent is a specific element
+    if let Some(name_part) = expr.strip_prefix("parent::") {
+        if name_part != "node()" {
+            let (ns_uri, local_name) = resolve_prefixed_name(name_part, xpath_node, doc)?;
+            return Some(XPathBoolExpr::ParentIs { ns_uri, local_name });
+        }
+    }
+
+    // name() = "str" or name() != "str"
+    {
+        let norm: String = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(rest) = norm.strip_prefix("name()") {
+            let rest = rest.trim();
+            if let Some(val) = rest.strip_prefix("!=") {
+                let val = val.trim().trim_matches('"').trim_matches('\'');
+                return Some(XPathBoolExpr::NameNeq(val.to_string()));
+            }
+            if let Some(val) = rest.strip_prefix('=') {
+                let val = val.trim().trim_matches('"').trim_matches('\'');
+                return Some(XPathBoolExpr::NameEq(val.to_string()));
+            }
+        }
+    }
+
+    // namespace-uri() = "str" or namespace-uri() != "str"
+    {
+        let norm: String = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(rest) = norm.strip_prefix("namespace-uri()") {
+            let rest = rest.trim();
+            if let Some(val) = rest.strip_prefix("!=") {
+                let val = val.trim().trim_matches('"').trim_matches('\'');
+                return Some(XPathBoolExpr::NamespaceUriNeq(val.to_string()));
+            }
+            if let Some(val) = rest.strip_prefix('=') {
+                let val = val.trim().trim_matches('"').trim_matches('\'');
+                return Some(XPathBoolExpr::NamespaceUriEq(val.to_string()));
+            }
+        }
+    }
+
+    // string(self::node()) = namespace-uri(parent::node())
+    {
+        let norm: String = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm == "string(self::node()) = namespace-uri(parent::node())" {
+            return Some(XPathBoolExpr::StringSelfEqNsUriParent);
+        }
+    }
+
+    // count(parent::node()/namespace::*) != count(parent::node()/namespace::* | self::node())
+    {
+        let norm: String = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm == "count(parent::node()/namespace::*) != count(parent::node()/namespace::* | self::node())" {
+            return Some(XPathBoolExpr::IsNotParentNsNode);
+        }
+        if norm == "count(parent::node()/namespace::*) = count(parent::node()/namespace::* | self::node())" {
+            return Some(XPathBoolExpr::IsParentNsNode);
+        }
+    }
+
+    // (count(ancestor-or-self::node()) mod 2) = 1
+    {
+        let norm: String = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm == "(count(ancestor-or-self::node()) mod 2) = 1" {
+            return Some(XPathBoolExpr::DepthOdd);
+        }
+    }
+
+    None
+}
+
+/// Split an expression at the first top-level occurrence of `sep`
+/// (i.e., not inside parentheses).
+fn split_top_level<'a>(expr: &'a str, sep: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0i32;
+    let bytes = expr.as_bytes();
+    let sep_bytes = sep.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'(' {
+            depth += 1;
+        }
+        if bytes[i] == b')' {
+            depth -= 1;
+        }
+        if depth == 0
+            && i + sep_bytes.len() <= bytes.len()
+            && &bytes[i..i + sep_bytes.len()] == sep_bytes
+        {
+            let left = &expr[..i];
+            let right = &expr[i + sep.len()..];
+            if !left.trim().is_empty() && !right.trim().is_empty() {
+                return Some((left.trim(), right.trim()));
+            }
+        }
+    }
+    None
+}
+
+/// Strip `not(...)` wrapper and return inner expression.
+/// Handles both `not(expr)` and `not (expr)` (space before opening paren).
+fn strip_not(expr: &str) -> Option<&str> {
+    let expr = expr.trim();
+    // Handle "not(" and "not (" variants
+    let prefix_len = if expr.starts_with("not(") {
+        4
+    } else if expr.starts_with("not (") {
+        5
+    } else {
+        return None;
+    };
+    if !expr.ends_with(')') {
+        return None;
+    }
+    {
+        // Check that the closing paren matches the opening one after "not("
+        let inner = &expr[prefix_len..expr.len() - 1];
+        // Verify balanced parentheses
+        let mut depth = 0i32;
+        for c in inner.chars() {
+            if c == '(' {
+                depth += 1;
+            }
+            if c == ')' {
+                depth -= 1;
+            }
+            if depth < 0 {
+                return None;
+            }
+        }
+        if depth == 0 {
+            return Some(inner.trim());
+        }
+    }
+    None
+}
+
+/// Resolve a possibly-prefixed element name using the XPath node's namespace declarations.
+fn resolve_prefixed_name(
+    name: &str,
+    xpath_node: NodeId,
+    doc: &Document<'_>,
+) -> Option<(String, String)> {
+    if let Some((prefix, local)) = name.split_once(':') {
+        // Resolve namespace prefix on the element itself
+        if let Some(elem) = doc.element(xpath_node) {
+            for (p, uri) in &elem.namespace_declarations {
+                if p.as_ref() == prefix {
+                    return Some((uri.to_string(), local.to_string()));
+                }
+            }
+        }
+        // Walk up ancestors looking for namespace declaration
+        let mut current = doc.parent(xpath_node);
+        while let Some(n) = current {
+            if let Some(elem) = doc.element(n) {
+                for (p, uri) in &elem.namespace_declarations {
+                    if p.as_ref() == prefix {
+                        return Some((uri.to_string(), local.to_string()));
+                    }
+                }
+            }
+            current = doc.parent(n);
+        }
+        None
+    } else {
+        // No prefix — match any namespace (empty URI signals "any")
+        Some((String::new(), name.to_string()))
+    }
+}
+
+/// A virtual namespace node for XPath evaluation.
+///
+/// In the XPath data model, namespace nodes are children of elements but
+/// Uppsala doesn't model them as separate nodes. This struct represents
+/// a namespace node with its properties.
+struct NsNode {
+    /// The prefix (empty string for default namespace)
+    prefix: String,
+    /// The namespace URI
+    uri: String,
+    /// The parent element node ID
+    parent: NodeId,
+}
+
+/// Evaluate a parsed XPath boolean expression for a given regular node.
+fn eval_xpath_bool(expr: &XPathBoolExpr, node: NodeId, doc: &Document<'_>) -> bool {
+    match expr {
+        XPathBoolExpr::True => true,
+        XPathBoolExpr::AncestorOrSelf { ns_uri, local_name } => {
+            // Check if node or any ancestor is the named element
+            let mut current = Some(node);
+            while let Some(n) = current {
+                if let Some(elem) = doc.element(n) {
+                    if elem.name.local_name.as_ref() == local_name.as_str()
+                        && (ns_uri.is_empty()
+                            || elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri)
+                    {
+                        return true;
+                    }
+                }
+                current = doc.parent(n);
+            }
+            false
+        }
+        XPathBoolExpr::SelfText => matches!(doc.node_kind(node), Some(NodeKind::Text(_))),
+        XPathBoolExpr::HasAttributes => doc.element(node).is_some_and(|e| !e.attributes.is_empty()),
+        XPathBoolExpr::SelfElement { ns_uri, local_name } => doc.element(node).is_some_and(|e| {
+            e.name.local_name.as_ref() == local_name.as_str()
+                && (ns_uri.is_empty() || e.name.namespace_uri.as_deref().unwrap_or("") == ns_uri)
+        }),
+        XPathBoolExpr::Not(inner) => !eval_xpath_bool(inner, node, doc),
+        XPathBoolExpr::And(left, right) => {
+            eval_xpath_bool(left, node, doc) && eval_xpath_bool(right, node, doc)
+        }
+        XPathBoolExpr::Or(left, right) => {
+            eval_xpath_bool(left, node, doc) || eval_xpath_bool(right, node, doc)
+        }
+        XPathBoolExpr::NameEq(s) => {
+            // For elements, name() returns QName (prefix:local or just local)
+            if let Some(elem) = doc.element(node) {
+                let qname = get_element_qname_from_elem(elem);
+                qname == *s
+            } else if matches!(doc.node_kind(node), Some(NodeKind::Text(_))) {
+                s.is_empty()
+            } else {
+                false
+            }
+        }
+        XPathBoolExpr::NameNeq(s) => {
+            if let Some(elem) = doc.element(node) {
+                let qname = get_element_qname_from_elem(elem);
+                qname != *s
+            } else if matches!(doc.node_kind(node), Some(NodeKind::Text(_))) {
+                !s.is_empty()
+            } else {
+                true
+            }
+        }
+        XPathBoolExpr::NamespaceUriEq(s) => {
+            if let Some(elem) = doc.element(node) {
+                elem.name.namespace_uri.as_deref().unwrap_or("") == s.as_str()
+            } else {
+                s.is_empty()
+            }
+        }
+        XPathBoolExpr::NamespaceUriNeq(s) => {
+            if let Some(elem) = doc.element(node) {
+                elem.name.namespace_uri.as_deref().unwrap_or("") != s.as_str()
+            } else {
+                !s.is_empty()
+            }
+        }
+        XPathBoolExpr::ParentIs { ns_uri, local_name } => {
+            if let Some(parent) = doc.parent(node) {
+                doc.element(parent).is_some_and(|e| {
+                    e.name.local_name.as_ref() == local_name.as_str()
+                        && (ns_uri.is_empty()
+                            || e.name.namespace_uri.as_deref().unwrap_or("") == ns_uri)
+                })
+            } else {
+                false
+            }
+        }
+        XPathBoolExpr::StringSelfEqNsUriParent => {
+            // For regular nodes, this compares string value to parent's namespace URI
+            // This is mainly meaningful for namespace nodes; for regular nodes, rarely true
+            false
+        }
+        XPathBoolExpr::IsNotParentNsNode => {
+            // For regular document nodes (elements, text), they're never namespace nodes
+            true
+        }
+        XPathBoolExpr::IsParentNsNode => {
+            // Regular nodes are never namespace nodes
+            false
+        }
+        XPathBoolExpr::DepthOdd => {
+            // Count ancestors-or-self: root=1, root-child=2, etc.
+            let mut depth = 0usize;
+            let mut current = Some(node);
+            while let Some(n) = current {
+                depth += 1;
+                current = doc.parent(n);
+            }
+            depth % 2 == 1
+        }
+    }
+}
+
+/// Evaluate a parsed XPath boolean expression for a virtual namespace node.
+fn eval_xpath_bool_ns(expr: &XPathBoolExpr, ns_node: &NsNode, doc: &Document<'_>) -> bool {
+    match expr {
+        XPathBoolExpr::True => true,
+        XPathBoolExpr::AncestorOrSelf { ns_uri, local_name } => {
+            // Namespace node ancestors are: parent element and its ancestors
+            let mut current = Some(ns_node.parent);
+            while let Some(n) = current {
+                if let Some(elem) = doc.element(n) {
+                    if elem.name.local_name.as_ref() == local_name.as_str()
+                        && (ns_uri.is_empty()
+                            || elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri)
+                    {
+                        return true;
+                    }
+                }
+                current = doc.parent(n);
+            }
+            false
+        }
+        XPathBoolExpr::SelfText => false,
+        XPathBoolExpr::HasAttributes => false,
+        XPathBoolExpr::SelfElement { .. } => false, // namespace node is not an element
+        XPathBoolExpr::Not(inner) => !eval_xpath_bool_ns(inner, ns_node, doc),
+        XPathBoolExpr::And(left, right) => {
+            eval_xpath_bool_ns(left, ns_node, doc) && eval_xpath_bool_ns(right, ns_node, doc)
+        }
+        XPathBoolExpr::Or(left, right) => {
+            eval_xpath_bool_ns(left, ns_node, doc) || eval_xpath_bool_ns(right, ns_node, doc)
+        }
+        XPathBoolExpr::NameEq(s) => {
+            // For namespace nodes, name() returns the prefix
+            ns_node.prefix == *s
+        }
+        XPathBoolExpr::NameNeq(s) => ns_node.prefix != *s,
+        XPathBoolExpr::NamespaceUriEq(s) => {
+            // namespace-uri() on namespace nodes is "" per XPath 1.0 spec §4.1
+            s.is_empty()
+        }
+        XPathBoolExpr::NamespaceUriNeq(s) => !s.is_empty(),
+        XPathBoolExpr::ParentIs { ns_uri, local_name } => {
+            doc.element(ns_node.parent).is_some_and(|e| {
+                e.name.local_name.as_ref() == local_name.as_str()
+                    && (ns_uri.is_empty()
+                        || e.name.namespace_uri.as_deref().unwrap_or("") == ns_uri)
+            })
+        }
+        XPathBoolExpr::StringSelfEqNsUriParent => {
+            // string(self::node()) for namespace nodes = the namespace URI
+            // namespace-uri(parent::node()) = parent element's namespace URI
+            let parent_ns = doc
+                .element(ns_node.parent)
+                .and_then(|e| e.name.namespace_uri.as_deref())
+                .unwrap_or("");
+            ns_node.uri == parent_ns
+        }
+        XPathBoolExpr::IsNotParentNsNode => {
+            // Namespace nodes ARE parent's namespace nodes
+            false
+        }
+        XPathBoolExpr::IsParentNsNode => {
+            // Namespace nodes ARE parent's namespace nodes
+            true
+        }
+        XPathBoolExpr::DepthOdd => {
+            // Namespace node depth = parent depth + 1
+            let mut depth = 1usize; // for the namespace node itself
+            let mut current = Some(ns_node.parent);
+            while let Some(n) = current {
+                depth += 1;
+                current = doc.parent(n);
+            }
+            depth % 2 == 1
+        }
+    }
+}
+
+/// Get the QName of an element from an Element reference (prefix:local or just local if no prefix).
+fn get_element_qname_from_elem(elem: &uppsala::Element<'_>) -> String {
+    if let Some(prefix) = elem.name.prefix.as_deref() {
+        if !prefix.is_empty() {
+            return format!("{}:{}", prefix, elem.name.local_name);
+        }
+    }
+    elem.name.local_name.to_string()
+}
+
+/// Check if an XPath boolean expression references namespace-node-specific
+/// constructs (name(), namespace-uri(), IsNotParentNsNode, etc.).
+/// When true, we need to compute the ns_visible map for the node set.
+fn expr_references_ns_nodes(expr: &XPathBoolExpr) -> bool {
+    match expr {
+        XPathBoolExpr::True => false,
+        XPathBoolExpr::NameEq(_)
+        | XPathBoolExpr::NameNeq(_)
+        | XPathBoolExpr::NamespaceUriEq(_)
+        | XPathBoolExpr::NamespaceUriNeq(_)
+        | XPathBoolExpr::StringSelfEqNsUriParent
+        | XPathBoolExpr::IsNotParentNsNode
+        | XPathBoolExpr::IsParentNsNode
+        | XPathBoolExpr::DepthOdd => true,
+        XPathBoolExpr::Not(inner) => expr_references_ns_nodes(inner),
+        XPathBoolExpr::And(l, r) | XPathBoolExpr::Or(l, r) => {
+            expr_references_ns_nodes(l) || expr_references_ns_nodes(r)
+        }
+        XPathBoolExpr::AncestorOrSelf { .. }
+        | XPathBoolExpr::SelfText
+        | XPathBoolExpr::HasAttributes
+        | XPathBoolExpr::SelfElement { .. }
+        | XPathBoolExpr::ParentIs { .. } => false,
+    }
+}
+
+/// Collect all in-scope namespace bindings for an element by walking the
+/// ancestor chain. Returns a map of prefix → URI.
+fn collect_inscope_namespaces_raw(
+    node: NodeId,
+    doc: &Document<'_>,
+) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let mut ns_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if let Some(elem) = doc.element(n) {
+            let mut level = BTreeMap::new();
+            for (prefix, uri) in &elem.namespace_declarations {
+                level.insert(prefix.to_string(), uri.to_string());
+            }
+            ns_stack.push(level);
+        }
+        current = doc.parent(n);
+    }
+    let mut result = BTreeMap::new();
+    for level in ns_stack.into_iter().rev() {
+        for (prefix, uri) in level {
+            if uri.is_empty() {
+                result.remove(&prefix);
+            } else {
+                result.insert(prefix, uri);
+            }
+        }
+    }
+    result
+}
+
+/// Apply a parsed XPath boolean expression as a node filter.
+fn apply_parsed_xpath_filter<'a>(
+    data: bergshamra_transforms::TransformData<'a>,
+    expr: &XPathBoolExpr,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    use bergshamra_xml::nodeset::{NodeSet, NodeSetType};
+    use std::collections::HashSet;
+
+    // If input is binary, convert to XML first (per XML-DSig spec: "If the input
+    // is an octet stream, the implementation MUST convert the octets to an XPath
+    // node-set by parsing the octets and creating a node-set that includes all
+    // document nodes").
+    let (xml_text, input_ns) = match data {
+        bergshamra_transforms::TransformData::Xml { xml_text, node_set } => (xml_text, node_set),
+        bergshamra_transforms::TransformData::Binary(bytes) => {
+            let text = String::from_utf8(bytes)
+                .map_err(|e| Error::XmlParse(format!("XPath transform: invalid UTF-8: {e}")))?;
+            (text.into(), None)
+        }
+    };
+
+    let doc = uppsala::parse(xml_text.as_ref()).map_err(|e| Error::XmlParse(e.to_string()))?;
+
+    // Filter: include only nodes for which the expression evaluates to true
+    let mut result_ids = HashSet::new();
+    for node in doc.descendants(doc.root()) {
+        // If we have an input node set, only consider nodes in it
+        if let Some(ref ns) = input_ns {
+            if !ns.contains_id(node) {
+                continue;
+            }
+        }
+        if eval_xpath_bool(expr, node, &doc) {
+            result_ids.insert(node.index());
+        }
+    }
+
+    let mut result_ns = NodeSet::from_ids(result_ids, NodeSetType::Normal);
+
+    // XPath `@*` (HasAttributes): the element is in the node set but
+    // its attribute nodes are NOT (since `@*` on an attribute node returns
+    // empty). C14N should omit attributes for these elements.
+    if matches!(expr, XPathBoolExpr::HasAttributes) {
+        result_ns.set_exclude_attrs(true);
+    }
+
+    // If the expression references namespace-node constructs, evaluate
+    // the expression for each element's in-scope namespace bindings and
+    // build the ns_visible map.
+    if expr_references_ns_nodes(expr) {
+        use std::collections::HashMap;
+        let mut ns_map: HashMap<(usize, String), bool> = HashMap::new();
+        for node in doc.descendants(doc.root()) {
+            if doc.element(node).is_none() {
+                continue;
+            }
+            let eid = node.index();
+            let inscope = collect_inscope_namespaces_raw(node, &doc);
+            for (prefix, uri) in &inscope {
+                let ns_node = NsNode {
+                    prefix: prefix.clone(),
+                    uri: uri.clone(),
+                    parent: node,
+                };
+                let visible = eval_xpath_bool_ns(expr, &ns_node, &doc);
+                ns_map.insert((eid, prefix.clone()), visible);
+            }
+        }
+        result_ns.set_ns_visible(ns_map);
+    }
+
+    Ok(bergshamra_transforms::TransformData::Xml {
+        xml_text,
+        node_set: Some(result_ns),
+    })
+}
+
+/// Check if an XPath expression is the enveloped-signature pattern.
+///
+/// Matches: `not(ancestor-or-self::PREFIX:Signature)` where PREFIX is bound
+/// to the XML-DSig namespace `http://www.w3.org/2000/09/xmldsig#`.
+fn is_enveloped_xpath(expr: &str, xpath_node: NodeId, doc: &Document<'_>) -> bool {
+    let expr = expr.trim();
+
+    // Pattern: not(ancestor-or-self::PREFIX:Signature)
+    if !expr.starts_with("not(ancestor-or-self::") || !expr.ends_with(":Signature)") {
+        return false;
+    }
+
+    // Extract the prefix
+    let inner = &expr["not(ancestor-or-self::".len()..expr.len() - ":Signature)".len()];
+
+    // Verify the prefix is bound to the DSIG namespace
+    let dsig_ns = ns::DSIG;
+    // Check namespace declarations on the XPath element and ancestors
+    let mut current = Some(xpath_node);
+    while let Some(n) = current {
+        if let Some(elem) = doc.element(n) {
+            for (prefix, uri) in &elem.namespace_declarations {
+                if prefix.as_ref() == inner && uri.as_ref() == dsig_ns {
+                    return true;
+                }
+            }
+        }
+        current = doc.parent(n);
+    }
+    false
+}
+
+/// Check if an XPath expression is the here()-based enveloped-signature pattern.
+///
+/// Matches:
+/// ```text
+/// count(ancestor-or-self::PREFIX:Signature |
+///   here()/ancestor::PREFIX:Signature[1]) >
+///   count(ancestor-or-self::PREFIX:Signature)
+/// ```
+/// where PREFIX is bound to the XML-DSig namespace.
+/// This is semantically equivalent to the enveloped-signature transform.
+fn is_enveloped_xpath_here(expr: &str, xpath_node: NodeId, doc: &Document<'_>) -> bool {
+    // Normalize whitespace for matching
+    let norm: String = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Pattern: count(ancestor-or-self::P:Signature | here()/ancestor::P:Signature[1]) > count(ancestor-or-self::P:Signature)
+    let prefix = "count(ancestor-or-self::";
+    if !norm.starts_with(prefix) {
+        return false;
+    }
+
+    let rest = &norm[prefix.len()..];
+
+    // Extract PREFIX:Signature from the first part
+    let sig_marker = ":Signature | here()/ancestor::";
+    let Some(pos) = rest.find(sig_marker) else {
+        return false;
+    };
+
+    let pfx = &rest[..pos];
+    let after_marker = &rest[pos + sig_marker.len()..];
+
+    // Verify the rest matches: PREFIX:Signature[1]) > count(ancestor-or-self::PREFIX:Signature)
+    let expected_tail = format!("{pfx}:Signature[1]) > count(ancestor-or-self::{pfx}:Signature)");
+    if after_marker != expected_tail {
+        return false;
+    }
+
+    // Verify the prefix is bound to the DSIG namespace
+    let dsig_ns = ns::DSIG;
+    let mut current = Some(xpath_node);
+    while let Some(n) = current {
+        if let Some(elem) = doc.element(n) {
+            for (prefix, uri) in &elem.namespace_declarations {
+                if prefix.as_ref() == pfx && uri.as_ref() == dsig_ns {
+                    return true;
+                }
+            }
+        }
+        current = doc.parent(n);
+    }
+    false
+}
+
+/// Apply an XPath Filter 2.0 transform.
+///
+/// Per W3C XPath Filter 2.0 spec (Section 3.4):
+/// 1. Initialize filter node-set F to all nodes in the input document
+/// 2. For each XPath expression: evaluate, subtree-expand, apply set op to F
+/// 3. Output O = I ∩ F (input node-set intersected with filter node-set)
+///
+/// An empty input node-set always produces an empty output node-set.
+fn apply_xpath_filter2_transform<'a>(
+    data: bergshamra_transforms::TransformData<'a>,
+    transform_node: NodeId,
+    outer_doc: &Document<'_>,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    use bergshamra_xml::nodeset::NodeSet;
+
+    match data {
+        bergshamra_transforms::TransformData::Xml { xml_text, node_set } => {
+            let doc =
+                uppsala::parse(xml_text.as_ref()).map_err(|e| Error::XmlParse(e.to_string()))?;
+
+            // I = input node-set (from previous transform or URI resolution)
+            let input_ns = node_set.unwrap_or_else(|| NodeSet::all(&doc));
+
+            // F = filter node-set, initialized to ALL nodes in the input document
+            let mut filter_ns = NodeSet::all(&doc);
+
+            // Process each <XPath> child element in sequence, updating F
+            for child in outer_doc.children(transform_node) {
+                let child_elem = match outer_doc.element(child) {
+                    Some(e) if e.name.local_name.as_ref() == "XPath" => e,
+                    _ => continue,
+                };
+                let filter = child_elem.get_attribute("Filter").unwrap_or("");
+                let xpath_expr = element_text(outer_doc, child).unwrap_or("").trim();
+
+                // Evaluate XPath expression and subtree-expand (S')
+                let xpath_ns = evaluate_simple_xpath(&doc, xpath_expr, child, outer_doc)?;
+
+                // Update filter node-set F based on filter type
+                match filter {
+                    "intersect" => {
+                        filter_ns = filter_ns.intersection(&xpath_ns);
+                    }
+                    "subtract" => {
+                        filter_ns = filter_ns.subtract(&xpath_ns);
+                    }
+                    "union" => {
+                        filter_ns = filter_ns.union(&xpath_ns);
+                    }
+                    _ => {
+                        return Err(Error::UnsupportedAlgorithm(format!(
+                            "XPath Filter 2.0 unknown filter: {filter}"
+                        )))
+                    }
+                }
+            }
+
+            // Output O = I ∩ F
+            let result_ns = input_ns.intersection(&filter_ns);
+
+            Ok(bergshamra_transforms::TransformData::Xml {
+                xml_text,
+                node_set: Some(result_ns),
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+/// Evaluate a simple XPath expression and return the matching node set.
+///
+/// Supports:
+/// - `/` — the document root (all nodes)
+/// - `//ElementName` — all descendant elements with the given local name
+/// - `//prefix:ElementName` — namespace-qualified element selection
+/// - `/a/b[@attr="val"]/c` — absolute paths with predicates
+/// - `*` — wildcard element names
+/// - `[not(@attr)]` — negated attribute predicates
+/// - `expr | expr` — union of two path expressions
+fn evaluate_simple_xpath(
+    doc: &Document<'_>,
+    expr: &str,
+    xpath_node: NodeId,
+    outer_doc: &Document<'_>,
+) -> Result<NodeSet, Error> {
+    use bergshamra_xml::nodeset::NodeSet;
+    use std::collections::HashSet;
+
+    // `/` — selects the entire document
+    if expr == "/" {
+        return Ok(NodeSet::all(doc));
+    }
+
+    // Handle top-level union: `expr1 | expr2`
+    // Split on top-level `|` (outside brackets)
+    if let Some((left, right)) = split_xpath_union(expr) {
+        let left_ns = evaluate_simple_xpath(doc, left.trim(), xpath_node, outer_doc)?;
+        let right_ns = evaluate_simple_xpath(doc, right.trim(), xpath_node, outer_doc)?;
+        return Ok(left_ns.union(&right_ns));
+    }
+
+    // `//name` or `//prefix:name` — descendant-or-self element selection
+    if let Some(name_expr) = expr.strip_prefix("//") {
+        let (ns_uri, local_name) = if let Some((prefix, local)) = name_expr.split_once(':') {
+            // Resolve namespace prefix from the XPath element's namespace declarations
+            let uri = resolve_ns_prefix(xpath_node, outer_doc, prefix).ok_or_else(|| {
+                Error::InvalidUri(format!(
+                    "XPath Filter 2.0: unresolved namespace prefix '{prefix}'"
+                ))
+            })?;
+            (Some(uri), local)
+        } else {
+            (None, name_expr)
+        };
+
+        // Find all matching elements and collect their subtrees
+        let mut nodes = HashSet::new();
+        for node in doc.descendants(doc.root()) {
+            if let Some(elem) = doc.element(node) {
+                if elem.name.local_name.as_ref() == local_name {
+                    let matches = match &ns_uri {
+                        Some(uri) => {
+                            elem.name.namespace_uri.as_deref().unwrap_or("") == uri.as_str()
+                        }
+                        None => true, // no namespace specified — match any namespace
+                    };
+                    if matches {
+                        // Collect the element and all its descendants (subtree)
+                        collect_subtree_ids(node, doc, &mut nodes);
+                    }
+                }
+            }
+        }
+
+        return Ok(NodeSet::from_ids(
+            nodes,
+            bergshamra_xml::nodeset::NodeSetType::Normal,
+        ));
+    }
+
+    // Absolute path: `/step1/step2/step3[pred]`
+    if let Some(stripped) = expr.strip_prefix('/') {
+        let steps = parse_xpath_path_steps(stripped)?;
+        let mut nodes = HashSet::new();
+        let matches = evaluate_path_steps(doc, &steps, xpath_node, outer_doc)?;
+        for node in &matches {
+            collect_subtree_ids(*node, doc, &mut nodes);
+        }
+        return Ok(NodeSet::from_ids(
+            nodes,
+            bergshamra_xml::nodeset::NodeSetType::Normal,
+        ));
+    }
+
+    Err(Error::UnsupportedAlgorithm(format!(
+        "XPath Filter 2.0 expression not supported: {expr}"
+    )))
+}
+
+/// Resolve a namespace prefix by walking up the ancestor chain.
+fn resolve_ns_prefix(node: NodeId, doc: &Document<'_>, prefix: &str) -> Option<String> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if let Some(elem) = doc.element(n) {
+            for (p, uri) in &elem.namespace_declarations {
+                if p.as_ref() == prefix {
+                    return Some(uri.to_string());
+                }
+            }
+        }
+        current = doc.parent(n);
+    }
+    None
+}
+
+/// Split an XPath expression at the top-level `|` (union) operator.
+/// Only splits outside brackets `[]` and parentheses `()`.
+fn split_xpath_union(expr: &str) -> Option<(&str, &str)> {
+    let mut bracket_depth = 0i32;
+    let mut paren_depth = 0i32;
+    let bytes = expr.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth -= 1,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            b'|' if bracket_depth == 0 && paren_depth == 0 => {
+                let left = expr[..i].trim();
+                let right = expr[i + 1..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    return Some((left, right));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A parsed XPath path step: element name (or wildcard) plus optional predicate.
+struct PathStep {
+    /// Element local name, or "*" for wildcard
+    name: String,
+    /// Namespace URI if prefix was provided
+    ns_uri: Option<String>,
+    /// Optional predicate (the content inside [...])
+    predicate: Option<String>,
+}
+
+/// Parse a `/`-separated path into steps.
+/// Input is the path WITHOUT the leading `/`, e.g., `XFDL/page[@sid="PAGE1"]/*`.
+fn parse_xpath_path_steps(path: &str) -> Result<Vec<PathStep>, Error> {
+    let mut steps = Vec::new();
+    let mut remaining = path;
+
+    while !remaining.is_empty() {
+        // Find the next `/` that's not inside a predicate `[...]`
+        let mut bracket_depth = 0i32;
+        let mut slash_pos = None;
+        for (i, b) in remaining.bytes().enumerate() {
+            match b {
+                b'[' => bracket_depth += 1,
+                b']' => bracket_depth -= 1,
+                b'/' if bracket_depth == 0 => {
+                    slash_pos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let step_str = match slash_pos {
+            Some(pos) => {
+                let s = &remaining[..pos];
+                remaining = &remaining[pos + 1..];
+                s
+            }
+            None => {
+                let s = remaining;
+                remaining = "";
+                s
+            }
+        };
+
+        // Parse step: "name" or "name[predicate]" or "*[predicate]"
+        let (name_part, predicate) = if let Some(bracket_start) = step_str.find('[') {
+            if !step_str.ends_with(']') {
+                return Err(Error::XmlStructure(format!(
+                    "XPath step with unclosed predicate: {step_str}"
+                )));
+            }
+            let name = &step_str[..bracket_start];
+            let pred = &step_str[bracket_start + 1..step_str.len() - 1];
+            (name, Some(pred.to_string()))
+        } else {
+            (step_str, None)
+        };
+
+        // Resolve prefix:local or just local or *
+        let (ns_uri, local_name) = if name_part == "*" {
+            (None, "*".to_string())
+        } else if let Some((prefix, local)) = name_part.split_once(':') {
+            // We'll resolve the prefix later when we have the xpath_node context
+            (Some(prefix.to_string()), local.to_string())
+        } else {
+            (None, name_part.to_string())
+        };
+
+        steps.push(PathStep {
+            name: local_name,
+            ns_uri,
+            predicate,
+        });
+    }
+
+    Ok(steps)
+}
+
+/// Evaluate path steps against the document, returning the matching leaf nodes.
+fn evaluate_path_steps(
+    doc: &Document<'_>,
+    steps: &[PathStep],
+    xpath_node: NodeId,
+    outer_doc: &Document<'_>,
+) -> Result<Vec<NodeId>, Error> {
+    if steps.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Resolve any namespace prefixes stored as strings
+    let resolved_steps: Vec<(Option<String>, &str, &Option<String>)> = steps
+        .iter()
+        .map(|s| {
+            let ns = match &s.ns_uri {
+                Some(prefix) => resolve_ns_prefix(xpath_node, outer_doc, prefix),
+                None => None,
+            };
+            (ns, s.name.as_str(), &s.predicate)
+        })
+        .collect();
+
+    // Start from the root's children (since we already consumed the leading `/`)
+    let mut current_nodes: Vec<NodeId> = doc
+        .children(doc.root())
+        .into_iter()
+        .filter(|&id| doc.element(id).is_some())
+        .collect();
+
+    for (step_idx, (ns_uri, local_name, predicate)) in resolved_steps.iter().enumerate() {
+        let mut matched = Vec::new();
+
+        for &node in &current_nodes {
+            // Check children of current node (except for first step which is already root children)
+            let candidates: Vec<NodeId> = if step_idx == 0 {
+                vec![node]
+            } else {
+                doc.children(node)
+                    .into_iter()
+                    .filter(|&id| doc.element(id).is_some())
+                    .collect()
+            };
+
+            for candidate in candidates {
+                let elem = match doc.element(candidate) {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                // Match element name
+                let name_matches = if *local_name == "*" {
+                    true
+                } else {
+                    elem.name.local_name.as_ref() == *local_name
+                };
+
+                // Match namespace
+                let ns_matches = match ns_uri {
+                    Some(ref uri) => {
+                        elem.name.namespace_uri.as_deref().unwrap_or("") == uri.as_str()
+                    }
+                    None => true,
+                };
+
+                if name_matches && ns_matches {
+                    // Check predicate
+                    if let Some(pred) = predicate {
+                        if evaluate_xpath_predicate(candidate, doc, pred) {
+                            matched.push(candidate);
+                        }
+                    } else {
+                        matched.push(candidate);
+                    }
+                }
+            }
+        }
+
+        current_nodes = matched;
+    }
+
+    Ok(current_nodes)
+}
+
+/// Evaluate a simple XPath predicate on a node.
+///
+/// Supports:
+/// - `@attr="value"` — attribute equals value
+/// - `@attr="val1" or @attr="val2" or ...` — disjunction of attribute checks
+/// - `not(@attr)` — attribute does not exist
+fn evaluate_xpath_predicate(node: NodeId, doc: &Document<'_>, pred: &str) -> bool {
+    let pred = pred.trim();
+
+    // Handle `not(@attr)` or `not(@prefix:attr)`
+    if pred.starts_with("not(") && pred.ends_with(')') {
+        let inner = pred[4..pred.len() - 1].trim();
+        if let Some(attr_name) = inner.strip_prefix('@') {
+            return doc
+                .element(node)
+                .and_then(|e| e.get_attribute(attr_name))
+                .is_none();
+        }
+    }
+
+    // Handle `@attr="value"` or disjunction `@attr="val1" or @attr="val2"`
+    // Split on top-level ` or `
+    let parts: Vec<&str> = split_predicate_or(pred);
+    if parts.iter().all(|p| is_attr_eq_predicate(p.trim())) {
+        return parts.iter().any(|p| evaluate_attr_eq(node, doc, p.trim()));
+    }
+
+    false
+}
+
+/// Split predicate on ` or ` at top level (outside quotes and parens).
+fn split_predicate_or(pred: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut quote_char = b'"';
+    let bytes = pred.as_bytes();
+    let or_bytes = b" or ";
+    let or_len = or_bytes.len();
+
+    for i in 0..bytes.len() {
+        if !in_quote && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            in_quote = true;
+            quote_char = bytes[i];
+        } else if in_quote && bytes[i] == quote_char {
+            in_quote = false;
+        } else if !in_quote && i + or_len <= bytes.len() && &bytes[i..i + or_len] == or_bytes {
+            parts.push(&pred[start..i]);
+            start = i + or_len;
+        }
+    }
+    parts.push(&pred[start..]);
+    parts
+}
+
+/// Check if a predicate part is an attribute comparison: `@attr="value"`
+fn is_attr_eq_predicate(part: &str) -> bool {
+    part.starts_with('@') && (part.contains("=\"") || part.contains("='"))
+}
+
+/// Evaluate `@attr="value"` predicate.
+fn evaluate_attr_eq(node: NodeId, doc: &Document<'_>, pred: &str) -> bool {
+    let pred = pred.trim();
+    if let Some(attr_part) = pred.strip_prefix('@') {
+        // Split on = to get attr name and value
+        if let Some((attr_name, quoted_value)) = attr_part.split_once('=') {
+            let value = quoted_value.trim_matches(|c| c == '"' || c == '\'');
+            return doc.element(node).and_then(|e| e.get_attribute(attr_name)) == Some(value);
+        }
+    }
+    false
+}
+
+/// Collect all node IDs in a subtree.
+fn collect_subtree_ids(
+    node: NodeId,
+    doc: &Document<'_>,
+    ids: &mut std::collections::HashSet<usize>,
+) {
+    ids.insert(node.index());
+    for child in doc.children(node) {
+        collect_subtree_ids(child, doc, ids);
+    }
+}
+
+/// Apply an XPointer transform.
+///
+/// Extracts `xpointer(id('...'))` from the `<XPointer>` child element
+/// and selects the subtree rooted at the element with the given ID.
+fn apply_xpointer_transform<'a>(
+    data: bergshamra_transforms::TransformData<'a>,
+    transform_node: NodeId,
+    outer_doc: &Document<'_>,
+) -> Result<bergshamra_transforms::TransformData<'a>, Error> {
+    use bergshamra_xml::nodeset::NodeSet;
+    use bergshamra_xml::xpath;
+
+    // Extract the XPointer expression from the <XPointer> child element
+    let xpointer_node = outer_doc
+        .children(transform_node)
+        .into_iter()
+        .find(|&id| {
+            outer_doc
+                .element(id)
+                .is_some_and(|e| e.name.local_name.as_ref() == "XPointer")
+        })
+        .ok_or_else(|| Error::MissingElement("XPointer expression element".into()))?;
+
+    let xpointer_expr = element_text(outer_doc, xpointer_node).unwrap_or("").trim();
+
+    // Parse xpointer(id('...')) or xpointer(id("..."))
+    let id = xpath::parse_xpointer_id(xpointer_expr).ok_or_else(|| {
+        Error::UnsupportedAlgorithm(format!(
+            "XPointer expression not supported: {xpointer_expr}"
+        ))
+    })?;
+
+    match data {
+        bergshamra_transforms::TransformData::Xml { xml_text, node_set } => {
+            let inner_doc =
+                uppsala::parse(xml_text.as_ref()).map_err(|e| Error::XmlParse(e.to_string()))?;
+
+            // Build ID map
+            let id_map = build_id_map(&inner_doc, &["Id", "ID", "id", "AssertionID"])?;
+
+            // Resolve the ID
+            let target = xpath::resolve_id(&inner_doc, &id_map, id)?;
+
+            // Build a node set for the subtree (xpointer includes comments)
+            let subtree_ns = NodeSet::tree_with_comments(target, &inner_doc);
+
+            // Intersect with existing node set if present
+            let final_ns = match node_set {
+                Some(existing) => existing.intersection(&subtree_ns),
+                None => subtree_ns,
+            };
+
+            Ok(bergshamra_transforms::TransformData::Xml {
+                xml_text,
+                node_set: Some(final_ns),
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+/// Try to unwrap an `<EncryptedKey>` inside `<KeyInfo>` to recover a session key.
+///
+/// This handles the case where a symmetric signing key (e.g. HMAC) is encrypted
+/// using AES Key Wrap, 3DES Key Wrap, or RSA key transport.
+fn try_unwrap_encrypted_key(
+    doc: &Document<'_>,
+    key_info_node: NodeId,
+    manager: &bergshamra_keys::KeysManager,
+) -> Result<bergshamra_keys::Key, Error> {
+    // Find <EncryptedKey> child
+    let enc_key_node = doc
+        .children(key_info_node)
+        .into_iter()
+        .find(|&id| {
+            doc.element(id).is_some_and(|e| {
+                e.name.local_name.as_ref() == ns::node::ENCRYPTED_KEY
+                    && e.name.namespace_uri.as_deref().unwrap_or("") == ns::ENC
+            })
+        })
+        .ok_or_else(|| Error::Key("no EncryptedKey found".into()))?;
+
+    // Read EncryptionMethod
+    let enc_method = find_child_element(doc, enc_key_node, ns::ENC, ns::node::ENCRYPTION_METHOD)
+        .ok_or_else(|| Error::MissingElement("EncryptionMethod on EncryptedKey".into()))?;
+    let enc_uri = doc
+        .element(enc_method)
+        .and_then(|e| e.get_attribute(ns::attr::ALGORITHM))
+        .ok_or_else(|| {
+            Error::MissingAttribute("Algorithm on EncryptedKey EncryptionMethod".into())
+        })?;
+
+    // Read CipherData/CipherValue
+    let cipher_data = find_child_element(doc, enc_key_node, ns::ENC, ns::node::CIPHER_DATA)
+        .ok_or_else(|| Error::MissingElement("CipherData on EncryptedKey".into()))?;
+    let cipher_value = find_child_element(doc, cipher_data, ns::ENC, ns::node::CIPHER_VALUE)
+        .ok_or_else(|| Error::MissingElement("CipherValue on EncryptedKey".into()))?;
+    let b64_text = element_text(doc, cipher_value).unwrap_or("").trim();
+    let clean: String = b64_text.chars().filter(|c| !c.is_whitespace()).collect();
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let cipher_bytes = engine
+        .decode(&clean)
+        .map_err(|e| Error::Base64(format!("EncryptedKey CipherValue: {e}")))?;
+
+    // Resolve the KEK from EncryptedKey's own KeyInfo
+    let ek_key_info = find_child_element(doc, enc_key_node, ns::DSIG, ns::node::KEY_INFO);
+
+    let session_key_bytes = match enc_uri {
+        algorithm::KW_AES128 | algorithm::KW_AES192 | algorithm::KW_AES256 => {
+            let kw = bergshamra_crypto::keywrap::from_uri(enc_uri)?;
+            let expected_kek_size = match enc_uri {
+                algorithm::KW_AES128 => 16,
+                algorithm::KW_AES192 => 24,
+                algorithm::KW_AES256 => 32,
+                _ => 0,
+            };
+            // Try KeyName from EncryptedKey's KeyInfo
+            let kek = resolve_kek_from_key_info(doc, ek_key_info, manager)?;
+            let kek_bytes = kek
+                .symmetric_key_bytes()
+                .ok_or_else(|| Error::Key("KEK has no symmetric key bytes".into()))?;
+            // Validate size if possible
+            if expected_kek_size > 0 && kek_bytes.len() != expected_kek_size {
+                // Try to find one with the right size
+                if let Some(sized_key) = manager.find_aes_by_size(expected_kek_size) {
+                    let sized_bytes = sized_key
+                        .symmetric_key_bytes()
+                        .ok_or_else(|| Error::Key("AES key has no bytes".into()))?;
+                    kw.unwrap(sized_bytes, &cipher_bytes)?
+                } else {
+                    kw.unwrap(kek_bytes, &cipher_bytes)?
+                }
+            } else {
+                kw.unwrap(kek_bytes, &cipher_bytes)?
+            }
+        }
+        algorithm::KW_TRIPLEDES => {
+            let kw = bergshamra_crypto::keywrap::from_uri(enc_uri)?;
+            let kek = resolve_kek_from_key_info(doc, ek_key_info, manager)?;
+            let kek_bytes = kek
+                .symmetric_key_bytes()
+                .ok_or_else(|| Error::Key("no symmetric key for 3DES key unwrap".into()))?;
+            kw.unwrap(kek_bytes, &cipher_bytes)?
+        }
+        algorithm::RSA_PKCS1 | algorithm::RSA_OAEP | algorithm::RSA_OAEP_ENC11 => {
+            let oaep_params = read_oaep_params(doc, enc_method);
+            let transport =
+                bergshamra_crypto::keytransport::from_uri_with_params(enc_uri, oaep_params)?;
+            let rsa_key = manager
+                .find_rsa_private()
+                .or_else(|| manager.find_rsa())
+                .ok_or_else(|| Error::Key("no RSA key for EncryptedKey decryption".into()))?;
+            let private_key = rsa_key
+                .software_key()?
+                .ok_or_else(|| Error::Key("RSA key has no software representation".into()))?;
+            if !private_key.has_private_key() {
+                return Err(Error::Key(
+                    "RSA private key required for key transport".into(),
+                ));
+            }
+            transport.decrypt(&private_key, &cipher_bytes)?
+        }
+        _ => {
+            return Err(Error::UnsupportedAlgorithm(format!(
+                "EncryptedKey method: {enc_uri}"
+            )))
+        }
+    };
+
+    // Create an HMAC key from the unwrapped session key
+    Ok(bergshamra_keys::Key::new(
+        bergshamra_keys::key::KeyData::from_symmetric_bytes(
+            kryptering::KeyAlgorithm::Hmac,
+            &session_key_bytes,
+        )?,
+        bergshamra_keys::key::KeyUsage::Any,
+    ))
+}
+
+/// Resolve the Key Encryption Key from an EncryptedKey's KeyInfo.
+fn resolve_kek_from_key_info<'a>(
+    doc: &Document<'_>,
+    ek_key_info: Option<NodeId>,
+    manager: &'a bergshamra_keys::KeysManager,
+) -> Result<&'a bergshamra_keys::Key, Error> {
+    if let Some(ki) = ek_key_info {
+        // Try KeyName
+        for child in doc.children(ki) {
+            let elem = match doc.element(child) {
+                Some(e) => e,
+                None => continue,
+            };
+            let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+            let local = &*elem.name.local_name;
+            if child_ns == ns::DSIG && local == ns::node::KEY_NAME {
+                let name = element_text(doc, child).unwrap_or("").trim();
+                if !name.is_empty() {
+                    if let Some(key) = manager.find_by_name(name) {
+                        return Ok(key);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: first key in manager
+    manager.first_key()
+}
+
+/// Read RSA-OAEP parameters from an EncryptionMethod element.
+fn read_oaep_params(
+    doc: &Document<'_>,
+    enc_method: NodeId,
+) -> bergshamra_crypto::keytransport::OaepParams {
+    let mut params = bergshamra_crypto::keytransport::OaepParams::default();
+    for child in doc.children(enc_method) {
+        let elem = match doc.element(child) {
+            Some(e) => e,
+            None => continue,
+        };
+        let local = &*elem.name.local_name;
+        let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+        if local == ns::node::DIGEST_METHOD && (child_ns == ns::DSIG || child_ns == ns::ENC) {
+            if let Some(alg) = elem.get_attribute(ns::attr::ALGORITHM) {
+                params.digest_uri = Some(alg.to_owned());
+            }
+        }
+        if local == ns::node::RSA_MGF && (child_ns == ns::ENC11 || child_ns == ns::ENC) {
+            if let Some(alg) = elem.get_attribute(ns::attr::ALGORITHM) {
+                params.mgf_uri = Some(alg.to_owned());
+            }
+        }
+        if local == ns::node::RSA_OAEP_PARAMS {
+            if let Some(text) = element_text(doc, child) {
+                let clean: String = text.trim().chars().filter(|c| !c.is_whitespace()).collect();
+                use base64::Engine;
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&clean) {
+                    params.oaep_params = Some(bytes);
+                }
+            }
+        }
+    }
+    params
+}
+
+// ── Helper functions ─────────────────────────────────────────────────
+
+fn find_element(doc: &Document<'_>, ns_uri: &str, local_name: &str) -> Option<NodeId> {
+    for id in doc.descendants(doc.root()) {
+        if let Some(elem) = doc.element(id) {
+            if elem.name.local_name.as_ref() == local_name
+                && elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri
+            {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Find every element matching `ns_uri`/`local_name`, in document order.
+fn find_all_elements(doc: &Document<'_>, ns_uri: &str, local_name: &str) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for id in doc.descendants(doc.root()) {
+        if let Some(elem) = doc.element(id) {
+            if elem.name.local_name.as_ref() == local_name
+                && elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri
+            {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+fn find_child_element(
+    doc: &Document<'_>,
+    parent: NodeId,
+    ns_uri: &str,
+    local_name: &str,
+) -> Option<NodeId> {
+    for id in doc.children(parent) {
+        if let Some(elem) = doc.element(id) {
+            if elem.name.local_name.as_ref() == local_name
+                && elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri
+            {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn find_child_elements(
+    doc: &Document<'_>,
+    parent: NodeId,
+    ns_uri: &str,
+    local_name: &str,
+) -> Vec<NodeId> {
+    doc.children(parent)
+        .into_iter()
+        .filter(|&id| {
+            doc.element(id).is_some_and(|elem| {
+                elem.name.local_name.as_ref() == local_name
+                    && elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri
+            })
+        })
+        .collect()
+}
+
+/// Find a descendant element with the given namespace URI and local name.
+fn find_descendant_element(
+    doc: &Document<'_>,
+    node: NodeId,
+    ns_uri: &str,
+    local_name: &str,
+) -> Option<NodeId> {
+    for id in doc.descendants(node) {
+        if let Some(elem) = doc.element(id) {
+            if elem.name.local_name.as_ref() == local_name
+                && elem.name.namespace_uri.as_deref().unwrap_or("") == ns_uri
+            {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a `<dsig11:KeyInfoReference URI="#id"/>` by following the same-document
+/// reference to the target `<KeyInfo>` element. Returns that element if found.
+fn resolve_key_info_reference(
+    doc: &Document<'_>,
+    key_info_node: NodeId,
+    id_map: &HashMap<String, NodeId>,
+) -> Option<NodeId> {
+    for child in doc.children(key_info_node) {
+        let elem = match doc.element(child) {
+            Some(e) => e,
+            None => continue,
+        };
+        let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+        let local = &*elem.name.local_name;
+        if local == ns::node::KEY_INFO_REFERENCE && child_ns == ns::DSIG11 {
+            if let Some(uri) = elem.get_attribute(ns::attr::URI) {
+                if let Some(fragment) = uri.strip_prefix('#') {
+                    if let Some(&node_id) = id_map.get(fragment) {
+                        return Some(node_id);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn build_id_map(doc: &Document<'_>, attr_names: &[&str]) -> Result<HashMap<String, NodeId>, Error> {
+    let mut map = HashMap::new();
+    for id in doc.descendants(doc.root()) {
+        if let Some(elem) = doc.element(id) {
+            for attr_name in attr_names {
+                if let Some(val) = elem.get_attribute(attr_name) {
+                    if map.insert(val.to_owned(), id).is_some() {
+                        return Err(Error::XmlStructure(format!("duplicate ID: {val}")));
+                    }
+                }
+            }
+            // Also check xml:id
+            if let Some(val) = elem.get_attribute("xml:id") {
+                if map.insert(val.to_owned(), id).is_some() {
+                    return Err(Error::XmlStructure(format!("duplicate ID: {val}")));
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Validate that a reference target is in an expected position relative to the
+/// Signature element. In strict mode, the target must be:
+/// - The document element (root), OR
+/// - An ancestor of the Signature (e.g. the signed element wraps the Signature), OR
+/// - A sibling of the Signature (e.g. both are children of the same parent).
+///
+/// This prevents XML Signature Wrapping (XSW) attacks where an attacker moves the
+/// signed element to an unexpected position and inserts a forged element at the
+/// original location.
+fn validate_reference_position(
+    doc: &Document<'_>,
+    sig_node: NodeId,
+    target_node: NodeId,
+) -> Result<(), Error> {
+    // Document element is always OK
+    if let Some(doc_elem) = doc.document_element() {
+        if target_node == doc_elem {
+            return Ok(());
+        }
+    }
+    // Ancestor of sig_node is OK (target wraps the Signature)
+    if xpath::is_ancestor_or_self(doc, target_node, sig_node) {
+        return Ok(());
+    }
+    // Sibling of sig_node is OK (target is next to the Signature)
+    if xpath::is_sibling(doc, target_node, sig_node) {
+        return Ok(());
+    }
+    Err(Error::XmlStructure(
+        "strict mode: reference target is not an ancestor, sibling, or document element \
+         relative to Signature (possible XSW attack)"
+            .into(),
+    ))
+}
+
+fn read_inclusive_prefixes(doc: &Document<'_>, node: NodeId) -> Vec<String> {
+    for child in doc.children(node) {
+        if let Some(elem) = doc.element(child) {
+            if elem.name.local_name.as_ref() == ns::node::INCLUSIVE_NAMESPACES {
+                if let Some(prefix_list) = elem.get_attribute(ns::attr::PREFIX_LIST) {
+                    return prefix_list
+                        .split_whitespace()
+                        .map(|s| s.to_owned())
+                        .collect();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Extract text content from the first Text/CData child of an element.
+fn element_text<'a>(doc: &'a Document<'a>, id: NodeId) -> Option<&'a str> {
+    for child in doc.children(id) {
+        match doc.node_kind(child) {
+            Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) => return Some(t),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Try to resolve a key from a `<RetrievalMethod>` element in `<KeyInfo>`.
+///
+/// Handles `Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"` by
+/// loading a DER certificate from the URI and extracting the public key.
+fn try_resolve_retrieval_method(
+    doc: &Document<'_>,
+    key_info_node: NodeId,
+    base_dir: Option<&str>,
+    url_maps: &[(String, String)],
+) -> Option<bergshamra_keys::Key> {
+    use bergshamra_keys::key::{Key, KeyUsage};
+
+    for child in doc.children(key_info_node) {
+        let elem = match doc.element(child) {
+            Some(e) => e,
+            None => continue,
+        };
+        let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+        let local = &*elem.name.local_name;
+        if local != "RetrievalMethod" || (child_ns != ns::DSIG && !child_ns.is_empty()) {
+            continue;
+        }
+
+        let type_attr = elem.get_attribute("Type").unwrap_or("");
+        let uri = elem.get_attribute("URI").unwrap_or("");
+
+        if type_attr != "http://www.w3.org/2000/09/xmldsig#rawX509Certificate" {
+            continue;
+        }
+
+        // Resolve URI to a file path
+        let file_path = resolve_retrieval_uri(uri, base_dir, url_maps)?;
+
+        // Load DER certificate
+        let cert_der = std::fs::read(&file_path).ok()?;
+
+        // Try to parse as DER X.509 certificate
+        use der::Decode;
+        let cert = x509_cert::Certificate::from_der(&cert_der).ok()?;
+
+        // Extract public key from certificate
+        let spki = &cert.tbs_certificate.subject_public_key_info;
+        let key_data = key_data_from_spki(spki)?;
+
+        let mut key = Key::new(key_data, KeyUsage::Verify);
+        key.x509_chain.push(cert_der);
+        return Some(key);
+    }
+    None
+}
+
+/// Try to resolve a key from a same-document `<RetrievalMethod>` that
+/// references an X509Data element by `#id`.
+///
+/// Handles the pattern: `<RetrievalMethod Type="...#X509Data" URI="#object-id">`
+/// possibly with XPath transforms.
+fn try_resolve_retrieval_method_inline(
+    doc: &Document<'_>,
+    key_info_node: NodeId,
+    id_map: &HashMap<String, NodeId>,
+) -> Option<bergshamra_keys::Key> {
+    use bergshamra_keys::key::{Key, KeyUsage};
+
+    for child in doc.children(key_info_node) {
+        let elem = match doc.element(child) {
+            Some(e) => e,
+            None => continue,
+        };
+        let child_ns = elem.name.namespace_uri.as_deref().unwrap_or("");
+        let local = &*elem.name.local_name;
+        if local != "RetrievalMethod" || (child_ns != ns::DSIG && !child_ns.is_empty()) {
+            continue;
+        }
+
+        let type_attr = elem.get_attribute("Type").unwrap_or("");
+        let uri = elem.get_attribute("URI").unwrap_or("");
+
+        // Only handle X509Data type with same-document reference
+        if type_attr != "http://www.w3.org/2000/09/xmldsig#X509Data" {
+            continue;
+        }
+        if !uri.starts_with('#') {
+            continue;
+        }
+
+        let id_value = &uri[1..];
+        let &target_node = id_map.get(id_value)?;
+
+        // Look for X509Data inside the target element (or it might be the
+        // target itself if an XPath filter selects it)
+        let x509_data = if doc.element(target_node).is_some_and(|e| {
+            e.name.local_name.as_ref() == "X509Data"
+                && e.name.namespace_uri.as_deref().unwrap_or("") == ns::DSIG
+        }) {
+            target_node
+        } else {
+            find_descendant_element(doc, target_node, ns::DSIG, "X509Data")?
+        };
+
+        // Extract X509Certificate from X509Data
+        let cert_b64_node = find_child_element(doc, x509_data, ns::DSIG, "X509Certificate")?;
+        let cert_b64 = element_text(doc, cert_b64_node).unwrap_or("").trim();
+        let cert_b64_clean: String = cert_b64.chars().filter(|c| !c.is_whitespace()).collect();
+
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let cert_der = engine.decode(&cert_b64_clean).ok()?;
+
+        // Parse the certificate and extract the public key
+        use der::Decode;
+        let cert = x509_cert::Certificate::from_der(&cert_der).ok()?;
+        let spki = &cert.tbs_certificate.subject_public_key_info;
+        let key_data = key_data_from_spki(spki)?;
+
+        let mut key = Key::new(key_data, KeyUsage::Verify);
+        key.x509_chain.push(cert_der);
+        return Some(key);
+    }
+    None
+}
+
+/// Resolve a RetrievalMethod URI to a local file path.
+fn resolve_retrieval_uri(
+    uri: &str,
+    base_dir: Option<&str>,
+    url_maps: &[(String, String)],
+) -> Option<std::path::PathBuf> {
+    // Check url-maps first (prefix replacement)
+    for (url, path) in url_maps {
+        if uri == url {
+            return Some(std::path::PathBuf::from(path));
+        }
+        if uri.starts_with(url) {
+            let suffix = &uri[url.len()..];
+            let full = std::path::Path::new(path).join(suffix.trim_start_matches('/'));
+            if full.exists() {
+                return Some(full);
+            }
+        }
+    }
+
+    // Treat as relative path from base_dir
+    if let Some(base) = base_dir {
+        let full = std::path::Path::new(base).join(uri);
+        if full.exists() {
+            return Some(full);
+        }
+        // Walk up ancestors of base_dir and try each
+        let mut ancestor = std::path::Path::new(base);
+        while let Some(parent) = ancestor.parent() {
+            let full = parent.join(uri);
+            if full.exists() {
+                return Some(full);
+            }
+            ancestor = parent;
+        }
+    }
+
+    // Try CWD-relative
+    {
+        let p = std::path::PathBuf::from(uri);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // Try as absolute path
+    let p = std::path::PathBuf::from(uri);
+    if p.exists() {
+        return Some(p);
+    }
+
+    None
+}
+
+/// Import an X.509 subject public key without exposing a concrete crypto type.
+fn key_data_from_spki(
+    spki: &x509_cert::spki::SubjectPublicKeyInfoOwned,
+) -> Option<bergshamra_keys::key::KeyData> {
+    use bergshamra_keys::key::KeyData;
+    use der::Encode;
+
+    let oid = spki.algorithm.oid;
+    let algorithm = if oid == der::oid::db::rfc5912::RSA_ENCRYPTION
+        || oid == der::oid::db::rfc5912::ID_RSASSA_PSS
+    {
+        kryptering::KeyAlgorithm::Rsa
+    } else if oid == der::oid::db::rfc5912::ID_DSA {
+        kryptering::KeyAlgorithm::Dsa
+    } else if oid == der::oid::db::rfc5912::ID_EC_PUBLIC_KEY {
+        let params = spki.algorithm.parameters.as_ref()?;
+        let curve_oid: der::asn1::ObjectIdentifier = params.decode_as().ok()?;
+        let curve = if curve_oid == der::oid::db::rfc5912::SECP_256_R_1 {
+            kryptering::EcCurve::P256
+        } else if curve_oid == der::oid::db::rfc5912::SECP_384_R_1 {
+            kryptering::EcCurve::P384
+        } else if curve_oid == der::oid::db::rfc5912::SECP_521_R_1 {
+            kryptering::EcCurve::P521
+        } else {
+            return None;
+        };
+        kryptering::KeyAlgorithm::Ec(curve)
+    } else if oid == der::oid::db::rfc8410::ID_ED_25519 {
+        kryptering::KeyAlgorithm::Ed25519
+    } else {
+        return None;
+    };
+
+    let der = spki.to_der().ok()?;
+    KeyData::from_spki_der(algorithm, &der).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runtime-owned file used by resolver tests.
+    ///
+    /// The resolver behavior depends on whether a path exists, so tests create
+    /// a real file and remove it automatically when the test finishes.
+    struct TestFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TestFile {
+        /// Create a unique temporary file with `contents`.
+        fn new(contents: &[u8]) -> Self {
+            let base_nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after unix epoch")
+                .as_nanos();
+            for attempt in 0..100_u32 {
+                let path = std::env::temp_dir().join(format!(
+                    "bergshamra-dsig-reference-{pid}-{base_nonce}-{attempt}.bin",
+                    pid = std::process::id()
+                ));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(mut file) => {
+                        use std::io::Write;
+                        file.write_all(contents)
+                            .expect("temporary resolver fixture must be writable");
+                        return Self { path };
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => {
+                        panic!(
+                            "temporary resolver fixture {} must be creatable: {err}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+
+            panic!("temporary resolver fixture path must be unique after retries");
+        }
+
+        /// Return the temporary path as UTF-8 for URI test inputs.
+        fn as_str(&self) -> &str {
+            self.path
+                .to_str()
+                .expect("temporary resolver path must be valid UTF-8")
+        }
+
+        /// Return the parent directory as UTF-8 for `base_dir` tests.
+        fn parent_str(&self) -> &str {
+            self.path
+                .parent()
+                .and_then(std::path::Path::to_str)
+                .expect("temporary resolver parent must be valid UTF-8")
+        }
+
+        /// Return only the file name as UTF-8 for relative URI tests.
+        fn file_name_str(&self) -> &str {
+            self.path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("temporary resolver filename must be valid UTF-8")
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Runtime-owned directory used by resolver containment tests.
+    ///
+    /// A real directory lets tests exercise canonical path containment without
+    /// depending on repository fixtures or shared global state.
+    struct TestDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TestDir {
+        /// Create a unique temporary directory.
+        fn new() -> Self {
+            let base_nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after unix epoch")
+                .as_nanos();
+            for attempt in 0..100_u32 {
+                let path = std::env::temp_dir().join(format!(
+                    "bergshamra-dsig-reference-dir-{pid}-{base_nonce}-{attempt}",
+                    pid = std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self { path },
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => {
+                        panic!(
+                            "temporary resolver directory {} must be creatable: {err}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+
+            panic!("temporary resolver directory path must be unique after retries");
+        }
+
+        /// Return the temporary directory path as UTF-8 for `base_dir` inputs.
+        fn as_str(&self) -> &str {
+            self.path
+                .to_str()
+                .expect("temporary resolver directory must be valid UTF-8")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Build a key manager containing one HMAC key for compact signing tests.
+    ///
+    /// HMAC keeps the no-reference regression self-contained: the generated
+    /// signature is real, but the fixture does not need RSA keys or certificates.
+    fn hmac_keys_manager() -> bergshamra_keys::KeysManager {
+        let mut keys = bergshamra_keys::KeysManager::new();
+        keys.add_key(bergshamra_keys::Key::new(
+            bergshamra_keys::KeyData::from_symmetric_bytes(
+                kryptering::KeyAlgorithm::Hmac,
+                b"reference-policy-secret",
+            )
+            .unwrap(),
+            bergshamra_keys::KeyUsage::Any,
+        ));
+        keys
+    }
+
+    /// XML-DSig template with a `SignedInfo` that intentionally has no
+    /// `Reference` children.
+    ///
+    /// Signing this template reproduces the coverage-bypass shape from the
+    /// security finding: `SignatureValue` can be valid while no payload bytes
+    /// were locally digested.
+    fn no_reference_hmac_template() -> String {
+        format!(
+            r#"<Root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <Payload>unsigned content</Payload>
+  <ds:Signature>
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="{c14n}"/>
+      <ds:SignatureMethod Algorithm="{hmac_sha256}"/>
+    </ds:SignedInfo>
+    <ds:SignatureValue></ds:SignatureValue>
+  </ds:Signature>
+</Root>"#,
+            c14n = algorithm::EXC_C14N,
+            hmac_sha256 = algorithm::HMAC_SHA256,
+        )
+    }
+
+    fn signed_no_reference_hmac_xml() -> String {
+        let signing_ctx = DsigContext::new_permissive(hmac_keys_manager());
+        crate::sign::sign(&signing_ctx, &no_reference_hmac_template())
+            .expect("no-reference HMAC template should sign")
+    }
+
+    #[test]
+    fn test_build_id_map_includes_assertionid() {
+        // SAML v1.1 uses AssertionID as the identifier attribute
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:1.0:assertion"
+            AssertionID="abc123" MajorVersion="1" MinorVersion="1">
+            <saml:AttributeStatement/>
+        </saml:Assertion>"#;
+        let doc = uppsala::parse(xml).expect("parse XML");
+        let id_map =
+            build_id_map(&doc, &["Id", "ID", "id", "AssertionID"]).expect("no duplicate IDs");
+        assert!(
+            id_map.contains_key("abc123"),
+            "AssertionID should be in the ID map"
+        );
+    }
+
+    #[test]
+    fn test_build_id_map_standard_id_attrs() {
+        let xml = r#"<Root>
+            <Elem1 Id="e1"/>
+            <Elem2 ID="e2"/>
+            <Elem3 id="e3"/>
+        </Root>"#;
+        let doc = uppsala::parse(xml).expect("parse XML");
+        let id_map =
+            build_id_map(&doc, &["Id", "ID", "id", "AssertionID"]).expect("no duplicate IDs");
+        assert!(id_map.contains_key("e1"), "Id should be in map");
+        assert!(id_map.contains_key("e2"), "ID should be in map");
+        assert!(id_map.contains_key("e3"), "id should be in map");
+    }
+
+    #[test]
+    fn test_find_all_elements_returns_every_match_in_document_order() {
+        // verify_all relies on find_all_elements to discover every <Signature>,
+        // including nested ones (e.g. a Response signature plus an Assertion
+        // signature), in document order.
+        let xml = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+            xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+            xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:Signature><ds:SignedInfo>resp</ds:SignedInfo></ds:Signature>
+            <saml:Assertion>
+                <ds:Signature><ds:SignedInfo>assert</ds:SignedInfo></ds:Signature>
+            </saml:Assertion>
+        </samlp:Response>"##;
+        let doc = uppsala::parse(xml).expect("parse");
+        let sigs = find_all_elements(&doc, ns::DSIG, ns::node::SIGNATURE);
+        assert_eq!(sigs.len(), 2, "both signatures must be discovered");
+        // Verify document order by the *content* of each returned signature, not
+        // by its position in the same traversal find_all_elements uses (which
+        // would be tautological). The Response signature (SignedInfo text
+        // "resp") must come before the nested Assertion signature ("assert").
+        let signed_info_text = |sig| {
+            let si = find_child_element(&doc, sig, ns::DSIG, ns::node::SIGNED_INFO)
+                .expect("each signature has a SignedInfo");
+            element_text(&doc, si).unwrap_or("").trim().to_owned()
+        };
+        assert_eq!(
+            signed_info_text(sigs[0]),
+            "resp",
+            "the first returned signature must be the Response signature"
+        );
+        assert_eq!(
+            signed_info_text(sigs[1]),
+            "assert",
+            "the second returned signature must be the nested Assertion signature"
+        );
+    }
+
+    #[test]
+    fn test_verify_all_errors_when_no_signature() {
+        // verify_all must report MissingElement (not an empty Vec) for a document
+        // with no <Signature>, mirroring verify's behaviour.
+        let ctx = DsigContext::new(bergshamra_keys::KeysManager::new());
+        let err = verify_all(&ctx, "<root><child/></root>")
+            .expect_err("a document with no Signature must error");
+        assert!(matches!(err, Error::MissingElement(_)));
+    }
+
+    #[test]
+    fn test_verify_all_reports_per_signature_errors_as_invalid() {
+        // A per-signature structural error (here: a <Signature> with no
+        // <SignedInfo>) must NOT short-circuit verify_all with Err — it must be
+        // reported as an Invalid entry so it cannot hide the other signatures.
+        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:Signature><ds:SignedInfo></ds:SignedInfo></ds:Signature>
+            <ds:Signature></ds:Signature>
+        </root>"##;
+        let ctx = DsigContext::new(bergshamra_keys::KeysManager::new());
+        let results = verify_all(&ctx, xml).expect("document-level parse must succeed");
+        assert_eq!(results.len(), 2, "both signatures must be reported");
+        // The second signature has no <SignedInfo>; it must be Invalid, not an
+        // error that aborts the whole call.
+        assert!(
+            matches!(results[1], VerifyResult::Invalid { .. }),
+            "a signature missing SignedInfo must be reported as Invalid"
+        );
+    }
+
+    #[test]
+    fn test_verify_reference_skips_cid_uri() {
+        // A <Reference URI="cid:..."> should be skipped (return Valid) without
+        // attempting to resolve the URI or compute a digest.
+        // See docs/adr/0002-cid-uri-scheme-skip.md
+        let xml = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:Reference URI="cid:attachment-1@example.com">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue>AAAA</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+</ds:Signature>"##;
+        let doc = uppsala::parse(xml).expect("parse");
+        let sig_node = find_element(&doc, ns::DSIG, ns::node::SIGNATURE).unwrap();
+        let signed_info =
+            find_child_element(&doc, sig_node, ns::DSIG, ns::node::SIGNED_INFO).unwrap();
+        let refs = find_child_elements(&doc, signed_info, ns::DSIG, ns::node::REFERENCE);
+        assert_eq!(refs.len(), 1);
+
+        let id_map = HashMap::new();
+        let (mismatch, vref) = verify_reference(
+            refs[0],
+            &doc,
+            &id_map,
+            Some(xml),
+            sig_node,
+            &[],
+            false,
+            None,
+        )
+        .expect("verify_reference failed");
+        assert!(
+            mismatch.is_none(),
+            "cid: reference should be skipped and reported as Valid"
+        );
+        assert!(vref.uri.starts_with("cid:"));
+        assert!(!vref.digest_verified);
+    }
+
+    #[test]
+    fn test_verify_reference_does_not_skip_non_cid_fragment() {
+        // A normal fragment reference (e.g. #id) should NOT be skipped.
+        // This verifies the cid: check is specific and does not accidentally
+        // skip other URI schemes.
+        let xml = r##"<Root Id="body">
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:Reference URI="#body">
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue>AAAA</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+  </ds:Signature>
+</Root>"##;
+        let doc = uppsala::parse(xml).expect("parse");
+        let sig_node = find_element(&doc, ns::DSIG, ns::node::SIGNATURE).unwrap();
+        let signed_info =
+            find_child_element(&doc, sig_node, ns::DSIG, ns::node::SIGNED_INFO).unwrap();
+        let refs = find_child_elements(&doc, signed_info, ns::DSIG, ns::node::REFERENCE);
+        assert_eq!(refs.len(), 1);
+
+        let id_map = build_id_map(&doc, &["Id", "ID", "id"]).expect("no duplicate IDs");
+        let (mismatch, vref) = verify_reference(
+            refs[0],
+            &doc,
+            &id_map,
+            Some(xml),
+            sig_node,
+            &[],
+            false,
+            None,
+        )
+        .expect("verify_reference failed");
+        // The digest will not match since AAAA is bogus, so we expect Some(reason).
+        assert!(
+            mismatch.is_some(),
+            "non-cid reference should be processed normally, digest mismatch expected"
+        );
+        assert!(vref.digest_verified);
+    }
+
+    #[test]
+    fn resolve_reference_uri_rejects_absolute_local_file_reference() {
+        // Absolute paths in a signed document are attacker-controlled input.
+        // Verification must reject them before reading the file; otherwise an
+        // invalid signature could select and disclose arbitrary local bytes.
+        let secret = "scan-local secret bytes";
+        let local_file = TestFile::new(secret.as_bytes());
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+
+        let message = match resolve_reference_uri(
+            local_file.as_str(),
+            &doc,
+            &id_map,
+            xml,
+            &[],
+            Some(local_file.parent_str()),
+        ) {
+            Err(Error::InvalidUri(message)) => message,
+            Err(err) => panic!("expected InvalidUri for absolute local path, got {err:?}"),
+            Ok(_) => panic!("absolute local path must not resolve to bytes"),
+        };
+
+        assert!(
+            message.contains("absolute local file"),
+            "error must identify the blocked local path policy"
+        );
+        assert!(
+            !message.contains(secret),
+            "error reporting must not include local file contents"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_uri_rejects_parent_directory_local_file_reference() {
+        // Simple relative detached files are allowed for XML-DSig
+        // compatibility, but `..` would let untrusted XML escape the intended
+        // document-adjacent directory.
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+
+        let message =
+            match resolve_reference_uri("../secret.txt", &doc, &id_map, xml, &[], Some("/tmp")) {
+                Err(Error::InvalidUri(message)) => message,
+                Err(err) => {
+                    panic!("expected InvalidUri for parent-directory reference, got {err:?}")
+                }
+                Ok(_) => panic!("parent-directory reference must not resolve to bytes"),
+            };
+
+        assert!(
+            message.contains("parent-directory"),
+            "error must identify the blocked traversal policy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_reference_uri_rejects_symlink_escape_from_base_dir() {
+        // A simple relative name can still escape the document directory if it
+        // is a symlink. Canonical containment must catch that before reading
+        // detached bytes selected by untrusted XML.
+        let outside_secret = "symlink escape secret";
+        let outside_file = TestFile::new(outside_secret.as_bytes());
+        let base_dir = TestDir::new();
+        std::os::unix::fs::symlink(outside_file.as_str(), base_dir.path.join("allowed"))
+            .expect("symlink fixture must be creatable");
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+
+        let message = match resolve_reference_uri(
+            "allowed",
+            &doc,
+            &id_map,
+            xml,
+            &[],
+            Some(base_dir.as_str()),
+        ) {
+            Err(Error::InvalidUri(message)) => message,
+            Err(err) => panic!("expected InvalidUri for symlink escape, got {err:?}"),
+            Ok(_) => panic!("symlink escape must not resolve to bytes"),
+        };
+
+        assert!(
+            message.contains("escapes base directory"),
+            "error must identify the blocked canonical containment policy"
+        );
+        assert!(
+            !message.contains(outside_secret),
+            "error reporting must not include escaped file contents"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_reference_uri_rejects_windows_drive_local_file_reference() {
+        // Windows drive-qualified paths can look like one-letter URI schemes.
+        // The verifier must reject them as local paths before scheme handling
+        // so the local-file policy is consistent across platforms.
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+
+        for uri in ["C:\\secret.txt", "C:secret.txt"] {
+            let message = match resolve_reference_uri(uri, &doc, &id_map, xml, &[], Some("C:\\")) {
+                Err(Error::InvalidUri(message)) => message,
+                Err(err) => panic!("expected InvalidUri for Windows local path, got {err:?}"),
+                Ok(_) => panic!("Windows local path must not resolve to bytes"),
+            };
+
+            assert!(
+                message.contains("absolute local file"),
+                "error must identify the blocked local path policy for {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_reference_uri_reads_document_relative_file_without_debug_dump() {
+        // XML-DSig compatibility suites use detached files beside the signed
+        // document. These bytes can be hashed, but they must remain redacted
+        // from pre-digest debug output until the outer signature is trusted.
+        let mapped_bytes = b"document relative bytes";
+        let local_file = TestFile::new(mapped_bytes);
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+
+        match resolve_reference_uri(
+            local_file.file_name_str(),
+            &doc,
+            &id_map,
+            xml,
+            &[],
+            Some(local_file.parent_str()),
+        ) {
+            Ok(ResolvedUri::Binary {
+                bytes,
+                debug_pre_digest_bytes,
+            }) => {
+                assert_eq!(bytes, mapped_bytes);
+                assert!(
+                    !debug_pre_digest_bytes,
+                    "detached local bytes must be redacted in verifier debug output"
+                );
+            }
+            Ok(ResolvedUri::Xml { .. }) => panic!("local file must resolve to detached bytes"),
+            Err(err) => panic!("document-relative file should resolve, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_reference_uri_reads_explicit_url_map() {
+        // Explicit URL maps are the supported detached-content path: callers
+        // decide which URI may read which file before untrusted XML is
+        // verified.
+        let mapped_bytes = b"mapped external bytes";
+        let mapped_file = TestFile::new(mapped_bytes);
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+        let uri = "urn:bergshamra:test-resource";
+        let url_maps = vec![(uri.to_owned(), mapped_file.as_str().to_owned())];
+
+        match resolve_reference_uri(uri, &doc, &id_map, xml, &url_maps, None) {
+            Ok(ResolvedUri::Binary {
+                bytes,
+                debug_pre_digest_bytes,
+            }) => {
+                assert_eq!(bytes, mapped_bytes);
+                assert!(
+                    !debug_pre_digest_bytes,
+                    "detached mapped bytes must be redacted in verifier debug output"
+                );
+            }
+            Ok(ResolvedUri::Xml { .. }) => panic!("url-map must resolve to detached bytes"),
+            Err(err) => panic!("explicit url-map should resolve, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_reference_uri_rejects_url_map_prefix_lookalike() {
+        // URL maps must not treat an arbitrary starts_with match as authority to
+        // read the mapped local file. A host lookalike such as
+        // `example.test.evil` is a different URI even though it shares a prefix.
+        let mapped_file = TestFile::new(b"mapped external bytes");
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+        let map_url = "https://example.test/resource";
+        let attacker_uri = "https://example.test.evil/resource";
+        let url_maps = vec![(map_url.to_owned(), mapped_file.as_str().to_owned())];
+
+        match resolve_reference_uri(attacker_uri, &doc, &id_map, xml, &url_maps, None) {
+            Err(Error::InvalidUri(message)) => assert!(
+                message.contains("external URI not supported"),
+                "unexpected error message: {message}"
+            ),
+            Ok(_) => panic!("host-lookalike URL map prefix must not resolve"),
+            Err(err) => panic!("unexpected URL map prefix error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_reference_uri_allows_url_map_fragment_suffix() {
+        // Fragment suffixes still refer to the same mapped resource and are the
+        // only non-exact URL-map match accepted by the resolver.
+        let mapped_bytes = b"mapped external bytes";
+        let mapped_file = TestFile::new(mapped_bytes);
+        let xml = r#"<Root Id="body"><Data>ok</Data></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let id_map = HashMap::new();
+        let map_url = "https://example.test/resource";
+        let uri_with_fragment = "https://example.test/resource#body";
+        let url_maps = vec![(map_url.to_owned(), mapped_file.as_str().to_owned())];
+
+        match resolve_reference_uri(uri_with_fragment, &doc, &id_map, xml, &url_maps, None) {
+            Ok(ResolvedUri::Binary {
+                bytes,
+                debug_pre_digest_bytes,
+            }) => {
+                assert_eq!(bytes, mapped_bytes);
+                assert!(
+                    !debug_pre_digest_bytes,
+                    "mapped external bytes must be redacted in verifier debug output"
+                );
+            }
+            Ok(ResolvedUri::Xml { .. }) => {
+                panic!("fragment URL map must resolve to detached bytes")
+            }
+            Err(err) => panic!("fragment URL map should resolve, got {err:?}"),
+        }
+    }
+
+    fn verified_reference(digest_verified: bool) -> VerifiedReference {
+        VerifiedReference {
+            uri: "#body".to_owned(),
+            resolved_node: Some(NodeId::new(0)),
+            digest_verified,
+        }
+    }
+
+    fn verified_key_info() -> VerifiedKeyInfo {
+        VerifiedKeyInfo {
+            algorithm: "test".to_owned(),
+            key_name: None,
+            x509_chain: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verify_result_helpers_report_all_verified_references() {
+        let result = VerifyResult::Valid {
+            signature_node: NodeId::new(0),
+            references: vec![verified_reference(true), verified_reference(true)],
+            key_info: verified_key_info(),
+        };
+
+        assert!(result.all_reference_digests_verified());
+        assert!(!result.has_unverified_references());
+    }
+
+    #[test]
+    fn verify_result_helpers_report_unverified_references() {
+        let result = VerifyResult::Valid {
+            signature_node: NodeId::new(0),
+            references: vec![verified_reference(true), verified_reference(false)],
+            key_info: verified_key_info(),
+        };
+
+        assert!(!result.all_reference_digests_verified());
+        assert!(result.has_unverified_references());
+    }
+
+    #[test]
+    fn verify_result_helpers_do_not_treat_zero_references_as_complete_coverage() {
+        let result = VerifyResult::Valid {
+            signature_node: NodeId::new(0),
+            references: Vec::new(),
+            key_info: verified_key_info(),
+        };
+
+        assert!(!result.all_reference_digests_verified());
+        assert!(!result.has_unverified_references());
+    }
+
+    #[test]
+    fn verify_result_helpers_are_false_for_invalid_result() {
+        let result = VerifyResult::Invalid {
+            reason: "bad signature".to_owned(),
+        };
+
+        assert!(!result.all_reference_digests_verified());
+        assert!(!result.has_unverified_references());
+    }
+
+    /// A signature with references but no locally verified digests should use
+    /// the same policy reason as a zero-reference signature.
+    ///
+    /// This covers detached-only cases such as all-`cid:` references, where the
+    /// reference list is non-empty but every digest is still out-of-band.
+    #[test]
+    fn reference_digest_policy_reports_no_digests_when_all_references_are_unverified() {
+        let ctx = DsigContext::new_permissive(bergshamra_keys::KeysManager::new());
+        let references = vec![verified_reference(false), verified_reference(false)];
+
+        assert_eq!(
+            reference_digest_policy_failure(&ctx, &references),
+            Some("no Reference digests were verified locally")
+        );
+    }
+
+    /// Mixed local and skipped references should report that only some digests
+    /// were missing.
+    #[test]
+    fn reference_digest_policy_reports_some_missing_digests_for_mixed_references() {
+        let ctx = DsigContext::new_permissive(bergshamra_keys::KeysManager::new());
+        let references = vec![verified_reference(true), verified_reference(false)];
+
+        assert_eq!(
+            reference_digest_policy_failure(&ctx, &references),
+            Some("one or more Reference digests were not verified locally")
+        );
+    }
+
+    /// A valid `SignatureValue` with no `Reference` digests is invalid by default.
+    ///
+    /// This regression covers the source-to-sink behavior from the security
+    /// finding: verification must not return `Valid` when no payload digest was
+    /// computed locally.
+    #[test]
+    fn verify_rejects_no_reference_signature_by_default() {
+        let signed_xml = signed_no_reference_hmac_xml();
+        let ctx = DsigContext::new_permissive(hmac_keys_manager());
+
+        let result = verify(&ctx, &signed_xml).expect("verification should complete");
+
+        assert!(
+            matches!(
+                result,
+                VerifyResult::Invalid { ref reason }
+                    if reason.contains("no Reference digests were verified locally")
+            ),
+            "no-reference signature must be invalid by default: {result:?}"
+        );
+    }
+
+    /// Detached-content callers can explicitly opt out of the local digest policy.
+    ///
+    /// The opt-out is a compatibility escape hatch for profiles that verify
+    /// attachment or detached-content digests outside Bergshamra.
+    #[test]
+    fn verify_allows_no_reference_signature_when_policy_disabled() {
+        let signed_xml = signed_no_reference_hmac_xml();
+        let ctx =
+            DsigContext::new_permissive(hmac_keys_manager()).with_require_reference_digests(false);
+
+        let result = verify(&ctx, &signed_xml).expect("verification should complete");
+
+        match result {
+            VerifyResult::Valid { references, .. } => {
+                assert!(
+                    references.is_empty(),
+                    "fixture must remain a no-reference signature"
+                );
+            }
+            VerifyResult::Invalid { reason } => {
+                panic!("policy-disabled verification should accept the signature: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_id_map_rejects_duplicate_id() {
+        let xml = r#"<Root>
+            <Elem1 Id="dup"/>
+            <Elem2 Id="dup"/>
+        </Root>"#;
+        let doc = uppsala::parse(xml).expect("parse XML");
+        let result = build_id_map(&doc, &["Id", "ID", "id"]);
+        assert!(result.is_err(), "duplicate ID should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate ID: dup"),
+            "error should name the duplicate ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_id_map_allows_different_ids() {
+        let xml = r#"<Root>
+            <Elem1 Id="a"/>
+            <Elem2 Id="b"/>
+            <Elem3 ID="c"/>
+        </Root>"#;
+        let doc = uppsala::parse(xml).expect("parse XML");
+        let id_map = build_id_map(&doc, &["Id", "ID", "id"]).expect("different IDs should be fine");
+        assert_eq!(id_map.len(), 3);
+    }
+
+    #[test]
+    fn test_build_id_map_cross_attr_duplicate_rejected() {
+        // Same value on different attribute names (Id vs ID) is still a duplicate
+        let xml = r#"<Root>
+            <Elem1 Id="same"/>
+            <Elem2 ID="same"/>
+        </Root>"#;
+        let doc = uppsala::parse(xml).expect("parse XML");
+        let result = build_id_map(&doc, &["Id", "ID", "id"]);
+        assert!(
+            result.is_err(),
+            "cross-attr-type duplicate should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_reference_position_ancestor_ok() {
+        // Target is an ancestor of Signature — allowed in strict mode
+        let xml = r#"<Root Id="root"><Signature/></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let root = doc.document_element().unwrap();
+        let sig = doc
+            .children(root)
+            .into_iter()
+            .find(|&id| {
+                doc.element(id)
+                    .is_some_and(|e| &*e.name.local_name == "Signature")
+            })
+            .unwrap();
+        assert!(validate_reference_position(&doc, sig, root).is_ok());
+    }
+
+    #[test]
+    fn test_validate_reference_position_sibling_ok() {
+        // Target is a sibling of Signature — allowed in strict mode
+        let xml = r#"<Root><Data Id="d1"/><Signature/></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let root = doc.document_element().unwrap();
+        let children: Vec<_> = doc
+            .children(root)
+            .into_iter()
+            .filter(|&id| doc.element(id).is_some())
+            .collect();
+        let data_node = children[0];
+        let sig_node = children[1];
+        assert!(validate_reference_position(&doc, sig_node, data_node).is_ok());
+    }
+
+    #[test]
+    fn test_validate_reference_position_document_element_ok() {
+        // Target is the document element — always allowed
+        let xml = r#"<Root Id="root"><Child><Signature/></Child></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let root = doc.document_element().unwrap();
+        let child = doc
+            .children(root)
+            .into_iter()
+            .find(|&id| {
+                doc.element(id)
+                    .is_some_and(|e| &*e.name.local_name == "Child")
+            })
+            .unwrap();
+        let sig = doc
+            .children(child)
+            .into_iter()
+            .find(|&id| {
+                doc.element(id)
+                    .is_some_and(|e| &*e.name.local_name == "Signature")
+            })
+            .unwrap();
+        assert!(validate_reference_position(&doc, sig, root).is_ok());
+    }
+
+    #[test]
+    fn test_validate_reference_position_unrelated_rejected() {
+        // Target is in a completely different subtree — rejected in strict mode
+        let xml = r#"<Root><A><Target Id="t1"/></A><B><Signature/></B></Root>"#;
+        let doc = uppsala::parse(xml).expect("parse");
+        let root = doc.document_element().unwrap();
+        let a = doc
+            .children(root)
+            .into_iter()
+            .find(|&id| doc.element(id).is_some_and(|e| &*e.name.local_name == "A"))
+            .unwrap();
+        let b = doc
+            .children(root)
+            .into_iter()
+            .find(|&id| doc.element(id).is_some_and(|e| &*e.name.local_name == "B"))
+            .unwrap();
+        let target = doc
+            .children(a)
+            .into_iter()
+            .find(|&id| {
+                doc.element(id)
+                    .is_some_and(|e| &*e.name.local_name == "Target")
+            })
+            .unwrap();
+        let sig = doc
+            .children(b)
+            .into_iter()
+            .find(|&id| {
+                doc.element(id)
+                    .is_some_and(|e| &*e.name.local_name == "Signature")
+            })
+            .unwrap();
+        let result = validate_reference_position(&doc, sig, target);
+        assert!(
+            result.is_err(),
+            "unrelated target should be rejected in strict mode"
+        );
+    }
+
+    // --- Tests ported from Go signedxml library ---
+    // These tests verify XML-DSig validation against real-world SAML, WSFed, and
+    // other signed XML documents originally from the Go signedxml test suite.
+
+    /// Path to the signedxml test data directory (relative to crate root).
+    const SIGNEDXML_TESTDATA: &str = "../../test-data/signedxml";
+
+    /// Helper: load a test file, returning the content or skipping if not found.
+    fn load_signedxml_testdata(filename: &str) -> String {
+        let path = std::path::Path::new(SIGNEDXML_TESTDATA).join(filename);
+        if !path.exists() {
+            eprintln!("skipping {filename}: test-data/signedxml/{filename} not found");
+            return String::new();
+        }
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    /// Helper: create a permissive DsigContext (no keys, insecure, no cert validation).
+    fn default_ctx() -> DsigContext {
+        DsigContext::new_permissive(bergshamra_keys::KeysManager::new())
+    }
+
+    #[cfg(feature = "aws-lc")]
+    fn assert_aws_lc_rejects_1024_bit_rsa_fixture(
+        result: std::result::Result<VerifyResult, Error>,
+        fixture: &str,
+    ) {
+        let error = result.expect_err("AWS-LC must reject the fixture's 1024-bit RSA key");
+        let message = error.to_string();
+        assert!(
+            matches!(error, Error::UnsupportedAlgorithm(_))
+                && message.contains("1024-bit RSA key")
+                && message.contains("at least 2048 bits"),
+            "expected deterministic AWS-LC key-size rejection for {fixture}, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_bbauth_metadata() {
+        // Blackbaud Auth SAML metadata with enveloped signature and embedded X509.
+        // Uses exc-c14n, rsa-sha256, sha256.
+        let xml = load_signedxml_testdata("bbauth-metadata.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml).expect("verify should not return Err");
+        assert!(
+            result.is_valid(),
+            "bbauth-metadata.xml should verify: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_saml_external_ns() {
+        // SAML Assertion with external namespace declarations, embedded X509.
+        // Uses exc-c14n, rsa-sha1, sha1.
+        let xml = load_signedxml_testdata("saml-external-ns.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml).expect("verify should not return Err");
+        assert!(
+            result.is_valid(),
+            "saml-external-ns.xml should verify: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_signature_with_inclusive_namespaces() {
+        // SAML Assertion with InclusiveNamespaces PrefixList="xs" in exc-c14n transform.
+        // Uses exc-c14n, rsa-sha1, sha1.
+        let xml = load_signedxml_testdata("signature-with-inclusivenamespaces.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml);
+        #[cfg(feature = "aws-lc")]
+        assert_aws_lc_rejects_1024_bit_rsa_fixture(
+            result,
+            "signature-with-inclusivenamespaces.xml",
+        );
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let result = result.expect("verify should not return Err");
+            assert!(
+                result.is_valid(),
+                "signature-with-inclusivenamespaces.xml should verify: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_valid_saml() {
+        // Full SAML Response with enveloped signature, embedded X509.
+        // Uses exc-c14n, rsa-sha1, sha1.
+        let xml = load_signedxml_testdata("valid-saml.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml);
+        #[cfg(feature = "aws-lc")]
+        assert_aws_lc_rejects_1024_bit_rsa_fixture(result, "valid-saml.xml");
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let result = result.expect("verify should not return Err");
+            assert!(
+                result.is_valid(),
+                "valid-saml.xml should verify: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_wsfed_metadata() {
+        // WS-Federation EntityDescriptor with enveloped signature, embedded X509.
+        // Uses exc-c14n, rsa-sha256, sha256. File has UTF-8 BOM.
+        let xml = load_signedxml_testdata("wsfed-metadata.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml).expect("verify should not return Err");
+        assert!(
+            result.is_valid(),
+            "wsfed-metadata.xml should verify: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rootxmlns_with_external_cert() {
+        // SAML Response where Signature uses dsig: prefix declared on root element.
+        // No embedded X509 — requires external certificate.
+        // Uses exc-c14n, rsa-sha1, sha1.
+        let xml = load_signedxml_testdata("rootxmlns.xml");
+        let cert_pem = load_signedxml_testdata("rootxmlns.crt");
+        if xml.is_empty() || cert_pem.is_empty() {
+            return;
+        }
+        let mut mgr = bergshamra_keys::KeysManager::new();
+        let key = bergshamra_keys::loader::load_x509_cert_pem(cert_pem.as_bytes())
+            .expect("load rootxmlns.crt");
+        mgr.add_key(key);
+        let ctx = DsigContext::new_permissive(mgr);
+        let result = verify(&ctx, &xml);
+        #[cfg(feature = "aws-lc")]
+        assert_aws_lc_rejects_1024_bit_rsa_fixture(result, "rootxmlns.xml");
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let result = result.expect("verify should not return Err");
+            assert!(
+                result.is_valid(),
+                "rootxmlns.xml should verify with external cert: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_changed_content() {
+        // WS-Fed metadata with tampered entityID (sts -> stx).
+        // Digest mismatch expected.
+        let xml = load_signedxml_testdata("invalid-signature-changed-content.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml).expect("verify should not return Err");
+        assert!(!result.is_valid(), "changed-content should fail validation");
+        if let VerifyResult::Invalid { reason } = &result {
+            assert!(
+                reason.contains("digest") || reason.contains("Digest"),
+                "error should mention digest mismatch, got: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_non_existing_reference() {
+        // WS-Fed metadata where the ID attribute was changed so the Reference URI
+        // points to a non-existing element.
+        let xml = load_signedxml_testdata("invalid-signature-non-existing-reference.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml);
+        // This should either return an error (element not found) or Invalid
+        match result {
+            Ok(r) => assert!(!r.is_valid(), "non-existing reference should fail: {r:?}"),
+            Err(e) => {
+                // An error about missing/unresolvable reference is also acceptable
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("URI")
+                        || msg.contains("reference")
+                        || msg.contains("not found")
+                        || msg.contains("resolve"),
+                    "error should relate to unresolvable reference, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_wrong_signature_value() {
+        // WS-Fed metadata with bogus SignatureValue (base64 of "signedxml:").
+        // The digest should still pass, but the signature value verification fails.
+        let xml = load_signedxml_testdata("invalid-signature-signature-value.xml");
+        if xml.is_empty() {
+            return;
+        }
+        let ctx = default_ctx();
+        let result = verify(&ctx, &xml);
+        // Should fail — either Invalid or an Err (crypto error from bad sig bytes)
+        match result {
+            Ok(r) => assert!(!r.is_valid(), "wrong signature value should fail: {r:?}"),
+            Err(_) => {
+                // A crypto error from mismatched signature bytes is also acceptable
+            }
+        }
+    }
+
+    #[test]
+    fn test_missing_signature_element() {
+        // Attempting to verify XML with no <Signature> element should return an error.
+        let xml = "<doc><content>hello</content></doc>";
+        let ctx = default_ctx();
+        let result = verify(&ctx, xml);
+        assert!(result.is_err(), "should error when no Signature element");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Signature"),
+            "error should mention Signature, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_missing_signed_info_element() {
+        // Signature element present but no SignedInfo should return an error.
+        let xml = r##"<Root>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignatureValue>AAAA</ds:SignatureValue>
+  </ds:Signature>
+</Root>"##;
+        let ctx = default_ctx();
+        let result = verify(&ctx, xml);
+        assert!(result.is_err(), "should error when no SignedInfo");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("SignedInfo"),
+            "error should mention SignedInfo, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_missing_canonicalization_method() {
+        // SignedInfo present but no CanonicalizationMethod.
+        let xml = r##"<Root>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AAAA</ds:SignatureValue>
+  </ds:Signature>
+</Root>"##;
+        let ctx = default_ctx();
+        let result = verify(&ctx, xml);
+        assert!(
+            result.is_err(),
+            "should error when no CanonicalizationMethod"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("CanonicalizationMethod"),
+            "error should mention CanonicalizationMethod, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_missing_signature_method() {
+        // SignedInfo with CanonicalizationMethod but no SignatureMethod.
+        let xml = r##"<Root>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AAAA</ds:SignatureValue>
+  </ds:Signature>
+</Root>"##;
+        let ctx = default_ctx();
+        let result = verify(&ctx, xml);
+        assert!(result.is_err(), "should error when no SignatureMethod");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("SignatureMethod"),
+            "error should mention SignatureMethod, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_missing_signature_method_algorithm() {
+        // SignatureMethod present but no Algorithm attribute.
+        let xml = r##"<Root>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod/>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AAAA</ds:SignatureValue>
+  </ds:Signature>
+</Root>"##;
+        let ctx = default_ctx();
+        let result = verify(&ctx, xml);
+        assert!(
+            result.is_err(),
+            "should error when SignatureMethod has no Algorithm"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Algorithm") || err_msg.contains("SignatureMethod"),
+            "error should mention Algorithm, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_missing_canonicalization_method_algorithm() {
+        // CanonicalizationMethod present but no Algorithm attribute.
+        let xml = r##"<Root>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AAAA</ds:SignatureValue>
+  </ds:Signature>
+</Root>"##;
+        let ctx = default_ctx();
+        let result = verify(&ctx, xml);
+        assert!(
+            result.is_err(),
+            "should error when CanonicalizationMethod has no Algorithm"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Algorithm") || err_msg.contains("CanonicalizationMethod"),
+            "error should mention Algorithm, got: {err_msg}"
+        );
+    }
+
+    // ── Trust-anchor enforcement (docs/adr/0004, 0006) ──────────────────────
+    //
+    // The document `x509data-test.xml` is signed (RSA-SHA1) and carries its
+    // signer certificate chain inline in `<X509Data>`, chaining to the Aleksey
+    // test root `cacert.pem`. These tests exercise the enforcement clause added
+    // to `needs_x509_validation`: when trust anchors are configured, an inline
+    // certificate must chain to one of them even in permissive mode
+    // (`enabled_key_data_x509` and `verify_keys` both false).
+
+    /// A compact attacker-controlled document signed by the embedded raw
+    /// `<KeyValue>`.
+    ///
+    /// This is the original trust-bypass shape: the signature is valid for the
+    /// raw inline RSA key, but that key has no X.509 chain and therefore cannot
+    /// satisfy a caller's configured trust anchors.
+    const RAW_KEYVALUE_SIGNED_XML: &str = r##"<Root Id="root">
+  <Payload>attacker controlled payload</Payload>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="#root">
+        <ds:Transforms>
+          <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+          <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue>NnrYodGkHwDR1Au09pcVBeLCVckmVGQVYP5qol5SFaw=</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>yDhDCGUg/3X3BQVbl2tglSfRxtUC0aabIdFMz67nJX8sGDsK/GqkLhh1WB9YV0RCnmDuGSa8sG1UXdQVgjDi60qd9I7YdXeER+soh1g0RrouI01osI/QL+jaMJ/1nq5Vkwh0dBIGgxFKOtBVdGNQ6CSg21ZbRK0ODF7mStq+Clo=</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:KeyValue>
+        <ds:RSAKeyValue>
+          <ds:Modulus>+dcpo4biTE96poyE0JcUkfF8Mvs5SUotRd95KJIQ5uQ7nsxLIMn4cs3MwF70WI0gCCkIwTK8Nj//zJFeIxJanlziNAgrMIjBuYXWbeJPmjTpTO1IEDaXEpfgtZtgmOFvt1e8ytauqpVZF2kQlBLuBZMGgbPlBxOlI3VHVBIXnDk=</ds:Modulus>
+          <ds:Exponent>AQAB</ds:Exponent>
+        </ds:RSAKeyValue>
+      </ds:KeyValue>
+    </ds:KeyInfo>
+  </ds:Signature>
+</Root>"##;
+
+    /// A parseable raw RSA `KeyValue` for mixed-KeyInfo regression tests.
+    ///
+    /// The key is intentionally unrelated to `X509DATA_TEST_XML`; anchored
+    /// verification must ignore it in favor of the following `<X509Data>`.
+    #[cfg(feature = "legacy-algorithms")]
+    const UNRELATED_RSA_KEYVALUE_XML: &str = r#"<KeyValue>
+        <RSAKeyValue>
+          <Modulus>+dcpo4biTE96poyE0JcUkfF8Mvs5SUotRd95KJIQ5uQ7nsxLIMn4cs3MwF70WI0gCCkIwTK8Nj//zJFeIxJanlziNAgrMIjBuYXWbeJPmjTpTO1IEDaXEpfgtZtgmOFvt1e8ytauqpVZF2kQlBLuBZMGgbPlBxOlI3VHVBIXnDk=</Modulus>
+          <Exponent>AQAB</Exponent>
+        </RSAKeyValue>
+      </KeyValue>"#;
+
+    /// The signed document with its inline signer chain.
+    const X509DATA_TEST_XML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-data/aleksey-xmldsig-01/x509data-test.xml"
+    ));
+    /// The correct anchor (Aleksey test root) the inline chain terminates at.
+    /// Only used by the `legacy-algorithms`-gated positive test below.
+    #[cfg(feature = "legacy-algorithms")]
+    const CACERT_PEM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-data/keys/cacert.pem"
+    ));
+    /// An unrelated CA (Merlin) the inline chain does NOT terminate at.
+    const WRONG_CA_PEM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-data/merlin-xmldsig-twenty-three/certs/ca.pem"
+    ));
+
+    /// Decode a single-certificate PEM to DER.
+    fn pem_cert_to_der(pem: &str) -> Vec<u8> {
+        use base64::Engine;
+        let body: String = pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .flat_map(|l| l.chars())
+            .collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(body.trim())
+            .expect("valid base64 PEM body")
+    }
+
+    fn permissive_ctx_with_anchor(anchor_pem: Option<&str>) -> DsigContext {
+        let mut mgr = bergshamra_keys::KeysManager::new();
+        if let Some(pem) = anchor_pem {
+            mgr.add_trusted_cert(pem_cert_to_der(pem));
+        }
+        // Permissive: inline keys accepted, no X509-data / verify-keys flags set.
+        let ctx = DsigContext::new_permissive(mgr);
+        assert!(!ctx.enabled_key_data_x509 && !ctx.verify_keys && !ctx.trusted_keys_only);
+        assert!(!ctx.allow_raw_inline_keyinfo_with_trust_anchors);
+        ctx
+    }
+
+    /// Baseline: without configured trust anchors, permissive verification still
+    /// allows raw inline `KeyValue` documents for XML-DSig compatibility.
+    #[test]
+    fn test_raw_inline_keyvalue_verifies_without_anchors() {
+        let ctx = permissive_ctx_with_anchor(None);
+        let result = verify(&ctx, RAW_KEYVALUE_SIGNED_XML);
+        #[cfg(feature = "aws-lc")]
+        assert_aws_lc_rejects_1024_bit_rsa_fixture(result, "raw inline KeyValue");
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let result = result.expect("verify should not error");
+            assert!(
+                result.is_valid(),
+                "raw inline KeyValue should remain valid in permissive no-anchor mode"
+            );
+        }
+    }
+
+    /// Enforcement: once trust anchors are configured, a raw inline `KeyValue`
+    /// cannot satisfy that trust policy because it has no certificate chain to
+    /// validate against the anchors.
+    #[test]
+    fn test_raw_inline_keyvalue_rejected_when_anchor_configured() {
+        let ctx = permissive_ctx_with_anchor(Some(WRONG_CA_PEM));
+        let err = verify(&ctx, RAW_KEYVALUE_SIGNED_XML)
+            .expect_err("raw inline KeyValue must not bypass configured trust anchors");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("raw inline KeyInfo key"),
+            "error should explain raw inline KeyInfo rejection, got: {msg}"
+        );
+    }
+
+    /// Compatibility escape hatch: xmlsec interop tests intentionally combine
+    /// trusted CA flags with raw inline `KeyValue` fixtures. That mode must be
+    /// explicit so ordinary trust-anchor verification remains fail-closed.
+    #[test]
+    fn test_raw_inline_keyvalue_allowed_by_explicit_compatibility_policy() {
+        let ctx = permissive_ctx_with_anchor(Some(WRONG_CA_PEM))
+            .with_allow_raw_inline_keyinfo_with_trust_anchors(true);
+        let result = verify(&ctx, RAW_KEYVALUE_SIGNED_XML);
+        #[cfg(feature = "aws-lc")]
+        assert_aws_lc_rejects_1024_bit_rsa_fixture(result, "raw inline KeyValue");
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let result = result.expect("verify should not error");
+            assert!(
+                result.is_valid(),
+                "explicit compatibility policy should allow raw inline KeyValue"
+            );
+        }
+    }
+
+    /// Anchored verification must not fail just because a raw `KeyValue`
+    /// appears before an anchorable inline certificate chain.
+    ///
+    /// Several interop documents carry both forms. When trust anchors are
+    /// configured and raw inline keys are disabled, the verifier should prefer
+    /// `<X509Data>` rather than rejecting the earlier raw key immediately.
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn test_anchor_policy_prefers_x509data_over_earlier_raw_keyvalue() {
+        let mixed_keyinfo_xml = X509DATA_TEST_XML.replace(
+            "<KeyInfo>\n      <X509Data>",
+            &format!("<KeyInfo>\n      {UNRELATED_RSA_KEYVALUE_XML}\n      <X509Data>"),
+        );
+        let ctx = permissive_ctx_with_anchor(Some(CACERT_PEM));
+        #[cfg(feature = "aws-lc")]
+        {
+            let error = verify(&ctx, &mixed_keyinfo_xml)
+                .expect_err("AWS-LC must reject the fixture's 512-bit intermediate RSA key");
+            let message = error.to_string();
+            assert!(
+                message.contains("512-bit RSA key") && message.contains("unsupported"),
+                "expected deterministic AWS-LC key-size rejection, got: {message}"
+            );
+        }
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let result = verify(&ctx, &mixed_keyinfo_xml).expect("verify should not error");
+            assert!(
+                result.is_valid(),
+                "anchored verification should use the later X509Data instead of the raw KeyValue"
+            );
+        }
+    }
+
+    /// Baseline: with NO trust anchors, the inline-certificate signature
+    /// verifies (permissive W3C behavior). This is the behavior the enforcement
+    /// clause tightens.
+    #[test]
+    fn test_inline_x509_verifies_without_anchors() {
+        let ctx = permissive_ctx_with_anchor(None);
+        let result = verify(&ctx, X509DATA_TEST_XML).expect("verify should not error");
+        assert!(
+            result.is_valid(),
+            "inline-cert signature should verify when no anchors are configured"
+        );
+    }
+
+    /// Enforcement: with a trust anchor configured that the inline chain does
+    /// NOT chain to, the same signature is now REJECTED — even though
+    /// `enabled_key_data_x509` and `verify_keys` are false. Before the
+    /// `has_trusted_anchors` clause this verified successfully.
+    #[test]
+    fn test_inline_x509_rejected_when_chain_misses_anchor() {
+        let ctx = permissive_ctx_with_anchor(Some(WRONG_CA_PEM));
+        let result = verify(&ctx, X509DATA_TEST_XML);
+        assert!(
+            result.is_err(),
+            "inline cert must be rejected when it does not chain to a configured anchor"
+        );
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            msg.contains("cert") || msg.contains("chain") || msg.contains("trust"),
+            "error should be a certificate/chain failure, got: {msg}"
+        );
+    }
+
+    /// Enforcement, positive side: with the CORRECT anchor configured, the
+    /// inline chain validates and the signature verifies. The certificates are
+    /// SHA-1 era, so chain validation only accepts them under the
+    /// `legacy-algorithms` policy; gate the assertion on that feature.
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn test_inline_x509_accepted_when_chain_reaches_anchor() {
+        let ctx = permissive_ctx_with_anchor(Some(CACERT_PEM));
+        #[cfg(feature = "aws-lc")]
+        {
+            let error = verify(&ctx, X509DATA_TEST_XML)
+                .expect_err("AWS-LC must reject the fixture's 512-bit intermediate RSA key");
+            let message = error.to_string();
+            assert!(
+                message.contains("512-bit RSA key") && message.contains("unsupported"),
+                "expected deterministic AWS-LC key-size rejection, got: {message}"
+            );
+        }
+        #[cfg(not(feature = "aws-lc"))]
+        {
+            let result = verify(&ctx, X509DATA_TEST_XML).expect("verify should not error");
+            assert!(
+                result.is_valid(),
+                "inline cert should verify when it chains to the configured anchor"
+            );
+        }
+    }
+}

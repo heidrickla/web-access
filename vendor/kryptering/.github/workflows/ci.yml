@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (e.g. re-pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt + clippy + test, feature matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install AWS-LC native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake clang libclang-dev perl pkg-config
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (default RustCrypto + PKCS#11)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo clippy (RustCrypto complete)
+        run: cargo clippy --locked --no-default-features --features rustcrypto,legacy,post-quantum --all-targets -- -D warnings
+
+      - name: cargo clippy (AWS-LC)
+        run: cargo clippy --locked --no-default-features --features aws-lc,legacy --all-targets -- -D warnings
+
+      # Unit tests — pure cryptography paths, no HSM. The `pkcs11` feature
+      # only requires libloading at build time; no runtime PKCS#11 module
+      # is needed because kryptering's HSM tests live in downstream
+      # integration suites (e.g. bergshamra) and gate behind softhsm.
+      - name: cargo test (default RustCrypto + PKCS#11)
+        run: cargo test --locked --lib
+
+      - name: provider baseline (RustCrypto)
+        run: cargo test --locked --test provider_baseline
+
+      - name: cargo test (RustCrypto complete)
+        run: cargo test --locked --no-default-features --features rustcrypto,legacy,post-quantum --lib
+
+      - name: cargo test (AWS-LC)
+        run: cargo test --locked --no-default-features --features aws-lc,legacy --lib
+
+      - name: provider baseline (AWS-LC)
+        run: cargo test --locked --no-default-features --features aws-lc,legacy --test provider_baseline
+
+      - name: TLS client config (ring)
+        run: cargo test --locked --no-default-features --features rustcrypto,tls-ring --test tls_provider
+
+      - name: TLS client config (AWS-LC)
+        run: cargo test --locked --no-default-features --features aws-lc,tls-aws-lc --test tls_provider
+
+      - name: AWS-LC excludes RustCrypto primitives
+        run: |
+          cargo tree --no-default-features --features aws-lc,legacy -e normal --prefix none > /tmp/kryptering-aws-tree.txt
+          forbidden='^(rsa|dsa|ecdsa|p256|p384|p521|ed25519-dalek|x25519-dalek|aes |aes-gcm|cbc |des |sha1 |sha2 |sha3 |hmac |ml-dsa|slh-dsa|ml-kem) v'
+          if rg "$forbidden" /tmp/kryptering-aws-tree.txt; then
+            echo "::error::AWS-LC build includes a RustCrypto primitive implementation"
+            exit 1
+          fi
+
+      - name: cargo doc
+        run: cargo doc --locked --no-default-features --features rustcrypto,legacy,post-quantum,pkcs11,tls-ring --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: invalid provider combinations fail
+        run: |
+          if cargo check --locked --no-default-features --features rustcrypto,aws-lc; then
+            echo "multiple document providers unexpectedly compiled" >&2
+            exit 1
+          fi
+          if cargo check --locked --no-default-features; then
+            echo "missing document provider unexpectedly compiled" >&2
+            exit 1
+          fi
+          if cargo check --locked --no-default-features --features rustcrypto,tls-ring,tls-aws-lc; then
+            echo "multiple TLS providers unexpectedly compiled" >&2
+            exit 1
+          fi
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: 1.88.0
+      - run: cargo check --locked
+
+  fips:
+    name: FIPS (AWS-LC, ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Install AWS-LC native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake clang libclang-dev perl pkg-config
+      - name: Install Go for the AWS-LC FIPS build
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Compile provider pairing
+        run: cargo check --locked --no-default-features --features fips,tls-aws-lc
+      - name: Verify mandatory initialization fails closed
+        run: cargo test --locked --no-default-features --features fips,tls-aws-lc --test fips_initialization cryptography_fails_closed_before_explicit_initialization
+      - name: Attest selected FIPS document and TLS providers
+        run: cargo test --locked --no-default-features --features fips,tls-aws-lc --test fips_attestation
+      - name: Run FIPS provider known-answer tests
+        run: cargo test --locked --no-default-features --features fips,tls-aws-lc --test fips_known_answers
+      - name: Invalid FIPS provider combinations fail closed
+        run: |
+          if cargo check --locked --no-default-features --features rustcrypto,fips; then
+            echo "::error::FIPS unexpectedly compiled with RustCrypto document crypto"
+            exit 1
+          fi
+          if cargo check --locked --no-default-features --features fips,tls-ring; then
+            echo "::error::FIPS unexpectedly compiled with ring TLS"
+            exit 1
+          fi

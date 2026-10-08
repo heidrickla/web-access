@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- When a caller invokes XsdValidator::from_schema_with_base_path(...),
+     a schemaLocation pointing at an absolute path (or traversing via ..)
+     is read via std::fs::read_to_string with no sandboxing.
+
+     Target path is substituted at test time by tests/security_audit.rs;
+     this file is a template. The real schemaLocation is patched before
+     the validator builds the schema. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:include schemaLocation="__TARGET_PATH__"/>
+  <xs:element name="x" type="xs:string"/>
+</xs:schema>
