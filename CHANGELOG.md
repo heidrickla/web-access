@@ -6,6 +6,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 
 ### Added
 
+- Single sign-on through the site's SAML 2.0 identity provider (ADFS, Entra ID), beside the password sign-in: `[saml]` in `config.toml`, a button on the sign-in page and in the renewal dialog, and `/api/saml/metadata` for IT to import. The account signed in is the directory account whose SID the assertion carries.
 - Files crossing the clipboard channel, both ways, are held on the proxy and scanned by the anti-malware product registered with Windows through AMSI (Trellix, Defender), or by a scanner command. Only files called clean are passed on; an offer with one file refused is refused whole. The user's page says what was decided, and the Activity tab has an entry per file. On by default on Windows; `[scan]` in `config.toml`.
 - The scanner is checked with the EICAR test file and a harmless one at start and hourly, and files are refused while the check fails. The Migration tab shows the scanner and its last check; the Activity tab records `scan.failing` and `scan.restored`.
 - A Settings tab: how long a sign-in lasts, when opening a server asks for the password again, and the largest file sent or fetched over the clipboard. A larger file is refused.

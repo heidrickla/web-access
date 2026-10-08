@@ -1,0 +1,22 @@
+listen = "127.0.0.1:8447"
+data_dir = "data5"
+admins = ["boss"]
+
+[https]
+cert = "../fixtures/localhost-cert.pem"
+key = "../fixtures/localhost-key.pem"
+
+[tls]
+verify = "insecure"
+
+[directory]
+domain = "corp.test"
+netbios = "CORP"
+urls = ["ldaps://dc1.corp.test:1636"]
+ca_bundle = "dc-ca.pem"
+service_account = "svc-webaccess"
+check_interval_secs = 30
+
+[saml]
+url = "https://localhost:8447"
+idp_metadata = "idp-metadata.xml"

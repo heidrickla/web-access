@@ -28,3 +28,7 @@ local.jar
 revoke-ready
 remote/
 scan.log
+data5/
+log5
+pid5
+idp-metadata.xml
