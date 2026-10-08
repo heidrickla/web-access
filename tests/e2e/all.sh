@@ -15,7 +15,8 @@ stage "local accounts" ./smoke-local.sh
 stage "browser 1" bash -c './run-e2e.sh e2e1 2>&1 | grep -v "status of 401"; exit ${PIPESTATUS[0]}'
 stage "browser 2 and 3" ./phases23.sh
 stage "file scanning" ./scan.sh
-./proxy.sh stop 1; ./proxy.sh stop 2
+stage "single sign-on" ./saml.sh
+./proxy.sh stop 1; ./proxy.sh stop 2; [ -f pid5 ] && kill "$(cat pid5)" 2>/dev/null; rm -f pid5
 stage "guards" ./mutate.sh
 
 if [ "$status" -eq 0 ]; then echo "ALL STAGES PASSED"; else echo "SOME STAGES FAILED"; fi

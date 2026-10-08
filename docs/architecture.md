@@ -63,7 +63,7 @@ The proxy decides who may reach which server, and relays. It decodes RDP only as
 | Direct reach: the proxy opens TCP to the target, no agents anywhere | settled (Lewis, 2026-09-23) |
 | Pass-through unless the user saves: the user's own credentials go to the server; a user may save them on the proxy, per server | settled (Lewis, 2026-09-23); saving reverses pass-through for that user and server only |
 | Sign-in: Active Directory over LDAPS, a simple bind as the user; the proxy host is not domain-joined | settled (Lewis, 2026-09-23) |
-| Sign in as the logged-on Windows user | roadmap: Kerberos via an SPN and keytab, accepted with `sspi` |
+| Single sign-on: the proxy is a SAML 2.0 service provider for the site's identity provider, beside the password sign-in; the account is the one whose objectSid the assertion's SID attribute names | settled: the site's IT runs SAML (Lewis, 2026-10-08), which replaced the Kerberos plan (an SPN and keytab, accepted with `sspi`); see Single sign-on below |
 | Local accounts for testing: an Argon2id hash in the database, created on the command line, signing in only with `allow_local_accounts = true`; the directory section becomes optional | settled (Lewis, 2026-09-24) |
 | Saved credentials live in a proxy-side encrypted store, per user and per server | settled (Lewis, 2026-09-23); see below |
 | Server lists are maintained by hand on the proxy, per user; IT revokes access by disabling the account | settled (Lewis, 2026-09-23) |
@@ -97,6 +97,24 @@ With no agents, nothing outside the proxy constrains which hosts it opens a sock
 - With a service account configured, signed-in accounts are re-checked every `check_interval_secs`. An account that is disabled, expired, gone or re-created loses its sessions and its live RDP connections. A lookup that fails skips that account only; a pass that cannot run revokes nothing. The last pass's outcome is kept for the Migration tab, and the Activity log records when checks start failing and when they recover. The domain controller that last answered is tried first.
 - A click mints a connect ticket: 60 seconds, single use, bound to the user and the server. The WebSocket must carry the session cookie of the same user and a same-origin `Origin`; the ticket travels in the RDCleanPath request and is checked with the cookie and the assignment at admission. The browser takes its ticket after the credentials dialog closes, immediately before connecting.
 - A connection is registered at upgrade, before anything is read, and belongs to the sign-in it was opened under. Admission re-checks that sign-in, the ticket and the assignment. Revocation, sign-out, the sign-in expiring, the assignment or server being removed, or an import ends it at any stage, setting up or established. Each setup stage has a deadline.
+
+### Single sign-on
+
+`src/saml.rs` checks the protocol; `src/sso.rs` signs the account in through the same `finish_directory` and `start_session` as a password sign-in, so the SID binding, renames and the account re-checks apply unchanged.
+
+| Step | Design |
+|---|---|
+| Start | `GET /api/saml/start` sends an unsigned AuthnRequest by the HTTP-Redirect binding. Service-provider-initiated only: a response must answer a request this proxy made |
+| Flow cookie | `wa_saml`: the request ID, its expiry (5 minutes) and an HMAC under a key made at start, `SameSite=None; Secure; HttpOnly`, path `/api/saml`. Nothing is stored per started sign-in, so starts cannot fill a table. It ties the response to the browser that started it, which stops a login-CSRF that plants another person's assertion |
+| Return | `POST /api/saml/acs`, HTTP-POST binding. Exempt from the Origin and data-instance checks a page's request carries: what stands in for them is a signed assertion answering the request the flow cookie names |
+| Parsing | no DTD, depth 64, at most 1 MiB; comments and processing instructions refused, since exclusive c14n drops a comment and it could change what is read without changing what is signed. Element text must be text alone |
+| Signature | `bergshamra-dsig` with trusted keys only, verified once per signing certificate in the metadata, each in its own key manager. Every signature in the response must verify; one must be enveloped in the Assertion with its one Reference resolving to that Assertion. The only shape accepted is exclusive c14n, RSA-SHA256/384/512, SHA-256/384/512, transforms enveloped-signature then exclusive c14n, a `#id` reference; anything else is refused before verification, so no reference reads a file or a URL |
+| Assertion | exactly one in the document, none encrypted. Issuer is the metadata's entityID; IssueInstant not past now plus skew; a bearer confirmation with Recipient the assertion consumer URL, InResponseTo the request, NotOnOrAfter in force and no NotBefore; Conditions in force, every AudienceRestriction naming this proxy, no condition but OneTimeUse and ProxyRestriction; an AuthnStatement whose SessionNotOnOrAfter has not passed; Status Success; Response Destination, when present, the assertion consumer URL |
+| Replay | the request ID and the assertion ID are spent by the first response that passes, until they could no longer be accepted. A restart makes a new flow key, which ends sign-ins in progress, so the in-memory table is enough |
+| Account | the SID attribute, exactly one value, looked up as objectSid with the service account; the directory must return that SID. A name is never matched: about 19 domains at the site share short names, and another domain's `jdoe` must not become this one's |
+| Answer | a page that moves on by itself: the session cookie is `SameSite=Strict`, set on the response to the identity provider's cross-site POST, and a redirect continuing that navigation would not carry it to the list. The page's script (`/saml-done.js`, as the CSP allows only `'self'`) navigates to `/`, a same-site navigation, with a link for a browser without scripts |
+
+Refused in this version: identity-provider-initiated responses, EncryptedAssertion, single logout. AuthnRequests are unsigned, which ADFS and Entra ID accept by default. Renewal under single sign-on is a full-page round trip through `/api/saml/start`.
 
 ### Imports and freezes
 
@@ -163,7 +181,7 @@ The RDP client performs NLA in the browser, so a saved password goes to its owne
 | Local wrap | DPAPI, machine scope, so the service starts unattended |
 | Recovery wrap | Argon2id (64 MiB, 3 passes) of an administrator's passphrase, so the key can move to a new host |
 
-A key derived from the user's own sign-in was the stronger candidate in the abstract and was not chosen: sign-in as the logged-on user (roadmap) supplies no password to derive from, and a key that only a signed-in user can open could not move with an export. A key in the config file was rejected.
+A key derived from the user's own sign-in was the stronger candidate in the abstract and was not chosen: single sign-on supplies no password to derive from, and a key that only a signed-in user can open could not move with an export. A key in the config file was rejected.
 
 A database whose local wrap does not open on the host it finds itself on starts locked; the recovery passphrase unlocks it and re-wraps the key for that host. A lost passphrase is replaced from the host that holds the key (`set-secret recovery --replace`). With neither, the credential store is reset: a new key, every saved credential and the service account's password deleted, users, servers and assignments kept.
 

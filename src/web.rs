@@ -470,13 +470,12 @@ async fn gate_requests(State(app): State<Shared>, req: Request, next: Next) -> R
 pub const INSTANCE_HEADER: &str = "x-data-instance";
 
 /// Changes name rows by id, and ids are only meaningful in the database the page loaded them
-/// from. Sign-out names nothing, the identity provider's POST comes from no page of ours, and the
-/// migration routes are what change the database.
+/// from. Sign-out names nothing, and the migration routes are what change the database.
+/// Self-gated routes, the identity provider's POST among them, are not asked.
 fn needs_instance(method: &Method, path: &str) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
         && path.starts_with("/api/")
         && path != "/api/logout"
-        && path != SSO_POST
         && !path.starts_with("/api/admin/migration/")
 }
 

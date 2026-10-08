@@ -15,6 +15,7 @@ Design record: `docs/architecture.md`.
 | RDP client in the browser | `ironrdp-web`, MIT OR Apache-2.0 | built to WASM and embedded in the proxy binary |
 | RDCleanPath, both ends | `ironrdp-rdcleanpath` | reused |
 | Sign-in | `src/directory.rs` | LDAPS simple bind as the user; the proxy host need not be domain-joined |
+| Single sign-on | `src/saml.rs`, `src/sso.rs` | SAML 2.0 service provider for the site's identity provider; the account is found by the SID it sends |
 | Sessions and connect tickets | `src/auth.rs` | 24-hour persistent sign-in; single-use ticket per connection |
 | Server lists, assignments | `src/store.rs`, `src/policy.rs` | SQLite; a user reaches exactly the servers assigned to them |
 | Saved credentials | `src/vault.rs` | AES-256-GCM under a master key wrapped by DPAPI and by a recovery passphrase |
@@ -25,7 +26,7 @@ Design record: `docs/architecture.md`.
 
 ## Using it
 
-1. Browse to the proxy and sign in with a network account: `jdoe`, `CORP\jdoe` or the account's sign-in name such as `john.doe@example.com`. Closing the browser does not sign out; the sign-in lasts 24 hours. Opening a server with less than 18 hours left asks for the password again first. Both are set on the Settings tab.
+1. Browse to the proxy and sign in with a network account: `jdoe`, `CORP\jdoe` or the account's sign-in name such as `john.doe@example.com`, or with single sign-on where it is offered. Closing the browser does not sign out; the sign-in lasts 24 hours. Opening a server with less than 18 hours left asks to renew the sign-in first, by password or single sign-on. Both are set on the Settings tab.
 2. The server list shows the servers assigned to you, in the administrator's groups. Groups collapse and expand; the filter matches names and hosts.
 3. Click a server. Enter its credentials, and tick "Save credentials" to be connected in one click next time. Credentials are saved only after the server accepts them. The domain starts as the server's default, when an administrator set one.
 4. The desktop fills the window. The rail at the left edge carries clipboard, file transfer, Ctrl+Alt+Del, fullscreen and Disconnect. Files dropped on the desktop go to the remote clipboard. A file larger than the limit on the Settings tab is refused, both ways; a drop holding one sends nothing. Every file is scanned on the proxy on the way, both ways, and the rail says when it passed or why it was refused.
@@ -127,8 +128,24 @@ With `allow_local_accounts = true`, the `[directory]` section may be left out en
 | `[tls]` | how RDP servers' certificates are checked: `verify = "ca"` with `ca_bundle`, or `"insecure"`. No default |
 | `[scan]` | `scanner`: `"amsi"` (default on Windows), `"command"` or `"off"`; `timeout_secs` (120), `max_staged_mb` (2048), `check_every_mins` (60); for `"command"`, `command` with `{file}`, `clean_exit_codes` and `detected_exit_codes` |
 | `[directory]` | `domain`; `urls` (ldaps only); optional `netbios`, `ca_bundle` (the Windows certificate store when omitted), `base_dn` (derived from `domain` when omitted), `service_account`, `check_interval_secs` (default 600) and `timeout_secs` (default 10). Optional when local accounts are allowed |
+| `[saml]` | single sign-on: `url` (the https address users open), `idp_metadata` (the identity provider's metadata file); optional `entity_id` (default `<url>/api/saml/metadata`), `sid_attribute` (default ADFS's Primary SID claim) and `clock_skew_secs` (default 180, at most 300). Needs `[directory]` with `service_account` |
 
 Set `netbios` to the domain's NetBIOS name. A sign-in name with a domain in it (`CORP\jdoe`, `john.doe@example.com`) is then checked exactly as typed, a password accepted for an account in another domain is refused, and the account signed in is the one Active Directory says the password was checked for. Without `netbios`, every sign-in name binds as `name@domain`.
+
+## Single sign-on
+
+With `[saml]` configured, the sign-in page offers "Sign in with single sign-on" beside the password. The proxy is a SAML 2.0 service provider for the site's identity provider (ADFS, Entra ID): the browser goes to the identity provider and comes back signed in, without typing a password where the identity provider's own session holds. The account signed in is the directory account whose objectSid the assertion's SID attribute names, read with the service account, so the service account's password must be set (Migration tab).
+
+| IT sets, on the identity provider | |
+|---|---|
+| Relying party | imported from `https://<proxy>/api/saml/metadata`; identifier `<url>/api/saml/metadata`, assertion consumer `<url>/api/saml/acs`, HTTP-POST |
+| SID attribute | ADFS: a claim rule passing Primary SID (`http://schemas.microsoft.com/ws/2008/06/identity/claims/primarysid`). Entra ID: a claim from `user.onpremisessecurityidentifier`, whose name goes in `sid_attribute` |
+| Signing | the assertion signed with SHA-256 or stronger; the response may be signed as well |
+| Encryption | off for this relying party |
+
+Then export the identity provider's metadata (ADFS: `https://<adfs>/FederationMetadata/2007-06/FederationMetadata.xml`; Entra ID: the enterprise application's Federation Metadata XML), save it where `idp_metadata` names, and restart the service. The metadata is read at start: after the identity provider adds or changes a signing certificate, export it again and restart. During a certificate rollover both certificates are trusted.
+
+The renewal dialog offers single sign-on too; it leaves the page, and the server is opened again after. A refused single sign-on shows why, and the Activity tab records it as `signin.refused`.
 
 ## HTTPS certificate
 
@@ -187,7 +204,7 @@ CI (`.github/workflows/ci.yml`) runs format, lint, test, page scripts and depend
 - The RDP client runs client-side in WASM, not server-side.
 - RDCleanPath is acceptable. Session confidentiality from the proxy is not a requirement on an internal network.
 - Direct reach. The proxy opens TCP to the target. No agents, no connectors, nothing installed on any target, so appliances and vendor-supported nodes are in scope.
-- Users sign in with their Active Directory accounts; the proxy host is not domain-joined.
+- Users sign in with their Active Directory accounts, by password or through the site's SAML identity provider; the proxy host is not domain-joined.
 - Each user's server list is maintained by hand on the proxy, per user.
 - Credentials pass through to the server unless the user saves them; saved ones are kept encrypted on the proxy, per user and per server, and move with an export.
 - Files crossing the clipboard are scanned on the proxy, inline, by the anti-malware product registered with Windows; only a clean verdict passes.
@@ -199,7 +216,6 @@ Future additions. RDP comes first. Design for each is in `docs/architecture.md`.
 
 | Addition | What it takes |
 |---|---|
-| Sign in as the logged-on Windows user | an SPN and keytab for the proxy's name; Kerberos acceptance via `sspi`; the proxy's URL in the browsers' intranet zone |
 | Linux desktops | EGFX in `ironrdp-web`, which GNOME Remote Desktop, built into Ubuntu, requires. xrdp is the alternative |
 | SSH | a raw-forward proxy mode; Go's SSH client compiled to WASM, on xterm.js |
 | VNC | the same raw-forward mode; noVNC |
