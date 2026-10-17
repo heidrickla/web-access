@@ -21,6 +21,15 @@ jobs:
       - uses: actions/checkout@v5
         timeout-minutes: 15
 
+      # Cargo hashes a vendored crate's absolute path into its fingerprint, and this runner's workspace
+      # path changes every run, so the vendored sources move to a fixed path before any build.
+      - name: vendored sources at a fixed path
+        timeout-minutes: 5
+        run: |
+          mv vendor "$HOME/web-access-vendor"
+          sed -i "s|^directory = \"vendor\"\$|directory = \"$HOME/web-access-vendor\"|" .cargo/config.toml
+          grep -qxF "directory = \"$HOME/web-access-vendor\"" .cargo/config.toml
+
       # shell: bash runs with pipefail, so a failed download fails the step instead of feeding sh nothing.
       - name: toolchain (pinned)
         timeout-minutes: 15
@@ -31,13 +40,13 @@ jobs:
           "$HOME/.cargo/bin/rustc" --version | grep -F ' 1.98.1 '
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # target, kept between runs keyed on the toolchain and Cargo.lock. rust-cache drops the builds of
-      # crates inside the workspace, and vendor/ is inside it.
+      # target, kept between runs keyed on the toolchain, Cargo.lock and the cargo config, which names
+      # the vendored sources' path. rust-cache drops the builds of crates inside the workspace.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         timeout-minutes: 10
         with:
           path: target
-          key: ${{ runner.os }}-target-1.98.1-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-target-1.98.1-${{ hashFiles('Cargo.lock', '.cargo/config.toml') }}
 
       # A release binary checked against its published digest, not a build on every push.
       - name: cargo-deny (pinned)
