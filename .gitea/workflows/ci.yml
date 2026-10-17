@@ -22,13 +22,15 @@ jobs:
         timeout-minutes: 15
 
       # Cargo hashes a vendored crate's absolute path into its fingerprint, and this runner's workspace
-      # path changes every run, so the vendored sources move to a fixed path before any build.
+      # path changes every run, so the vendored sources move to a fixed path before any build. Their
+      # mtimes are set to 2000, older than any cached build, or every build script reruns against the cache.
       - name: vendored sources at a fixed path
         timeout-minutes: 5
         run: |
           mv vendor "$HOME/web-access-vendor"
           sed -i "s|^directory = \"vendor\"\$|directory = \"$HOME/web-access-vendor\"|" .cargo/config.toml
           grep -qxF "directory = \"$HOME/web-access-vendor\"" .cargo/config.toml
+          find "$HOME/web-access-vendor" -exec touch -h -d @946684800 {} +
 
       # shell: bash runs with pipefail, so a failed download fails the step instead of feeding sh nothing.
       - name: toolchain (pinned)
