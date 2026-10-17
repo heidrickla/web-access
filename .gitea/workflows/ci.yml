@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v5
         timeout-minutes: 15
@@ -30,11 +31,13 @@ jobs:
           "$HOME/.cargo/bin/rustc" --version | grep -F ' 1.98.1 '
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # the crate registry and dependency builds, kept between runs keyed on the toolchain and Cargo.lock
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # target, kept between runs keyed on the toolchain and Cargo.lock. rust-cache drops the builds of
+      # crates inside the workspace, and vendor/ is inside it.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         timeout-minutes: 10
         with:
-          cache-bin: "false"
+          path: target
+          key: ${{ runner.os }}-target-1.98.1-${{ hashFiles('Cargo.lock') }}
 
       # A release binary checked against its published digest, not a build on every push.
       - name: cargo-deny (pinned)
