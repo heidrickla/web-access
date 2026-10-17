@@ -28,6 +28,11 @@ jobs:
           "$HOME/.cargo/bin/rustc" --version | grep -F ' 1.98.1 '
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # the crate registry and dependency builds, kept between runs keyed on the toolchain and Cargo.lock
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: "false"
+
       # A release binary checked against its published digest, not a build on every push.
       - name: cargo-deny (pinned)
         run: |
@@ -37,6 +42,15 @@ jobs:
           echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $d.tar.gz" | sha256sum -c -
           tar -xzf "$d.tar.gz" --strip-components=1 -C "$HOME/.cargo/bin" "$d/cargo-deny"
 
+      - name: cargo-nextest (pinned)
+        run: |
+          n=cargo-nextest-0.9.146-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL -o "$n" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/$n"
+          echo "b64617e8640624e8f9ba99819e37d7971154e97836d7ae4774fed4715501a6aa  $n" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nextest" && tar -xzf "$n" -C "$RUNNER_TEMP/nextest"
+          install -m 755 "$(find "$RUNNER_TEMP/nextest" -type f -name cargo-nextest)" "$HOME/.cargo/bin/"
+          cargo nextest --version
+
       - name: format
         run: cargo fmt --check
 
@@ -44,7 +58,7 @@ jobs:
         run: cargo clippy --offline --locked --all-targets -- -D warnings
 
       - name: test
-        run: cargo test --offline --locked
+        run: cargo nextest run --offline --locked
 
       - name: page scripts
         run: bash tests/js/run.sh
@@ -63,6 +77,11 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
           rustup default 1.98.1
+
+      # the crate registry and dependency builds, kept between runs keyed on the toolchain and Cargo.lock
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: "false"
 
       - name: lint
         run: cargo clippy --offline --locked --all-targets -- -D warnings
