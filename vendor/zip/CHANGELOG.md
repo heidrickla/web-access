@@ -5,7 +5,178 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [9.0.5](https://github.com/zip-rs/zip2/compare/v9.0.4...v9.0.5) - 2026-10-17
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- use mode_t for fchmodat's mode, which is u32 on NetBSD and OpenBSD ([#1076](https://github.com/zip-rs/zip2/pull/1076))
+- *(write)* prevent duplicate 0x9901 AES extra field in raw_copy_file ([#1078](https://github.com/zip-rs/zip2/pull/1078))
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Enable release-plz on backport branches in future ([#1079](https://github.com/zip-rs/zip2/pull/1079))
+
+## [9.0.4](https://github.com/zip-rs/zip2/compare/v9.0.3...v9.0.4) - 2026-10-16
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- enclosed_name rejects a separator inside one verbatim path component ([#1066](https://github.com/zip-rs/zip2/pull/1066))
+- return `Ok(None)` when read_zipfile_from_stream is called on an empty archive ([#1063](https://github.com/zip-rs/zip2/pull/1063))
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Revert impl Copy for Zip64CentralDirectoryEndLocator due to failing semver check, fix CI where most Miri tests weren't running, and other fixes so other PRs can pass CI ([#1065](https://github.com/zip-rs/zip2/pull/1065))
+- update lzma-rust2 and ppmd-rust dependencies ([#1060](https://github.com/zip-rs/zip2/pull/1060))
+
+## [9.0.3](https://github.com/zip-rs/zip2/compare/v9.0.2...v9.0.3) - 2026-10-13
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Preserve directories' read-only status when extracting on non-Unix systems ([#1054](https://github.com/zip-rs/zip2/pull/1054))
+
+## [9.0.2](https://github.com/zip-rs/zip2/compare/v9.0.1...v9.0.2) - 2026-10-11
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- additional bug fixes for symlink extraction
+
+## [9.0.1](https://github.com/zip-rs/zip2/compare/v9.0.0...v9.0.1) - 2026-10-10
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- set_permissions was still following symlinks in non-streaming extraction ([#1038](https://github.com/zip-rs/zip2/pull/1038))
+- two arithmetic overflows in the implode decoder ([#1028](https://github.com/zip-rs/zip2/pull/1028))
+- reject an empty archive whose central directory offset is past the EOCD ([#1025](https://github.com/zip-rs/zip2/pull/1025))
+- don't panic when two entries extract to the same path ([#1023](https://github.com/zip-rs/zip2/pull/1023))
+- fail reads that exceed the declared uncompressed size ([#1022](https://github.com/zip-rs/zip2/pull/1022))
+- shrink decoder skipped LZW code 8191 ([#1029](https://github.com/zip-rs/zip2/pull/1029))
+- write only the sentinel-marked values in a central ZIP64 field ([#1027](https://github.com/zip-rs/zip2/pull/1027))
+
+## [9.0.0](https://github.com/zip-rs/zip2/compare/v9.0.0-pre3...v9.0.0) - 2026-10-08
+
+### <!-- 0 -->🚀 Features
+
+- add ZipFileBuilder for parallelizing compression ([#911](https://github.com/zip-rs/zip2/pull/911))
+- add method `by_index_with_data_descriptor` ([#994](https://github.com/zip-rs/zip2/pull/994))
+- add len, is_empty and entry to ZipArchiveMetadata ([#1015](https://github.com/zip-rs/zip2/pull/1015))
+- read data descriptor from binary ([#990](https://github.com/zip-rs/zip2/pull/990))
+- add comment and test for ZipStreamReader and symlinks ([#985](https://github.com/zip-rs/zip2/pull/985))
+- *(write)* add `ZipWriter::hide_file` for in-place entry deletion ([#924](https://github.com/zip-rs/zip2/pull/924))
+- add compression ([#948](https://github.com/zip-rs/zip2/pull/948))
+- add test to in place modification ([#945](https://github.com/zip-rs/zip2/pull/945))
+- move CustomExtraField to own file ([#941](https://github.com/zip-rs/zip2/pull/941))
+- add a test on enum size ([#939](https://github.com/zip-rs/zip2/pull/939))
+- use ZipFileEntry instead of ZipStreamFileMetadata ([#935](https://github.com/zip-rs/zip2/pull/935))
+- add ZipFileEntry with no Reader ([#933](https://github.com/zip-rs/zip2/pull/933))
+- change `aes_mode` to `aes_settings()` in ZipFileData ([#925](https://github.com/zip-rs/zip2/pull/925))
+- cleanup and harmonize extra fields ([#923](https://github.com/zip-rs/zip2/pull/923))
+- Rewrite zip64 extra ([#913](https://github.com/zip-rs/zip2/pull/913))
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- reading an empty AES entry again at EOF returns Ok(0) ([#1024](https://github.com/zip-rs/zip2/pull/1024))
+- reject ZIP64 sizes that overflow u64 when computing data end offsets ([#1036](https://github.com/zip-rs/zip2/pull/1036))
+- apply central directory metadata in ZipStreamReader, only to written entries ([#1030](https://github.com/zip-rs/zip2/pull/1030))
+- consume the whole extended timestamp field in the central header ([#1016](https://github.com/zip-rs/zip2/pull/1016))
+- parse the central header of the extended timestamp ([#1002](https://github.com/zip-rs/zip2/pull/1002))
+- don't pre-allocate the declared size in the legacy decoders ([#991](https://github.com/zip-rs/zip2/pull/991))
+- Symlink with very large declared size could lead to out-of-memory panic ([#984](https://github.com/zip-rs/zip2/pull/984))
+- copy extra fields in raw_copy_file ([#955](https://github.com/zip-rs/zip2/pull/955)) ([#982](https://github.com/zip-rs/zip2/pull/982))
+- add unix_mode when copy_raw_file ([#981](https://github.com/zip-rs/zip2/pull/981))
+- rewrite documentation of add_symlink_from_path ([#979](https://github.com/zip-rs/zip2/pull/979))
+- ignore a ZIP64 extra field that no sentinel asked for ([#962](https://github.com/zip-rs/zip2/pull/962))
+- do not set data descriptor if directory ([#973](https://github.com/zip-rs/zip2/pull/973))
+- expose flags function for easier access ([#972](https://github.com/zip-rs/zip2/pull/972))
+- preserve unix permission in raw_copy_file ([#956](https://github.com/zip-rs/zip2/pull/956))
+- clippy warning on nightly ([#960](https://github.com/zip-rs/zip2/pull/960))
+- remove extra alloc used to copy ([#938](https://github.com/zip-rs/zip2/pull/938))
+- lazy allocation on error case ([#937](https://github.com/zip-rs/zip2/pull/937))
+- fix data alignment ([#929](https://github.com/zip-rs/zip2/pull/929))
+
+### <!-- 2 -->🚜 Refactor
+
+- move extract to own file ([#1009](https://github.com/zip-rs/zip2/pull/1009))
+- cleanup permissions related code ([#961](https://github.com/zip-rs/zip2/pull/961))
+- remove feature gate ([#949](https://github.com/zip-rs/zip2/pull/949))
+- create `ZipFileFlags` to wrap `flags` ([#947](https://github.com/zip-rs/zip2/pull/947))
+- remove unused trait ([#946](https://github.com/zip-rs/zip2/pull/946))
+- access `crate::format` with `zip::unstable::format` ([#944](https://github.com/zip-rs/zip2/pull/944))
+- harmonize functions to `format/functions.rs` ([#943](https://github.com/zip-rs/zip2/pull/943))
+- rewrite `make_reader()` function ([#936](https://github.com/zip-rs/zip2/pull/936))
+- simplify `initialize_local_block` ([#934](https://github.com/zip-rs/zip2/pull/934))
+- move write options to `write/options.rs` ([#931](https://github.com/zip-rs/zip2/pull/931))
+- move spec to format ([#932](https://github.com/zip-rs/zip2/pull/932))
+- move Magic to format ([#930](https://github.com/zip-rs/zip2/pull/930))
+- [**breaking**] Remove ZipFileData::extra_data_start field that is never read ([#926](https://github.com/zip-rs/zip2/pull/926))
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Fix high-level symlink extraction logic, disable some tests in miri, and fix some typos ([#1035](https://github.com/zip-rs/zip2/pull/1035))
+
+### Fix
+
+- some permissions tests can only run on Unix ([#1000](https://github.com/zip-rs/zip2/pull/1000))
+
+## [9.0.0-pre3](https://github.com/zip-rs/zip2/compare/v9.0.0-pre2...v9.0.0-pre3) - 2026-08-10
+
+### <!-- 0 -->🚀 Features
+
+- add example for memory allocation ([#881](https://github.com/zip-rs/zip2/pull/881))
+- add method to README ([#857](https://github.com/zip-rs/zip2/pull/857))
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- rewrite extra fields ([#879](https://github.com/zip-rs/zip2/pull/879))
+- zip64 creation of exactly 4GB without large file should crash ([#839](https://github.com/zip-rs/zip2/pull/839))
+- remove seek call and inline ([#858](https://github.com/zip-rs/zip2/pull/858))
+- change directory attributes detection and set `external attributes` ([#851](https://github.com/zip-rs/zip2/pull/851))
+- ignore zip info extra field on failure ([#868](https://github.com/zip-rs/zip2/pull/868))
+
+### <!-- 2 -->🚜 Refactor
+
+- change extra_data to extra_fields ([#833](https://github.com/zip-rs/zip2/pull/833))
+- change zip64 parsing ([#834](https://github.com/zip-rs/zip2/pull/834))
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- tag PRs with size labels ([#882](https://github.com/zip-rs/zip2/pull/882))
+
+## [9.0.0-pre2](https://github.com/zip-rs/zip2/compare/v9.0.0-pre1...v9.0.0-pre1.1) - 2026-05-11
+
+### <!-- 2 -->🚜 Refactor
+
+- move types to zip format folder ([#827](https://github.com/zip-rs/zip2/pull/827))
+- split `read.rs` file to read folder ([#832](https://github.com/zip-rs/zip2/pull/832))
+- move tests outside of read.rs ([#829](https://github.com/zip-rs/zip2/pull/829))
+- add doc and remove useless variables ([#828](https://github.com/zip-rs/zip2/pull/828))
+- update some extra field ([#821](https://github.com/zip-rs/zip2/pull/821))
+- Allow zip file with data descriptor using `ZipReadOptions` ([#823](https://github.com/zip-rs/zip2/pull/823))
+- allow AES in zip file stream ([#820](https://github.com/zip-rs/zip2/pull/820))
+
+## [9.0.0-pre1](https://github.com/zip-rs/zip2/compare/v8.6.0...v9.0.0-pre1) - 2026-05-05
+
+### <!-- 0 -->🚀 Features
+
+- Allow FileOptions to specify filename that may be non-UTF8 ([#819](https://github.com/zip-rs/zip2/pull/819))
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Zeroize derived_key when dropped, and suppress error details that may be sensitive ([#803](https://github.com/zip-rs/zip2/pull/803))
+
+### <!-- 2 -->🚜 Refactor
+
+- change vendor_version ([#817](https://github.com/zip-rs/zip2/pull/817))
+- rewrite aes settings ([#815](https://github.com/zip-rs/zip2/pull/815))
+- remove inner compression method from aes options ([#814](https://github.com/zip-rs/zip2/pull/814))
+- don't store converted filenames; convert on demand instead; and don't use Arc since it only deduplicates when copying to same path in another archive ([#807](https://github.com/zip-rs/zip2/pull/807))
+- Potential fixes for 5 code quality findings in src/aes.rs ([#808](https://github.com/zip-rs/zip2/pull/808))
+- [**breaking**] remove deprecated method *_zip64_comment methods ([#812](https://github.com/zip-rs/zip2/pull/812))
+- [**breaking**] Remove deprecated elements ([#802](https://github.com/zip-rs/zip2/pull/802))
+- store the file_name_raw only as key (BREAKING) ([#789](https://github.com/zip-rs/zip2/pull/789))
+- Remove fields from ZipFileData ([#790](https://github.com/zip-rs/zip2/pull/790))
+- Remove useless compression level ([#791](https://github.com/zip-rs/zip2/pull/791))
+- Add non-exhaustive to ExtraField enum ([#793](https://github.com/zip-rs/zip2/pull/793))
+- remove macro export ([#792](https://github.com/zip-rs/zip2/pull/792))
 
 ## [8.6.0](https://github.com/zip-rs/zip2/compare/v8.5.1...v8.6.0) - 2026-04-25
 

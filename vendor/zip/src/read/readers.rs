@@ -1,10 +1,8 @@
 //! Code related to reader
 
-use crate::AesMode;
 use crate::compression::{CompressionMethod, Decompressor};
 use crate::crc32::Crc32Reader;
 use crate::result::{ZipError, ZipResult};
-use crate::types::AesVendorVersion;
 use crate::types::ZipFileData;
 use crate::zipcrypto::{ZipCryptoReader, ZipCryptoReaderValid, ZipCryptoValidator};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -74,7 +72,6 @@ pub(crate) enum CryptoReader<'a, R: Read + ?Sized> {
     #[cfg(feature = "aes-crypto")]
     Aes {
         reader: crate::aes::AesReaderValid<io::Take<&'a mut R>>,
-        vendor_version: AesVendorVersion,
     },
 }
 
@@ -84,12 +81,8 @@ impl<R: Read + ?Sized> core::fmt::Debug for CryptoReader<'_, R> {
             CryptoReader::Plaintext(_) => f.write_str("CryptoReader::Plaintext"),
             CryptoReader::ZipCrypto(_) => f.write_str("CryptoReader::ZipCrypto"),
             #[cfg(feature = "aes-crypto")]
-            CryptoReader::Aes { vendor_version, .. } => {
-                write!(
-                    f,
-                    "CryptoReader::Aes {{ vendor_version: {:?} }}",
-                    vendor_version
-                )
+            CryptoReader::Aes { .. } => {
+                write!(f, "CryptoReader::Aes",)
             }
         }
     }
@@ -125,6 +118,24 @@ impl<R: Read + ?Sized> Read for CryptoReader<'_, R> {
 }
 
 impl<'a, R: Read + ?Sized> CryptoReader<'a, R> {
+    fn is_aes(&self) -> bool {
+        #[cfg(feature = "aes-crypto")]
+        if let CryptoReader::Aes { .. } = self {
+            return true;
+        }
+        false
+    }
+
+    /// Called once the consumer has reached EOF. For AES entries this
+    /// authenticates any ciphertext that the decompressor left unread.
+    fn finish(&mut self) -> io::Result<()> {
+        #[cfg(feature = "aes-crypto")]
+        if let CryptoReader::Aes { reader } = self {
+            return reader.finish();
+        }
+        Ok(())
+    }
+
     /// Consumes this decoder, returning the underlying reader.
     pub fn into_inner(self) -> io::Take<&'a mut R> {
         match self {
@@ -133,24 +144,6 @@ impl<'a, R: Read + ?Sized> CryptoReader<'a, R> {
             #[cfg(feature = "aes-crypto")]
             CryptoReader::Aes { reader: r, .. } => r.into_inner(),
         }
-    }
-
-    /// Returns `true` if the data is encrypted using AE2.
-    #[cfg(feature = "aes-crypto")]
-    pub const fn is_ae2_encrypted(&self) -> bool {
-        matches!(
-            self,
-            CryptoReader::Aes {
-                vendor_version: AesVendorVersion::Ae2,
-                ..
-            }
-        )
-    }
-
-    /// `false` since the feature `aes-crypto` is not enabled
-    #[cfg(not(feature = "aes-crypto"))]
-    pub const fn is_ae2_encrypted(&self) -> bool {
-        false
     }
 }
 
@@ -166,6 +159,10 @@ pub(crate) enum ZipFileReader<'a, R: Read + ?Sized> {
     Raw(io::Take<&'a mut R>),
     Stored(Box<Crc32Reader<CryptoReader<'a, R>>>),
     Compressed(Box<Crc32Reader<Decompressor<io::BufReader<CryptoReader<'a, R>>>>>),
+    /// A compressed AES entry. The decompressor may report EOF before all of the
+    /// ciphertext has been read (a Deflate stream ends at its final block), so at
+    /// EOF the rest of the ciphertext is authenticated via [`Self::finish_aes`].
+    CompressedAes(Box<Crc32Reader<Decompressor<io::BufReader<CryptoReader<'a, R>>>>>),
 }
 
 impl<R: Read + ?Sized> Read for ZipFileReader<'_, R> {
@@ -175,15 +172,13 @@ impl<R: Read + ?Sized> Read for ZipFileReader<'_, R> {
             ZipFileReader::Raw(r) => r.read(buf),
             ZipFileReader::Stored(r) => r.read(buf),
             ZipFileReader::Compressed(r) => r.read(buf),
-        }
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        match self {
-            ZipFileReader::NoReader => invalid_state!(),
-            ZipFileReader::Raw(r) => r.read_exact(buf),
-            ZipFileReader::Stored(r) => r.read_exact(buf),
-            ZipFileReader::Compressed(r) => r.read_exact(buf),
+            ZipFileReader::CompressedAes(r) => {
+                let n = r.read(buf)?;
+                if n == 0 && !buf.is_empty() {
+                    self.finish_aes()?;
+                }
+                Ok(n)
+            }
         }
     }
 
@@ -193,6 +188,11 @@ impl<R: Read + ?Sized> Read for ZipFileReader<'_, R> {
             ZipFileReader::Raw(r) => r.read_to_end(buf),
             ZipFileReader::Stored(r) => r.read_to_end(buf),
             ZipFileReader::Compressed(r) => r.read_to_end(buf),
+            ZipFileReader::CompressedAes(r) => {
+                let n = r.read_to_end(buf)?;
+                self.finish_aes()?;
+                Ok(n)
+            }
         }
     }
 
@@ -202,6 +202,21 @@ impl<R: Read + ?Sized> Read for ZipFileReader<'_, R> {
             ZipFileReader::Raw(r) => r.read_to_string(buf),
             ZipFileReader::Stored(r) => r.read_to_string(buf),
             ZipFileReader::Compressed(r) => r.read_to_string(buf),
+            ZipFileReader::CompressedAes(r) => {
+                let n = r.read_to_string(buf)?;
+                self.finish_aes()?;
+                Ok(n)
+            }
+        }
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        match self {
+            ZipFileReader::NoReader => invalid_state!(),
+            ZipFileReader::Raw(r) => r.read_exact(buf),
+            ZipFileReader::Stored(r) => r.read_exact(buf),
+            ZipFileReader::Compressed(r) => r.read_exact(buf),
+            ZipFileReader::CompressedAes(r) => r.read_exact(buf),
         }
     }
 }
@@ -212,10 +227,31 @@ impl<'a, R: Read + ?Sized> ZipFileReader<'a, R> {
             ZipFileReader::NoReader => invalid_state!(),
             ZipFileReader::Raw(r) => Ok(r),
             ZipFileReader::Stored(r) => Ok(r.into_inner().into_inner()),
-            ZipFileReader::Compressed(r) => {
+            ZipFileReader::Compressed(r) | ZipFileReader::CompressedAes(r) => {
                 Ok(r.into_inner().into_inner()?.into_inner().into_inner())
             }
         }
+    }
+
+    /// The decompressor of an AES entry reported EOF: drain and authenticate
+    /// the remaining ciphertext (GHSA-c9rm-qm35-rhqf). On failure the reader
+    /// is left in the `NoReader` state, so later reads keep failing instead of
+    /// reporting a clean EOF.
+    fn finish_aes(&mut self) -> io::Result<()> {
+        let ZipFileReader::CompressedAes(r) = std::mem::replace(self, ZipFileReader::NoReader)
+        else {
+            return Ok(());
+        };
+        // Bytes buffered but not consumed by the decompressor have already been
+        // MACed, so dropping the BufReader's buffer here is fine.
+        let mut crypto = r.into_inner().into_inner()?.into_inner();
+        crypto.finish()?;
+        let raw = crypto.into_inner();
+        // All `compressed_size` bytes have been consumed, so this only ever
+        // yields `Ok(0)`; keeping it lets `into_inner()` work for streaming readers.
+        debug_assert_eq!(raw.limit(), 0);
+        *self = ZipFileReader::Raw(raw);
+        Ok(())
     }
 }
 
@@ -224,7 +260,6 @@ pub(crate) fn make_crypto_reader<'a, R: Read + ?Sized>(
     data: &ZipFileData,
     reader: io::Take<&'a mut R>,
     password: Option<&[u8]>,
-    aes_info: Option<(AesMode, AesVendorVersion, CompressionMethod)>,
 ) -> ZipResult<CryptoReader<'a, R>> {
     #[allow(deprecated)]
     {
@@ -232,8 +267,7 @@ pub(crate) fn make_crypto_reader<'a, R: Read + ?Sized>(
             return Err(ZipError::CompressionMethodNotSupported(id));
         }
     }
-
-    let reader = match (password, aes_info) {
+    let reader = match (password, data.aes_settings()) {
         #[cfg(not(feature = "aes-crypto"))]
         (Some(_), Some(_)) => {
             return Err(ZipError::UnsupportedArchive(
@@ -241,13 +275,12 @@ pub(crate) fn make_crypto_reader<'a, R: Read + ?Sized>(
             ));
         }
         #[cfg(feature = "aes-crypto")]
-        (Some(password), Some((aes_mode, vendor_version, _))) => CryptoReader::Aes {
-            reader: crate::aes::AesReader::new(reader, aes_mode, data.compressed_size)
+        (Some(password), Some((aes_mode, _))) => CryptoReader::Aes {
+            reader: crate::aes::AesReader::new(reader, aes_mode, data.compressed_size)?
                 .validate(password)?,
-            vendor_version,
         },
         (Some(password), None) => {
-            let validator = if data.using_data_descriptor {
+            let validator = if data.is_using_data_descriptor() {
                 ZipCryptoValidator::InfoZipMsdosTime(
                     data.last_modified_time.map_or(0, |x| x.timepart()),
                 )
@@ -265,33 +298,82 @@ pub(crate) fn make_crypto_reader<'a, R: Read + ?Sized>(
 pub(crate) fn make_reader<R: Read + ?Sized>(
     compression_method: CompressionMethod,
     uncompressed_size: u64,
+    size_limit: Option<u64>,
     crc32: Option<u32>,
+    aes_vendor_version: Option<crate::format::aes::AesVendorVersion>,
     reader: CryptoReader<'_, R>,
     #[cfg(feature = "legacy-zip")] flags: u16,
 ) -> ZipResult<ZipFileReader<'_, R>> {
     // enable the crc32 check when there is a crc32 and the content is not ae2_encrypted
     let (should_disable, crc32) = if let Some(data_crc32) = crc32 {
-        (reader.is_ae2_encrypted(), data_crc32)
+        (
+            aes_vendor_version.is_some_and(|v| v.is_ae2_encrypted()),
+            data_crc32,
+        )
     } else {
         (true, 0)
     };
     if compression_method == CompressionMethod::Stored {
-        return Ok(ZipFileReader::Stored(Box::new(Crc32Reader::new(
-            reader,
-            crc32,
-            should_disable,
-        ))));
+        return Ok(ZipFileReader::Stored(Box::new(
+            Crc32Reader::new(reader, crc32, should_disable).with_size_limit(size_limit),
+        )));
     }
     #[cfg(not(feature = "legacy-zip"))]
     let flags = 0;
-    Ok(ZipFileReader::Compressed(Box::new(Crc32Reader::new(
-        Decompressor::new(
-            io::BufReader::new(reader),
-            compression_method,
-            uncompressed_size,
-            flags,
-        )?,
-        crc32,
-        should_disable,
-    ))))
+    let is_aes = reader.is_aes();
+    let reader = Box::new(
+        Crc32Reader::new(
+            Decompressor::new(
+                io::BufReader::new(reader),
+                compression_method,
+                uncompressed_size,
+                flags,
+            )?,
+            crc32,
+            should_disable,
+        )
+        .with_size_limit(size_limit),
+    );
+    Ok(if is_aes {
+        ZipFileReader::CompressedAes(reader)
+    } else {
+        ZipFileReader::Compressed(reader)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_size_reader_enum() {
+        use super::Crc32Reader;
+        use super::CryptoReader;
+        use super::Decompressor;
+        use super::ZipFileReader;
+        use std::io::BufReader;
+        use std::io::Cursor;
+        use std::io::Take;
+        use std::mem::size_of;
+
+        type R = Cursor<Vec<u8>>;
+        let enum_size = size_of::<ZipFileReader<'_, R>>();
+        // Ensure the enum stays small to optimize memory usage, particularly for archives
+        // with many files where many instances may exist simultaneously
+        assert!(enum_size <= 32);
+
+        let raw_reader_size = size_of::<Take<&R>>();
+        let stored_reader_size = size_of::<Crc32Reader<CryptoReader<'_, R>>>();
+        let compressed_reader_size =
+            size_of::<Crc32Reader<Decompressor<BufReader<CryptoReader<'_, R>>>>>();
+        let box_size = size_of::<Box<R>>();
+        // eprintln!("enum {enum_size}");
+        // eprintln!("raw: {raw_reader_size}");
+        // eprintln!("stored: {stored_reader_size}");
+        // eprintln!("compressed_reader_size: {compressed_reader_size}");
+        // eprintln!("box: {box_size}");
+        assert!(box_size < enum_size);
+        assert!(raw_reader_size < enum_size);
+        assert!(stored_reader_size > enum_size); // That's why we wrap in a box
+        assert!(compressed_reader_size > enum_size); // That's why we wrap in a box
+    }
 }

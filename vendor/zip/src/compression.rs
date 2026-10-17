@@ -1,5 +1,6 @@
 //! Possible ZIP compression methods.
 
+use crate::format::compression::Compression;
 use core::fmt;
 use std::{fmt::Debug, io};
 
@@ -264,6 +265,52 @@ impl CompressionMethod {
     pub const fn to_u16(self) -> u16 {
         self.serialize_to_u16()
     }
+
+    /// Transform to `Compression`
+    #[must_use]
+    pub const fn into_compression(self) -> Compression {
+        match self {
+            CompressionMethod::Stored => Compression::Stored,
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Shrink => Compression::Shrink,
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Reduce(n) => match n {
+                1 => Compression::ReduceFactor1,
+                2 => Compression::ReduceFactor2,
+                3 => Compression::ReduceFactor3,
+                4 => Compression::ReduceFactor4,
+                _ => Compression::Unknown(n as u16),
+            },
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Implode => Compression::Implode,
+            #[cfg(feature = "_deflate-any")]
+            CompressionMethod::Deflated => Compression::Deflated,
+            #[cfg(feature = "deflate64")]
+            CompressionMethod::Deflate64 => Compression::Deflate64,
+            #[cfg(feature = "_bzip2_any")]
+            CompressionMethod::Bzip2 => Compression::Bzip2,
+            #[cfg(feature = "zstd")]
+            CompressionMethod::Zstd => Compression::Zstd,
+            #[cfg(feature = "lzma")]
+            CompressionMethod::Lzma => Compression::Lzma,
+            #[cfg(feature = "xz")]
+            CompressionMethod::Xz => Compression::Xz,
+            #[cfg(feature = "ppmd")]
+            CompressionMethod::Ppmd => Compression::Ppmd,
+            // E.4 The compression method field (section 4.4.5) is set to 99
+            // to indicate a file has been encrypted using this method.
+            #[cfg(feature = "aes-crypto")]
+            CompressionMethod::Aes => Compression::Aes,
+            #[allow(deprecated)]
+            CompressionMethod::Unsupported(v) => Compression::Unknown(v),
+        }
+    }
+}
+
+impl From<CompressionMethod> for Compression {
+    fn from(value: CompressionMethod) -> Self {
+        value.into_compression()
+    }
 }
 
 impl Default for CompressionMethod {
@@ -304,6 +351,13 @@ pub const SUPPORTED_COMPRESSION_METHODS: &[CompressionMethod] = &[
     CompressionMethod::Ppmd,
 ];
 
+#[cfg(feature = "zstd")]
+pub(crate) enum Zstd<R: io::BufRead> {
+    FailedToInitialize,
+    Initialized(zstd::Decoder<'static, R>),
+    Uninitialized(R),
+}
+
 pub(crate) enum Decompressor<R: io::BufRead> {
     Stored(R),
     #[cfg(feature = "deflate-flate2")]
@@ -313,7 +367,7 @@ pub(crate) enum Decompressor<R: io::BufRead> {
     #[cfg(feature = "_bzip2_any")]
     Bzip2(bzip2::bufread::BzDecoder<R>),
     #[cfg(feature = "zstd")]
-    Zstd(zstd::Decoder<'static, R>),
+    Zstd(Zstd<R>),
     #[cfg(feature = "lzma")]
     Lzma(Lzma<R>),
     #[cfg(feature = "legacy-zip")]
@@ -373,6 +427,9 @@ pub(crate) enum Ppmd<R: io::BufRead> {
 
 impl<R: io::BufRead> io::Read for Decompressor<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         match self {
             Decompressor::Stored(r) => r.read(buf),
             #[cfg(feature = "deflate-flate2")]
@@ -382,7 +439,18 @@ impl<R: io::BufRead> io::Read for Decompressor<R> {
             #[cfg(feature = "_bzip2_any")]
             Decompressor::Bzip2(r) => r.read(buf),
             #[cfg(feature = "zstd")]
-            Decompressor::Zstd(r) => r.read(buf),
+            Decompressor::Zstd(r) => {
+                let mut decoder = match core::mem::replace(r, Zstd::FailedToInitialize) {
+                    Zstd::Initialized(decoder) => decoder,
+                    Zstd::Uninitialized(inner) => zstd::Decoder::with_buffer(inner)?,
+                    Zstd::FailedToInitialize => {
+                        return Err(io::Error::other("Failed to start Zstd decoder"));
+                    }
+                };
+                let result = decoder.read(buf);
+                *r = Zstd::Initialized(decoder);
+                result
+            }
             #[cfg(feature = "lzma")]
             Decompressor::Lzma(r) => match r {
                 Lzma::Uninitialized {
@@ -513,7 +581,7 @@ impl<R: io::BufRead> Decompressor<R> {
             #[cfg(feature = "_bzip2_any")]
             CompressionMethod::Bzip2 => Decompressor::Bzip2(bzip2::bufread::BzDecoder::new(reader)),
             #[cfg(feature = "zstd")]
-            CompressionMethod::Zstd => Decompressor::Zstd(zstd::Decoder::with_buffer(reader)?),
+            CompressionMethod::Zstd => Decompressor::Zstd(Zstd::Uninitialized(reader)),
             #[cfg(feature = "lzma")]
             CompressionMethod::Lzma => Decompressor::Lzma(Lzma::Uninitialized {
                 reader: Some(reader),
@@ -558,7 +626,13 @@ impl<R: io::BufRead> Decompressor<R> {
             #[cfg(feature = "_bzip2_any")]
             Decompressor::Bzip2(r) => r.into_inner(),
             #[cfg(feature = "zstd")]
-            Decompressor::Zstd(r) => r.finish(),
+            Decompressor::Zstd(Zstd::Initialized(r)) => r.finish(),
+            #[cfg(feature = "zstd")]
+            Decompressor::Zstd(Zstd::Uninitialized(r)) => r,
+            #[cfg(feature = "zstd")]
+            Decompressor::Zstd(Zstd::FailedToInitialize) => {
+                return Err(io::Error::other("Failed to start Zstd decoder"));
+            }
             #[cfg(feature = "lzma")]
             Decompressor::Lzma(r) => match r {
                 Lzma::Uninitialized { mut reader, .. } => reader
@@ -624,5 +698,13 @@ mod tests {
         for &method in SUPPORTED_COMPRESSION_METHODS {
             check_match(method);
         }
+    }
+
+    #[cfg(feature = "legacy-zip")]
+    #[test]
+    fn check_reduce() {
+        assert_eq!(CompressionMethod::Reduce(1), CompressionMethod::REDUCE_1);
+        assert_eq!(CompressionMethod::Reduce(1).serialize_to_u16(), 2);
+        assert_eq!(CompressionMethod::REDUCE_1.serialize_to_u16(), 2);
     }
 }
