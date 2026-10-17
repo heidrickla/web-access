@@ -20,6 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Git checkout stamps the vendored files with the current time. They are set to 2000, older than
+      # any cached build, or every build script reruns against the cache.
+      - name: vendored sources' mtimes
+        shell: bash
+        run: find vendor -exec touch -d @946684800 {} +
+
       # shell: bash runs with pipefail, so a failed download fails the step instead of feeding sh nothing.
       - name: toolchain (pinned)
         shell: bash
@@ -76,6 +82,12 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v5
+
+      # Git checkout stamps the vendored files with the current time. They are set to 2000, older than
+      # any cached build, or every build script reruns against the cache.
+      - name: vendored sources' mtimes
+        shell: bash
+        run: find vendor -exec touch -d @946684800 {} +
 
       - name: toolchain (pinned)
         run: |
