@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: 0
