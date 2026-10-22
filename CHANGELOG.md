@@ -62,6 +62,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - A CSV import leaves a server's port and group as they are when the file has no column for them; an empty group cell still ungroups.
 - Removing servers from a user asks first, naming what goes with them; switching user, tab or page with unsaved ticks asks before discarding them; unticking your own administrator flag asks first.
 - The admin lists draw at most 500 rows, and their filters wait for a pause in typing; the user detail pane stays in view beside a long list.
+- An HTTPS listener sends `Strict-Transport-Security: max-age=31536000`. The pages' CSP allows connections to their own origin only.
 
 ### Fixed
 

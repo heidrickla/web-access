@@ -56,7 +56,7 @@ impl ConnectionPermit {
 const UPGRADE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
-    connect-src 'self' ws: wss:; img-src 'self' data: blob:; frame-ancestors 'none'; \
+    connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'; \
     base-uri 'none'; form-action 'self'";
 
 /// (request path, content type, bytes).
@@ -343,8 +343,18 @@ async fn origin_guard(req: Request, next: Next) -> Response {
     }
 }
 
-async fn security_headers(mut res: Response) -> Response {
+/// Sent only by an HTTPS listener: a browser ignores it over plain HTTP, and over a certificate it
+/// does not trust.
+pub const HSTS: &str = "max-age=31536000";
+
+async fn security_headers(State(app): State<Shared>, mut res: Response) -> Response {
     let h = res.headers_mut();
+    if app.secure_cookies {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static(HSTS),
+        );
+    }
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -390,7 +400,10 @@ pub fn router(app: Shared) -> Router {
         ))
         .layer(middleware::from_fn(deadline))
         .layer(middleware::from_fn(origin_guard))
-        .layer(middleware::map_response(security_headers))
+        .layer(middleware::map_response_with_state(
+            Arc::clone(&app),
+            security_headers,
+        ))
         .with_state(app)
 }
 
@@ -2052,6 +2065,37 @@ pub mod tests {
         }
         stripped.push_str(rest);
         stripped
+    }
+
+    /// HSTS goes with an HTTPS listener only, and the page may connect to its own origin only.
+    #[tokio::test]
+    async fn hsts_follows_the_listener_and_the_csp_connects_only_to_this_origin() {
+        for secure in [false, true] {
+            let mut app = build_app([9; 32], "testhost", "", true, "");
+            app.secure_cookies = secure;
+            let app = Arc::new(app);
+            for (method, path) in [("GET", "/"), ("GET", "/api/me")] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::HOST, "proxy.test")
+                    .body(Body::empty())
+                    .unwrap();
+                let res = router(Arc::clone(&app)).oneshot(req).await.unwrap();
+                let h = res.headers();
+                let hsts = h
+                    .get(header::STRICT_TRANSPORT_SECURITY)
+                    .map(|v| v.to_str().unwrap());
+                assert_eq!(hsts, secure.then_some(HSTS), "{path} secure={secure}");
+                let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+                let connect: Vec<&str> = csp
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|d| d.starts_with("connect-src"))
+                    .collect();
+                assert_eq!(connect, ["connect-src 'self'"], "{path}");
+            }
+        }
     }
 
     /// The CSP forbids inline <style>, inline <script> and inline event handlers. Inlining any of

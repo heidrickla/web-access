@@ -37,7 +37,7 @@ pub struct App {
     pub tickets: Tickets,
     pub live: LiveSessions,
     pub target_tls: TlsSetup,
-    /// Set the cookie's Secure attribute: true when the listener speaks HTTPS.
+    /// True when the listener speaks HTTPS: the cookie's Secure attribute, and HSTS.
     pub secure_cookies: bool,
     pub host_name: String,
     pub imports: Mutex<HashMap<String, PendingImport>>,
