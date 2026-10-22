@@ -73,7 +73,7 @@ The proxy decides who may reach which server, and relays. It decodes RDP only as
 | Resolve by name, not by address | settled (Lewis, 2026-09-23) |
 | Verify the target's certificate against an internal CA | per deployment: `tls.verify`, which has no default, and is coupled to the row above |
 | Session recording | outside the proxy: the proxy reads only the clipboard channel, so recording comes from the target or from a gateway that decodes all of RDP |
-| Files crossing the clipboard channel are scanned on the proxy, inline and enforced, by the anti-malware product registered with Windows through AMSI (Trellix on the hosts it serves); only a clean verdict passes | settled (Lewis, 2026-09-30); see File scanning below |
+| Files crossing the clipboard channel are scanned on the proxy, inline and enforced, by the anti-malware product registered with Windows through AMSI (Trellix, Defender); only a clean verdict passes | settled (Lewis, 2026-09-30); see File scanning below |
 
 ### Resolving by name puts DNS in the trust chain
 
@@ -111,7 +111,7 @@ With no agents, nothing outside the proxy constrains which hosts it opens a sock
 | Signature | `bergshamra-dsig` with trusted keys only, verified once per signing certificate in the metadata, each in its own key manager. Every signature in the response must verify; one must be enveloped in the Assertion with its one Reference resolving to that Assertion. The only shape accepted is exclusive c14n, RSA-SHA256/384/512, SHA-256/384/512, transforms enveloped-signature then exclusive c14n, a `#id` reference; anything else is refused before verification, so no reference reads a file or a URL |
 | Assertion | exactly one in the document, none encrypted. Issuer is the metadata's entityID; IssueInstant not past now plus skew; a bearer confirmation with Recipient the assertion consumer URL, InResponseTo the request, NotOnOrAfter in force and no NotBefore; Conditions in force, every AudienceRestriction naming this proxy, no condition but OneTimeUse and ProxyRestriction; an AuthnStatement whose SessionNotOnOrAfter has not passed; Status Success; Response Destination, when present, the assertion consumer URL |
 | Replay | the request ID and the assertion ID are spent by the first response that passes, until they could no longer be accepted. A restart makes a new flow key, which ends sign-ins in progress, so the in-memory table is enough |
-| Account | the SID attribute, exactly one value, looked up as objectSid with the service account; the directory must return that SID. A name is never matched: about 19 domains at the site share short names, and another domain's `jdoe` must not become this one's |
+| Account | the SID attribute, exactly one value, looked up as objectSid with the service account; the directory must return that SID. A name is never matched: short names repeat across domains, and another domain's `jdoe` must not become this one's |
 | Answer | a page that moves on by itself: the session cookie is `SameSite=Strict`, set on the response to the identity provider's cross-site POST, and a redirect continuing that navigation would not carry it to the list. The page's script (`/saml-done.js`, as the CSP allows only `'self'`) navigates to `/`, a same-site navigation, with a link for a browser without scripts |
 
 Refused in this version: identity-provider-initiated responses, EncryptedAssertion, single logout. AuthnRequests are unsigned, which ADFS and Entra ID accept by default. Renewal under single sign-on is a full-page round trip through `/api/saml/start`.
