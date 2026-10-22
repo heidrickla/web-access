@@ -18,7 +18,7 @@ jobs:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         timeout-minutes: 15
 
       # Cargo hashes a vendored crate's absolute path into its fingerprint, and this runner's workspace
@@ -32,13 +32,17 @@ jobs:
           grep -qxF "directory = \"$HOME/web-access-vendor\"" .cargo/config.toml
           find "$HOME/web-access-vendor" -exec touch -h -d @946684800 {} +
 
-      # shell: bash runs with pipefail, so a failed download fails the step instead of feeding sh nothing.
+      # rustup-init pinned by version and checked against its published digest.
       - name: toolchain (pinned)
         timeout-minutes: 15
         shell: bash
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain 1.98.1 --component clippy,rustfmt
+          r=1.29.1
+          i="$RUNNER_TEMP/rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSf -o "$i" "https://static.rust-lang.org/rustup/archive/$r/x86_64-unknown-linux-gnu/rustup-init"
+          echo "dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71  $i" | sha256sum -c -
+          chmod +x "$i"
+          "$i" -y --profile minimal --default-toolchain 1.98.1 --component clippy,rustfmt
           "$HOME/.cargo/bin/rustc" --version | grep -F ' 1.98.1 '
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
