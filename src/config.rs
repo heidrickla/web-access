@@ -95,6 +95,7 @@ const KNOWN: &[(&str, &[&str])] = &[
             "service_account",
             "timeout_secs",
             "check_interval_secs",
+            "failed_signins_per_address",
         ],
     ),
     (
@@ -275,6 +276,10 @@ pub struct DirectoryConfig {
     /// How often signed-in accounts are re-checked with the service account.
     #[serde(default = "default_check_interval")]
     pub check_interval_secs: u64,
+    /// Wrong passwords one client address may try in five minutes; after that its sign-ins are
+    /// refused without asking the directory. 0 for no limit.
+    #[serde(default = "default_failed_signins_per_address")]
+    pub failed_signins_per_address: usize,
 }
 
 /// The site's SAML 2.0 identity provider.
@@ -352,6 +357,10 @@ fn default_max_connections() -> usize {
 
 fn default_check_interval() -> u64 {
     600
+}
+
+fn default_failed_signins_per_address() -> usize {
+    30
 }
 
 fn default_audit_days() -> u32 {

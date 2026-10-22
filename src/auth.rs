@@ -115,13 +115,28 @@ impl Tickets {
 pub const THROTTLE_FAILURES: usize = 5;
 pub const THROTTLE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-/// Local accounts have no directory lockout policy behind them, so the proxy keeps its own.
-#[derive(Default)]
+/// Local accounts have no directory lockout policy behind them, so the proxy keeps its own, per
+/// username. Directory sign-ins are counted per client address.
 pub struct Throttle {
     failures: Mutex<HashMap<String, Vec<Instant>>>,
+    /// Failures allowed within the window; 0 for no limit.
+    limit: usize,
+}
+
+impl Default for Throttle {
+    fn default() -> Self {
+        Self::new(THROTTLE_FAILURES)
+    }
 }
 
 impl Throttle {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            failures: Mutex::default(),
+            limit,
+        }
+    }
+
     pub fn blocked(&self, key: &str) -> bool {
         self.blocked_at(key, Instant::now())
     }
@@ -132,7 +147,42 @@ impl Throttle {
             return false;
         };
         times.retain(|t| at.saturating_duration_since(*t) < THROTTLE_WINDOW);
-        times.len() >= THROTTLE_FAILURES
+        self.limit != 0 && times.len() >= self.limit
+    }
+
+    /// Counts an attempt before it is made, so attempts in flight at once cannot all pass a check
+    /// made before any of them failed. False, and nothing counted, when the budget is spent.
+    pub fn take(&self, key: &str) -> bool {
+        self.take_at(key, Instant::now())
+    }
+
+    fn take_at(&self, key: &str, at: Instant) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        let mut map = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, v| {
+            v.last()
+                .is_some_and(|t| at.saturating_duration_since(*t) < THROTTLE_WINDOW)
+        });
+        let times = map.entry(key.to_owned()).or_default();
+        times.retain(|t| at.saturating_duration_since(*t) < THROTTLE_WINDOW);
+        if times.len() >= self.limit {
+            return false;
+        }
+        times.push(at);
+        true
+    }
+
+    /// Gives back an attempt taken by `take` that turned out not to be a wrong password.
+    pub fn refund(&self, key: &str) {
+        let mut map = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(times) = map.get_mut(key) {
+            times.pop();
+            if times.is_empty() {
+                map.remove(key);
+            }
+        }
     }
 
     pub fn fail(&self, key: &str) {
@@ -184,6 +234,34 @@ mod tests {
         t.fail_at("devtest", start);
         t.clear("devtest");
         assert!(!t.blocked_at("devtest", start));
+    }
+
+    #[test]
+    fn an_attempt_is_counted_before_it_is_made_and_refunded_when_not_a_failure() {
+        let t = Throttle::new(2);
+        let start = Instant::now();
+        assert!(t.take_at("192.0.2.1", start));
+        assert!(t.take_at("192.0.2.1", start));
+        assert!(!t.take_at("192.0.2.1", start), "a third attempt in flight");
+        assert_eq!(
+            t.failures("192.0.2.1"),
+            2,
+            "a refused attempt is not counted"
+        );
+        assert!(
+            t.take_at("192.0.2.2", start),
+            "another address has its own budget"
+        );
+        t.refund("192.0.2.1");
+        assert!(t.take_at("192.0.2.1", start));
+        assert!(!t.take_at("192.0.2.1", start));
+        assert!(t.take_at("192.0.2.1", start + THROTTLE_WINDOW));
+
+        let unlimited = Throttle::new(0);
+        for _ in 0..100 {
+            assert!(unlimited.take_at("192.0.2.1", start));
+        }
+        assert!(!unlimited.blocked_at("192.0.2.1", start));
     }
 
     #[test]

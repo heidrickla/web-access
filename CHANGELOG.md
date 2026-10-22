@@ -63,6 +63,7 @@ Notable changes, newest first. Versions follow semantic versioning; the MSI and 
 - Removing servers from a user asks first, naming what goes with them; switching user, tab or page with unsaved ticks asks before discarding them; unticking your own administrator flag asks first.
 - The admin lists draw at most 500 rows, and their filters wait for a pause in typing; the user detail pane stays in view beside a long list.
 - An HTTPS listener sends `Strict-Transport-Security: max-age=31536000`. The pages' CSP allows connections to their own origin only.
+- Directory sign-ins are limited per client address: `failed_signins_per_address` in `[directory]`, wrong passwords in five minutes, default 30.
 
 ### Fixed
 

@@ -56,6 +56,8 @@ pub struct App {
     pub packaged: tokio::sync::Notify,
     /// Failed local-account sign-ins, per username.
     pub throttle: crate::auth::Throttle,
+    /// Failed directory sign-ins, per client address.
+    pub address_throttle: crate::auth::Throttle,
     /// How the directory account checks last went, for the Migration tab.
     pub revocation: Mutex<RevocationHealth>,
     /// Files on the clipboard channel are scanned before they are passed on; none when off.
@@ -158,6 +160,10 @@ impl App {
         secure_cookies: bool,
     ) -> Self {
         let scan = crate::scan::ScanService::new(&cfg.scan, &cfg.data_dir());
+        let per_address = cfg
+            .directory
+            .as_ref()
+            .map_or(0, |d| d.failed_signins_per_address);
         Self {
             secure_cookies,
             host_name,
@@ -177,6 +183,7 @@ impl App {
             #[cfg(test)]
             packaged: tokio::sync::Notify::new(),
             throttle: crate::auth::Throttle::default(),
+            address_throttle: crate::auth::Throttle::new(per_address),
             revocation: Mutex::new(RevocationHealth::default()),
             scan,
             notices: crate::scan::Notices::default(),

@@ -49,6 +49,9 @@ ca_bundle = 'C:\ProgramData\web-access\directory-ca.pem'
 # base_dn = "OU=Staff,DC=corp,DC=example,DC=com"
 # Seconds to wait for a domain controller.
 # timeout_secs = 10
+# Wrong passwords one client address may try in five minutes before its sign-ins are refused
+# without asking the directory. 0 for no limit.
+# failed_signins_per_address = 30
 # Optional read-only account. With it, the proxy checks usernames when an administrator adds them,
 # and ends the sessions of accounts disabled in the directory. Its password is set on the admin
 # Migration page or with `web-access-proxy.exe set-secret directory`, never in this file.

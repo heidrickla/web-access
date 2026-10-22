@@ -674,7 +674,11 @@ enum Checked {
     Told(crate::directory::Refusal),
 }
 
-async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiResult<Response> {
+async fn login(
+    State(app): State<Shared>,
+    peer: Option<axum::Extension<Peer>>,
+    Json(req): Json<LoginRequest>,
+) -> ApiResult<Response> {
     let username = normalize_username(&req.username)
         .ok_or_else(|| ApiError::bad_request("enter your username"))?;
     if req.password.len() > 1024 {
@@ -699,7 +703,10 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> ApiR
         Some((user_id, incarnation, hash)) => {
             check_local(&app, &username, user_id, incarnation, hash, &req.password).await?
         }
-        None => check_directory(&app, &req.username, &username, &req.password).await?,
+        None => {
+            let client = client_key(peer.map(|p| p.0 .0));
+            check_directory(&app, &client, &req.username, &username, &req.password).await?
+        }
     };
 
     // Recorded under a hold, and only in the database the check was made against.
@@ -856,8 +863,35 @@ fn finish_local(
 }
 
 /// `typed` is the name as the user entered it; `username` its short form, for the log.
+const THROTTLED_ADDRESS: &str =
+    "too many failed sign-ins from this address; refused without asking the directory";
+
+/// What a client's failed sign-ins are counted against: its IPv4 address, or its IPv6 /64, since
+/// one host can hold a whole /64.
+fn client_key(peer: Option<SocketAddr>) -> String {
+    match peer.map(|p| p.ip().to_canonical()) {
+        Some(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Some(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        None => "unknown".to_owned(),
+    }
+}
+
+/// Whether a directory answer was a wrong password, the only answer that keeps its place in the
+/// client's budget. A lockout is answered whatever password is typed, so it counts too.
+fn guessed_wrong(result: &Result<crate::directory::Account, DirError>) -> bool {
+    match result {
+        Err(DirError::InvalidCredentials) => true,
+        Err(DirError::Refused(r)) => !r.proves_password(),
+        _ => false,
+    }
+}
+
 async fn check_directory(
     app: &App,
+    client: &str,
     typed: &str,
     username: &str,
     password: &str,
@@ -865,7 +899,16 @@ async fn check_directory(
     let Some(directory) = &app.directory else {
         return Ok(Checked::Refused("no directory is configured"));
     };
-    match directory.authenticate(typed, password).await {
+    // The directory's lockout guards each account; this bounds how many accounts one client can
+    // try passwords on. The attempt is counted before the bind, so binds in flight at once count.
+    if !app.address_throttle.take(client) {
+        return Ok(Checked::Refused(THROTTLED_ADDRESS));
+    }
+    let result = directory.authenticate(typed, password).await;
+    if !guessed_wrong(&result) {
+        app.address_throttle.refund(client);
+    }
+    match result {
         Ok(account) => Ok(Checked::Directory(account)),
         Err(DirError::InvalidCredentials) => {
             Ok(Checked::Refused("directory refused the credentials"))
@@ -1878,6 +1921,80 @@ pub mod tests {
             newcomer.id, first.id,
             "a new account took the renamed one's row"
         );
+    }
+
+    fn last_audit(app: &App) -> (String, String) {
+        let row = app.store.audit_list(1, None).unwrap().remove(0);
+        (row.action, row.detail)
+    }
+
+    /// Once a client address has spent its budget, a directory sign-in is refused without a bind.
+    /// This directory is never contacted, so asking it would answer unreachable, not 401.
+    #[tokio::test]
+    async fn a_spent_address_budget_refuses_directory_sign_ins_unasked() {
+        let app = test_app();
+        while app.address_throttle.take("unknown") {}
+        let (status, _) = login_as(&app, "jdoe", "a password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            last_audit(&app),
+            ("signin.refused".into(), THROTTLED_ADDRESS.into())
+        );
+    }
+
+    /// A wrong password keeps its place in the budget; an attempt the directory could not decide
+    /// gives its place back.
+    #[tokio::test]
+    async fn only_a_wrong_password_spends_the_address_budget() {
+        let app = Arc::new(build_app(
+            [9; 32],
+            "testhost",
+            "",
+            false,
+            "[directory]\ndomain = \"corp.example.com\"\nurls = [\"ldaps://127.0.0.1:1\"]\ntimeout_secs = 5\nfailed_signins_per_address = 2\n",
+        ));
+        // A control character makes the sign-in name invalid: refused as a wrong password, unbound.
+        let (status, _) = login_as(&app, "a\u{1}\\jdoe", "a password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(app.address_throttle.failures("unknown"), 1);
+        let (status, _) = login_as(&app, "jdoe", "a password").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(app.address_throttle.failures("unknown"), 1);
+        let (status, _) = login_as(&app, "a\u{1}\\jdoe", "a password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(last_audit(&app).1, THROTTLED_ADDRESS);
+        let (status, _) = login_as(&app, "jdoe", "a password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(last_audit(&app).1, THROTTLED_ADDRESS);
+    }
+
+    #[test]
+    fn a_lockout_and_a_wrong_password_spend_the_budget_and_nothing_else_does() {
+        use crate::directory::Refusal;
+        assert!(guessed_wrong(&Err(DirError::InvalidCredentials)));
+        assert!(guessed_wrong(&Err(DirError::Refused(Refusal::Locked))));
+        for kept in [
+            DirError::Refused(Refusal::Disabled),
+            DirError::Refused(Refusal::PasswordMustChange),
+            DirError::OtherDomain("OTHER\\jdoe".into()),
+            DirError::Unreachable("dc1: refused".into()),
+            DirError::Protocol("who-am-i".into()),
+        ] {
+            assert!(!guessed_wrong(&Err(kept)));
+        }
+    }
+
+    #[test]
+    fn failures_are_counted_per_ipv4_address_and_per_ipv6_64() {
+        let key = |s: &str| client_key(Some(s.parse().unwrap()));
+        assert_eq!(key("192.0.2.7:50000"), "192.0.2.7");
+        assert_eq!(key("[::ffff:192.0.2.7]:50000"), "192.0.2.7");
+        assert_eq!(
+            key("[2001:db8:1:2:aa::1]:443"),
+            key("[2001:db8:1:2:bb::9]:443")
+        );
+        assert_ne!(key("[2001:db8:1:2::1]:443"), key("[2001:db8:1:3::1]:443"));
+        assert_eq!(client_key(None), "unknown");
     }
 
     /// A failed local password counts toward the throttle even when its request is abandoned
